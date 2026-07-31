@@ -1,0 +1,242 @@
+[
+  {
+    "id": 1,
+    "question": "什么是软件架构风格？",
+    "answer_keyword": "描述某一特定应用领域中系统组织方式的惯用模式，定义系统家族、词汇表和约束",
+    "source_topic": "架构风格定义",
+    "difficulty": "简单",
+    "type": "概念题"
+  },
+  {
+    "id": 2,
+    "question": "什么是软件工程？",
+    "answer_keyword": "应用计算机科学、数学及管理科学等原理，以工程化方法解决软件问题，目的是提高生产率、质量，降低成本",
+    "source_topic": "软件工程定义",
+    "difficulty": "简单",
+    "type": "概念题"
+  },
+  {
+    "id": 3,
+    "question": "软件架构设计的主要目的是什么？",
+    "answer_keyword": "解决软件系统的高层结构设计问题，降低维护成本，保障质量属性，指导开发",
+    "source_topic": "架构设计目的",
+    "difficulty": "简单",
+    "type": "概念题"
+  },
+  {
+    "id": 4,
+    "question": "常见的软件架构风格有哪些？",
+    "answer_keyword": "管道过滤器、数据抽象/面向对象、隐式调用/事件驱动、分层、仓库/黑板、解释器、进程通信、C2、REST、微服务等",
+    "source_topic": "架构风格分类",
+    "difficulty": "简单",
+    "type": "列举题"
+  },
+  {
+    "id": 5,
+    "question": "什么是中间件？它在架构中起什么作用？",
+    "answer_keyword": "位于操作系统和应用程序之间的软件，屏蔽底层差异，提供通信、数据管理等公共服务，支持分布式应用互操作",
+    "source_topic": "中间件",
+    "difficulty": "简单",
+    "type": "概念题"
+  },
+  {
+    "id": 6,
+    "question": "软件质量属性有哪些？",
+    "answer_keyword": "运行期：性能、可用性、可靠性、安全性、易用性；开发期：可修改性、可测试性、可移植性、互操作性",
+    "source_topic": "质量属性",
+    "difficulty": "简单",
+    "type": "列举题"
+  },
+  {
+    "id": 7,
+    "question": "瀑布模型有什么特点？",
+    "answer_keyword": "阶段划分明确、严格串行、面向文档、阶段间有固定交付物，需求变动代价大",
+    "source_topic": "瀑布模型",
+    "difficulty": "简单",
+    "type": "概念题"
+  },
+  {
+    "id": 8,
+    "question": "敏捷开发的核心思想是什么？",
+    "answer_keyword": "迭代增量、拥抱变化、快速交付、客户协作、轻文档",
+    "source_topic": "敏捷开发",
+    "difficulty": "简单",
+    "type": "概念题"
+  },
+  {
+    "id": 9,
+    "question": "什么是软件生命周期？",
+    "answer_keyword": "软件从产生到废弃的整个过程，包括定义、开发、维护三大阶段",
+    "source_topic": "软件生命周期",
+    "difficulty": "简单",
+    "type": "概念题"
+  },
+  {
+    "id": 10,
+    "question": "什么是面向对象分析（OOA）？",
+    "answer_keyword": "运用面向对象方法对问题域进行分析，建立对象模型，识别类、属性、方法及关系",
+    "source_topic": "面向对象分析",
+    "difficulty": "简单",
+    "type": "概念题"
+  },
+  {
+    "id": 11,
+    "question": "瀑布模型和敏捷开发有什么区别？",
+    "answer_keyword": "瀑布串行文档驱动、难适应变化；敏捷迭代灵活、拥抱变化、轻文档",
+    "source_topic": "开发模型对比",
+    "difficulty": "中等",
+    "type": "对比题"
+  },
+  {
+    "id": 12,
+    "question": "集中式架构和分布式架构各有什么优缺点？",
+    "answer_keyword": "集中式简单易维护但扩展性差、单点故障；分布式可扩展、高可用但复杂、有一致性问题",
+    "source_topic": "架构对比",
+    "difficulty": "中等",
+    "type": "对比题"
+  },
+  {
+    "id": 13,
+    "question": "软件架构的分层风格和管道-过滤器风格有什么区别？",
+    "answer_keyword": "分层按层次调用、层次间接口稳定；管道过滤器按数据流连接、各过滤器独立、支持并行",
+    "source_topic": "架构风格对比",
+    "difficulty": "中等",
+    "type": "对比题"
+  },
+  {
+    "id": 14,
+    "question": "可用性和可靠性的区别是什么？",
+    "answer_keyword": "可用性是系统可提供服务的时间比例；可靠性是系统在规定条件下规定时间内完成功能的能力",
+    "source_topic": "质量属性对比",
+    "difficulty": "中等",
+    "type": "对比题"
+  },
+  {
+    "id": 15,
+    "question": "面向对象分析和面向对象设计（OOD）有什么区别？",
+    "answer_keyword": "OOA 关注问题域建模识别对象；OOD 关注将模型转化为可实现的设计结构，增加实现细节",
+    "source_topic": "OOA与OOD",
+    "difficulty": "中等",
+    "type": "对比题"
+  },
+  {
+    "id": 16,
+    "question": "什么是云架构？它如何实现扩展性？",
+    "answer_keyword": "云架构将数据复制到内存成可复制单元，业务处理能力封装成处理单元，按访问量增减处理单元，无中央数据库消除扩展瓶颈",
+    "source_topic": "云架构",
+    "difficulty": "中等",
+    "type": "技术题"
+  },
+  {
+    "id": 17,
+    "question": "软件架构评估有哪些方法？",
+    "answer_keyword": "ATAM、SAAM、CBAM、ARID 等，常用 ATAM 基于场景的评估方法",
+    "source_topic": "架构评估",
+    "difficulty": "中等",
+    "type": "技术题"
+  },
+  {
+    "id": 18,
+    "question": "什么是 ATAM？",
+    "answer_keyword": "架构权衡分析方法，基于场景评估架构，分析质量属性间的权衡，识别风险点、敏感点、权衡点",
+    "source_topic": "ATAM",
+    "difficulty": "中等",
+    "type": "技术题"
+  },
+  {
+    "id": 19,
+    "question": "什么是设计模式？常见的设计模式有哪些分类？",
+    "answer_keyword": "创建型、结构型、行为型三大类",
+    "source_topic": "设计模式",
+    "difficulty": "中等",
+    "type": "技术题"
+  },
+  {
+    "id": 20,
+    "question": "什么是软件复用？",
+    "answer_keyword": "利用已有软件构件构造新软件，提高生产率、降低成本、提升质量",
+    "source_topic": "软件复用",
+    "difficulty": "中等",
+    "type": "概念题"
+  },
+  {
+    "id": 21,
+    "question": "如果一个系统要求高并发和易扩展，应该选择什么架构风格？为什么？",
+    "answer_keyword": "云架构或微服务，云架构通过增减处理单元实现弹性扩展，无中央数据库消除瓶颈",
+    "source_topic": "架构选型",
+    "difficulty": "中等",
+    "type": "应用题"
+  },
+  {
+    "id": 22,
+    "question": "信息系统项目中，风险管理包括哪些过程？",
+    "answer_keyword": "风险识别、风险分析、风险规划、风险监控",
+    "source_topic": "风险管理",
+    "difficulty": "中等",
+    "type": "项目管理题"
+  },
+  {
+    "id": 23,
+    "question": "项目范围管理是什么？",
+    "answer_keyword": "确保项目包含且仅包含完成项目所需的工作，包括范围计划、定义、核实、变更控制",
+    "source_topic": "范围管理",
+    "difficulty": "中等",
+    "type": "项目管理题"
+  },
+  {
+    "id": 24,
+    "question": "什么是项目进度管理？",
+    "answer_keyword": "管理项目按时完成，包括活动定义、排序、资源估算、历时估算、进度控制",
+    "source_topic": "进度管理",
+    "difficulty": "中等",
+    "type": "项目管理题"
+  },
+  {
+    "id": 25,
+    "question": "数据仓库的特点是什么？",
+    "answer_keyword": "面向主题、集成、相对稳定、反映历史变化",
+    "source_topic": "数据仓库",
+    "difficulty": "中等",
+    "type": "技术题"
+  },
+  {
+    "id": 26,
+    "question": "什么是面向服务的架构（SOA）？",
+    "answer_keyword": "将应用程序功能作为服务发布，服务间通过标准接口通信，松耦合、可复用、可组合",
+    "source_topic": "SOA",
+    "difficulty": "中等",
+    "type": "技术题"
+  },
+  {
+    "id": 27,
+    "question": "微服务架构和SOA有什么区别？",
+    "answer_keyword": "微服务更细粒度、独立部署、去中心化、技术栈自由；SOA偏粗粒度、共享ESB、集中式",
+    "source_topic": "架构对比",
+    "difficulty": "中等",
+    "type": "对比题"
+  },
+  {
+    "id": 28,
+    "question": "软件测试有哪些类型？",
+    "answer_keyword": "单元测试、集成测试、确认测试、系统测试、验收测试；白盒/黑盒测试",
+    "source_topic": "软件测试",
+    "difficulty": "中等",
+    "type": "列举题"
+  },
+  {
+    "id": 29,
+    "question": "什么是软件配置管理？",
+    "answer_keyword": "标识、控制、记录配置项的状态和变更，保证产品完整性、一致性、可追溯性",
+    "source_topic": "配置管理",
+    "difficulty": "中等",
+    "type": "概念题"
+  },
+  {
+    "id": 30,
+    "question": "项目质量管理包括哪些过程？",
+    "answer_keyword": "质量计划、质量保证、质量控制",
+    "source_topic": "质量管理",
+    "difficulty": "中等",
+    "type": "项目管理题"
+  }
+]
