@@ -18,6 +18,8 @@ from langchain_core.documents import Document
 
 from rag_common import BASE_DIR, META_FILE
 
+logger = logging.getLogger(__name__)
+
 TOKENIZER_VERSION = "2"  # 分词规则（停用词、过滤逻辑等）变化时递增，使缓存失效
 USERDICT_FILE = BASE_DIR / "bm25_userdict.txt"  # 放仓库根目录：data/*.txt 会被当文档入库
 CACHE_DIR = BASE_DIR / ".bm25_cache"
@@ -121,7 +123,10 @@ def tokenize_corpus(ids: list[str], texts: list[str]) -> tuple[list[list[str]], 
 
 
 class HybridRetriever:
-    """向量 / BM25 / 混合三种检索模式，.invoke(question) 返回 Document 列表。
+    """向量 / BM25 / 混合三种检索模式，.invoke(question, mode=None) 返回 Document 列表。
+
+    构造时的 mode 是默认模式，invoke 可按次覆盖；用到 BM25 的模式要求索引已构建
+    （mode != "vector" 或 build_bm25=True 时构建，否则 invoke 会抛出明确错误）。
 
     每个返回的 Document.metadata 额外带有：
     rrf_score（融合分数）、vec_rank / bm25_rank（1 起的路内排名，未命中为 None）、chunk_id。
@@ -134,6 +139,7 @@ class HybridRetriever:
         mode: str = "hybrid",
         per_route_k: int = 30,
         final_k: int = 20,
+        build_bm25: bool | None = None,
     ):
         if mode not in MODES:
             raise ValueError(f"mode 必须是 {MODES} 之一，收到 {mode!r}")
@@ -147,8 +153,14 @@ class HybridRetriever:
         self._bm25 = None
         self._corpus: dict[str, tuple[str, dict]] = {}
         self._ids: list[str] = []
-        if mode != "vector":
+        if build_bm25 is None:
+            build_bm25 = mode != "vector"
+        if build_bm25:
             self._build_bm25()
+
+    @property
+    def bm25_ready(self) -> bool:
+        return self._bm25 is not None
 
     def _build_bm25(self) -> None:
         """从 Chroma 取全部片段，分词（或读缓存）并建 BM25 索引。"""
@@ -165,6 +177,12 @@ class HybridRetriever:
         self._bm25 = bm25s.BM25()
         self._bm25.index(corpus_tokens, show_progress=False)
         self.build_seconds = time.perf_counter() - start
+        logger.info(
+            "BM25 索引就绪：%d 个片段，用时 %.1fs（分词缓存%s）",
+            len(self._ids),
+            self.build_seconds,
+            "命中" if self.cache_hit else "未命中",
+        )
 
     def _vector_route(self, question: str, k: int) -> list[tuple[str, str, dict]]:
         result = self.collection.query(
@@ -196,11 +214,16 @@ class HybridRetriever:
             hits.append((doc_id, text, metadata))
         return hits
 
-    def invoke(self, question: str) -> list[Document]:
+    def invoke(self, question: str, mode: str | None = None) -> list[Document]:
+        mode = mode or self.mode
+        if mode not in MODES:
+            raise ValueError(f"mode 必须是 {MODES} 之一，收到 {mode!r}")
+        if mode != "vector" and not self.bm25_ready:
+            raise RuntimeError(f"mode={mode!r} 需要 BM25 索引，但构造时未构建（请用 build_bm25=True）")
         routes: list[tuple[str, list[tuple[str, str, dict]]]] = []
-        if self.mode == "vector":
+        if mode == "vector":
             routes.append(("vec", self._vector_route(question, self.final_k)))
-        elif self.mode == "bm25":
+        elif mode == "bm25":
             routes.append(("bm25", self._bm25_route(question, self.final_k)))
         else:
             routes.append(("vec", self._vector_route(question, self.per_route_k)))

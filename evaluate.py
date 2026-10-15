@@ -9,14 +9,13 @@ from dotenv import load_dotenv
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 
+from config import get_settings
 from evaluation_metrics import (
     RagasEvaluator,
     lexical_retrieval_metrics,
     mean_scores,
 )
 from rag_pipeline import (
-    CONTEXT_MIN_SCORE,
-    RERANK_MIN_SCORE,
     ask,
     build_pipeline,
     retrieve_and_rerank,
@@ -28,8 +27,6 @@ load_dotenv()
 
 BASE_DIR = Path(__file__).parent
 EVAL_FILE = BASE_DIR / "eval_questions.json"
-RETRIEVE_K = 20
-RERANK_K = 5
 
 
 def result_path(mode: str, retrieval_only: bool) -> Path:
@@ -39,6 +36,7 @@ def result_path(mode: str, retrieval_only: bool) -> Path:
 
 
 def parse_args():
+    settings = get_settings()  # 默认值来自配置（环境变量 / .env），命令行参数可覆盖
     parser = argparse.ArgumentParser(description="评估 RAG 检索与回答质量")
     parser.add_argument("--limit", type=int, help="只评估前 N 道题，适合冒烟测试")
     parser.add_argument("--start-id", type=int, default=1, help="从指定题号开始")
@@ -55,8 +53,8 @@ def parse_args():
     parser.add_argument(
         "--retrieval-mode",
         choices=("vector", "bm25", "hybrid"),
-        default="hybrid",
-        help="召回方式：向量 / BM25 / 两路 RRF 融合（默认）",
+        default=settings.mode,
+        help=f"召回方式：向量 / BM25 / 两路 RRF 融合（默认 {settings.mode}，可由 RAG_MODE 设置）",
     )
     parser.add_argument(
         "--retrieval-only",
@@ -66,14 +64,14 @@ def parse_args():
     parser.add_argument(
         "--min-score",
         type=float,
-        default=RERANK_MIN_SCORE,
-        help=f"最相关片段的精排得分低于该值则拒答、不调用 LLM（默认 {RERANK_MIN_SCORE}；0 表示不拒答）",
+        default=settings.min_score,
+        help=f"最相关片段的精排得分低于该值则拒答、不调用 LLM（默认 {settings.min_score}；0 表示不拒答）",
     )
     parser.add_argument(
         "--context-min-score",
         type=float,
-        default=CONTEXT_MIN_SCORE,
-        help=f"只把精排得分不低于该值的片段交给 LLM（top1 总是保留；默认 {CONTEXT_MIN_SCORE}；0 表示不过滤）",
+        default=settings.context_min_score,
+        help=f"只把精排得分不低于该值的片段交给 LLM（top1 总是保留；默认 {settings.context_min_score}；0 表示不过滤）",
     )
     return parser.parse_args()
 
@@ -300,10 +298,11 @@ def print_summary(results, mode: str):
 
 def main():
     args = parse_args()
-    api_key = os.getenv("ARK_CHAT_API_KEY")
-    model = os.getenv("ARK_CHAT_MODEL")
-    base_url = os.getenv("ARK_BASE_URL")
-    if not args.retrieval_only and not all((api_key, model, base_url)):
+    settings = get_settings()
+    api_key = settings.chat_api_key.get_secret_value() if settings.chat_api_key else None
+    model = settings.chat_model
+    base_url = settings.base_url
+    if not args.retrieval_only and not settings.llm_configured:
         raise SystemExit("错误：请在 .env 中配置 ARK_CHAT_API_KEY、ARK_CHAT_MODEL 和 ARK_BASE_URL")
 
     questions = load_eval_questions(args.start_id, args.limit)
@@ -314,7 +313,7 @@ def main():
     result_file = result_path(mode, args.retrieval_only)
     print(f"加载 {len(questions)} 道测试题，开始评估（召回模式：{mode}）...")
     print("加载本地 embedding 与 reranker 模型...")
-    pipeline, llm = build_pipeline(retrieve_k=RETRIEVE_K, mode=mode)
+    pipeline, llm = build_pipeline(mode=mode)
     ragas_evaluator = None
     if not args.skip_ragas and not args.retrieval_only:
         ragas_evaluator = RagasEvaluator(
@@ -333,7 +332,7 @@ def main():
 
             if args.retrieval_only:
                 answer, evidence = None, ""
-                reranked, candidates = retrieve_and_rerank(pipeline, prompt, RERANK_K)
+                reranked, candidates = retrieve_and_rerank(pipeline, prompt, settings.rerank_k)
                 refused = should_refuse(reranked, args.min_score)
                 top_score = reranked[0].metadata["rerank_score"] if reranked else None
                 # 与 ask 一致：拒答时没有片段交给 LLM
@@ -342,7 +341,7 @@ def main():
                 outcome = ask(
                     pipeline,
                     prompt,
-                    rerank_k=RERANK_K,
+                    rerank_k=settings.rerank_k,
                     min_score=args.min_score,
                     context_min_score=args.context_min_score,
                 )

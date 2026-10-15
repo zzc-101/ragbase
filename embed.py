@@ -12,13 +12,20 @@ from functools import lru_cache
 from langchain_core.embeddings import Embeddings
 from sentence_transformers import SentenceTransformer
 
+from config import HALF_PRECISION_DEVICES, get_settings, resolve_device
+
 
 class Qwen3Embeddings(Embeddings):
-    def __init__(self, model_name: str = "Qwen/Qwen3-Embedding-0.6B", device: str = "mps"):
-        # torch_dtype=fp16 半精度，省显存、加速；M 芯片 MPS 支持
+    def __init__(self, model_name: str = "Qwen/Qwen3-Embedding-0.6B", device: str | None = None):
+        # device 为空时按配置（RAG_DEVICE，默认 auto：mps > cuda > cpu）解析
+        device = resolve_device(device or get_settings().device)
+        self.device = device
+        # mps / cuda 上用 fp16 半精度，省显存、加速；CPU 保持默认精度
         model_kwargs = {
             "device": device,
-            "model_kwargs": {"torch_dtype": "float16"},
+            "model_kwargs": (
+                {"torch_dtype": "float16"} if device in HALF_PRECISION_DEVICES else {}
+            ),
         }
         try:
             # 已下载时避免每次启动都访问 Hugging Face Hub。

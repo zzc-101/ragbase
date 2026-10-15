@@ -1,38 +1,28 @@
 """查询与评测共用的 RAG 流水线。"""
-import os
+import logging
 import re
-from dataclasses import dataclass
+import threading
+import time
+from dataclasses import dataclass, field
 
 import chromadb
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI
 
+from config import CONTEXT_MIN_SCORE, RERANK_MIN_SCORE, Settings, get_settings, resolve_device
 from embed import Qwen3Embeddings
 from hybrid_retriever import HybridRetriever
 from rag_common import COLLECTION, DB_DIR
 from reranker import Qwen3Reranker
 
 
+logger = logging.getLogger(__name__)
+
 NO_ANSWER = "我没有在文档中找到相关内容。"  # 召回为空或精排得分过低时的固定回答
 
-# 最相关片段的精排得分（P(相关)，0~1）低于该值就拒答、不调用 LLM。
-# 校准（scripts/calibrate_rerank_threshold.py）：45 道库内问题 top1 得分 0.937~0.9999（中位 0.9994），
-# 21 道库外问题 0.0000~0.9882（14 道 < 0.06，其余 0.61~0.99 与库内有重叠）。
-# 取最低库内分 × 0.75 ≈ 0.7：库内零误拒，拦下 15/21；宁可放过也不误拒。
-RERANK_MIN_SCORE = 0.7
-
-# 通过拒答门槛后，只把 rerank_score >= 该值的片段交给 LLM（最相关的 top1 总是保留）；None/0 不过滤。
-# 数据（临时实验脚本，30 道评测题、hybrid、精排 Top5、不调用 LLM）：Reranker 得分高度饱和，
-# 库内题全部 5 个片段都 >= 0.96（Top5 最低 0.9612），所以 <= 0.95 的阈值对库内题等于不过滤：
-#   阈值    平均保留片段   要点召回(point_recall)
-#   0~0.95     5.00          0.8344（与不过滤相同）
-#   0.97       4.87          0.8210（-0.013，超出 0.01 容忍）
-#   0.99       4.63          0.7988
-#   0.998      3.37          0.7121
-# 取满足“要点召回不低于未过滤值 0.01”的最高候选 0.95：库内题零损失，只在片段得分明显偏低时才裁剪。
-# 注意得分已饱和，提高阈值会开始裁掉对比 / 多方面题需要的片段，别盲目调高。
-CONTEXT_MIN_SCORE = 0.95
+# 拒答阈值 RERANK_MIN_SCORE 与上下文过滤阈值 CONTEXT_MIN_SCORE 的取值依据见 config.py
+# （从那里 import，本模块照旧可导入）。
 
 ANSWER_SYSTEM_PROMPT = f"""你是一个文档问答助手。请只根据下面提供的上下文片段回答用户的问题。
 
@@ -62,12 +52,19 @@ ANSWER_HEADING = re.compile(
 )
 
 
+class GenerationError(RuntimeError):
+    """调用大模型生成回答失败（网络、鉴权、限流等）；原始异常在 __cause__ 里。"""
+
+
 @dataclass
 class RAGPipeline:
     retriever: object
     reranker: Qwen3Reranker
-    answer_chain: object
+    answer_chain: object  # 未配置大模型时为 None（只能检索，不能 ask）
     embeddings: Qwen3Embeddings
+    device: str = ""
+    # 本地 embedding / reranker 在 MPS 上不能并发使用：召回 + 精排期间持有该锁（不包含 LLM 调用）
+    lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
 
 def build_answer_chain(llm):
@@ -84,18 +81,32 @@ def build_answer_chain(llm):
 
 
 def build_pipeline(
-    retrieve_k: int = 20,
-    mode: str = "hybrid",
-    per_route_k: int = 30,
-) -> tuple[RAGPipeline, ChatOpenAI]:
+    retrieve_k: int | None = None,
+    mode: str | None = None,
+    per_route_k: int | None = None,
+    device: str | None = None,
+    build_bm25: bool | None = None,
+    settings: Settings | None = None,
+) -> tuple[RAGPipeline, ChatOpenAI | None]:
     """从本地缓存加载模型，并构建检索、精排和生成组件。
 
+    未显式传入的参数取自 settings（默认 get_settings()）：召回数、每路召回数、默认模式、设备、回答模型。
     mode: vector（仅向量）/ bm25（仅关键词）/ hybrid（两路 RRF 融合）。
+    build_bm25: 是否构建 BM25 索引，默认 mode != vector 时构建；API 服务要按请求切换模式，传 True。
+    回答模型未配置齐全时 answer_chain / llm 为 None，仍可检索。
     """
+    settings = settings or get_settings()
+    retrieve_k = retrieve_k or settings.retrieve_k
+    per_route_k = per_route_k or settings.per_route_k
+    mode = mode or settings.mode
+    device = resolve_device(device or settings.device)
+
     # Transformers 并行初始化两个同系列 Qwen 模型时存在偶发 meta tensor 竞态，
     # 因此这里顺序加载；local_files_only 快路径已把冷启动压缩到数秒。
-    embeddings = Qwen3Embeddings()
-    reranker = Qwen3Reranker()
+    start = time.perf_counter()
+    embeddings = Qwen3Embeddings(device=device)
+    reranker = Qwen3Reranker(device=device)
+    logger.info("本地模型加载完成（设备 %s），用时 %.1fs", device, time.perf_counter() - start)
     client = chromadb.PersistentClient(path=DB_DIR)
     collection = client.get_collection(COLLECTION)
     retriever = HybridRetriever(
@@ -104,19 +115,25 @@ def build_pipeline(
         mode=mode,
         per_route_k=per_route_k,
         final_k=retrieve_k,
+        build_bm25=build_bm25,
     )
 
-    llm = ChatOpenAI(
-        model=os.getenv("ARK_CHAT_MODEL"),
-        api_key=os.getenv("ARK_CHAT_API_KEY"),
-        base_url=os.getenv("ARK_BASE_URL"),
-        temperature=0,
-    )
+    llm = None
+    if settings.llm_configured:
+        llm = ChatOpenAI(
+            model=settings.chat_model,
+            api_key=settings.chat_api_key,
+            base_url=settings.base_url,
+            temperature=0,
+        )
+    else:
+        logger.warning("大模型未配置（ARK_CHAT_MODEL / ARK_CHAT_API_KEY / ARK_BASE_URL），只能检索不能生成回答")
     return RAGPipeline(
         retriever=retriever,
         reranker=reranker,
-        answer_chain=build_answer_chain(llm),
+        answer_chain=build_answer_chain(llm) if llm is not None else None,
         embeddings=embeddings,
+        device=device,
     ), llm
 
 
@@ -127,20 +144,30 @@ def format_docs(docs) -> str:
     )
 
 
-def retrieve_and_rerank(pipeline: RAGPipeline, question: str, rerank_k: int = 5):
+def retrieve_and_rerank(
+    pipeline: RAGPipeline,
+    question: str,
+    rerank_k: int = 5,
+    mode: str | None = None,
+):
     """召回并精排（不调用 LLM），返回 (精排片段, 原始候选片段)。
 
     精排片段是候选的副本，metadata 里附带 rerank_score（P(相关)，0~1）；
-    原始候选保持不变。
+    原始候选保持不变。mode 为 None 时用检索器构造时的默认模式。
+    全程持有 pipeline.lock：本地模型不支持并发推理，多线程（API）调用时在此串行。
     """
-    candidates = pipeline.retriever.invoke(question)
-    if not candidates:
-        return [], []  # 空召回不调用 reranker
-    ranked = pipeline.reranker.rerank_with_scores(
-        question,
-        [doc.page_content for doc in candidates],
-        top_k=rerank_k,
-    )
+    with pipeline.lock:
+        if mode is None:
+            candidates = pipeline.retriever.invoke(question)
+        else:
+            candidates = pipeline.retriever.invoke(question, mode=mode)
+        if not candidates:
+            return [], []  # 空召回不调用 reranker
+        ranked = pipeline.reranker.rerank_with_scores(
+            question,
+            [doc.page_content for doc in candidates],
+            top_k=rerank_k,
+        )
     docs = [
         candidates[index].model_copy(update={
             "metadata": {**candidates[index].metadata, "rerank_score": score},
@@ -228,22 +255,27 @@ def ask(
     rerank_k: int = 5,
     min_score: float | None = RERANK_MIN_SCORE,
     context_min_score: float | None = CONTEXT_MIN_SCORE,
+    mode: str | None = None,
 ) -> AskResult:
     """执行召回、精排和生成，返回 AskResult。
 
     无召回结果，或最相关片段的 rerank_score < min_score 时直接返回 NO_ANSWER、
     不调用 LLM（reranked 仍会返回，便于查看最接近的片段）。min_score 为 None 或 0 时不按得分拒答。
     通过后只把 rerank_score >= context_min_score 的片段交给 LLM（None/0 不过滤），
-    LLM 输出的【依据】/【回答】会被拆开。
+    LLM 输出的【依据】/【回答】会被拆开。mode 为 None 时用默认召回模式；
+    大模型调用失败抛 GenerationError（不在锁内，慢生成不会阻塞别的检索）。
     """
-    reranked, candidates = retrieve_and_rerank(pipeline, question, rerank_k)
+    reranked, candidates = retrieve_and_rerank(pipeline, question, rerank_k, mode)
     top_score = reranked[0].metadata["rerank_score"] if reranked else None
     if should_refuse(reranked, min_score):
         return AskResult(NO_ANSWER, "", [], reranked, candidates, True, top_score)
     docs = select_context_docs(reranked, context_min_score)
-    raw = pipeline.answer_chain.invoke({
-        "context": format_docs(docs),
-        "input": question,
-    })
+    try:
+        raw = pipeline.answer_chain.invoke({
+            "context": format_docs(docs),
+            "input": question,
+        })
+    except Exception as exc:
+        raise GenerationError(f"大模型调用失败：{type(exc).__name__}") from exc
     evidence, answer = split_evidence_answer(raw)
     return AskResult(answer, evidence, docs, reranked, candidates, False, top_score)

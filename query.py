@@ -7,31 +7,33 @@ import argparse
 import os
 
 from dotenv import load_dotenv
+from config import get_settings
 from rag_common import collection_count
-from rag_pipeline import CONTEXT_MIN_SCORE, RERANK_MIN_SCORE, ask, build_pipeline
+from rag_pipeline import ask, build_pipeline
 
 load_dotenv()
 
 
 def parse_args():
+    settings = get_settings()  # 默认值来自配置（环境变量 / .env），命令行参数可覆盖
     parser = argparse.ArgumentParser(description="RAG 命令行问答")
     parser.add_argument(
         "--mode",
         choices=("vector", "bm25", "hybrid"),
-        default="hybrid",
-        help="召回方式：向量 / BM25 / 两路 RRF 融合（默认）",
+        default=settings.mode,
+        help=f"召回方式：向量 / BM25 / 两路 RRF 融合（默认 {settings.mode}，可由 RAG_MODE 设置）",
     )
     parser.add_argument(
         "--min-score",
         type=float,
-        default=RERANK_MIN_SCORE,
-        help=f"最相关片段的精排得分（0~1）低于该值则拒答、不调用大模型（默认 {RERANK_MIN_SCORE}；0 表示不拒答）",
+        default=settings.min_score,
+        help=f"最相关片段的精排得分（0~1）低于该值则拒答、不调用大模型（默认 {settings.min_score}；0 表示不拒答）",
     )
     parser.add_argument(
         "--context-min-score",
         type=float,
-        default=CONTEXT_MIN_SCORE,
-        help=f"只把精排得分不低于该值的片段交给大模型（最相关片段总是保留；默认 {CONTEXT_MIN_SCORE}；0 表示不过滤）",
+        default=settings.context_min_score,
+        help=f"只把精排得分不低于该值的片段交给大模型（最相关片段总是保留；默认 {settings.context_min_score}；0 表示不过滤）",
     )
     return parser.parse_args()
 
@@ -58,7 +60,8 @@ def source_label(metadata: dict) -> str:
 
 def main():
     args = parse_args()
-    if not os.getenv("ARK_CHAT_API_KEY"):
+    settings = get_settings()
+    if not settings.chat_api_key:
         print("错误：请先在 .env 文件里填写 ARK_CHAT_API_KEY")
         return
     if not collection_count():
@@ -66,7 +69,7 @@ def main():
         return
 
     print("加载本地 embedding 与 reranker 模型...")
-    pipeline, _ = build_pipeline(retrieve_k=20, mode=args.mode)
+    pipeline, _ = build_pipeline(mode=args.mode)
 
     print(f"RAG 问答已就绪（召回模式：{args.mode}），输入问题开始（输入 exit 退出）")
     while True:
@@ -79,7 +82,7 @@ def main():
         result = ask(
             pipeline,
             q,
-            rerank_k=5,
+            rerank_k=settings.rerank_k,
             min_score=args.min_score,
             context_min_score=args.context_min_score,
         )
