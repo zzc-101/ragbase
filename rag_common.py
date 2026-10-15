@@ -1,11 +1,14 @@
-"""RAG 公共配置与文档入库工具。"""
+"""RAG 公共配置、稳定 ID 与入库编排工具。"""
 import hashlib
 import json
-import os
+from dataclasses import asdict
 from pathlib import Path
 
 from dotenv import load_dotenv
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+from document_cleaner import clean_documents
+from document_parser import load_document
+from document_splitter import split_documents
 
 load_dotenv()
 
@@ -14,45 +17,7 @@ DATA_DIR = BASE_DIR / "data"
 DB_DIR = str(BASE_DIR / "chroma_db")
 COLLECTION = "rag"
 META_FILE = BASE_DIR / ".ingest_meta.json"  # 记录文件指纹，用于增量更新
-
-# 支持的文件格式 -> 后缀集合
-SUPPORTED_EXTS = {".pdf", ".docx", ".doc", ".md", ".markdown", ".txt"}
-
-# 切分器（中文友好：按段落 -> 句号 -> 逗号）
-SPLITTER = RecursiveCharacterTextSplitter(
-    chunk_size=500,
-    chunk_overlap=50,
-    separators=["\n\n", "\n", "。", "！", "？", "，", " ", ""],
-)
-
-
-def load_document(path: Path):
-    """按文件格式选择合适的 loader，返回 Document 列表。
-
-    支持格式：PDF / Word(.docx) / Markdown / 纯文本
-    """
-    ext = path.suffix.lower()
-    if ext == ".pdf":
-        from langchain_community.document_loaders import PyMuPDFLoader
-        loader = PyMuPDFLoader(str(path))
-    elif ext in (".docx", ".doc"):
-        from langchain_community.document_loaders import Docx2txtLoader
-        loader = Docx2txtLoader(str(path))
-    elif ext in (".md", ".markdown", ".txt"):
-        from langchain_community.document_loaders import TextLoader
-        # text_loader_kwargs 解决部分文件编码问题
-        loader = TextLoader(str(path), encoding="utf-8", autodetect_encoding=True)
-    else:
-        raise ValueError(f"不支持的格式：{ext}（仅支持 {SUPPORTED_EXTS}）")
-    return loader.load()
-
-
-def list_documents() -> list[Path]:
-    """列出 data/ 下所有支持的文档文件。"""
-    files = []
-    for ext in SUPPORTED_EXTS:
-        files.extend(DATA_DIR.glob(f"*{ext}"))
-    return sorted(files)
+INGEST_PIPELINE_VERSION = "2"  # 解析/清洗/切分规则变化时递增
 
 
 def file_fingerprint(path: Path) -> str:
@@ -62,7 +27,10 @@ def file_fingerprint(path: Path) -> str:
     不用内容哈希是因为大文件读一遍太慢，mtime+size 足够检测改动。
     """
     stat = path.stat()
-    raw = f"{path.name}|{stat.st_size}|{int(stat.st_mtime)}"
+    raw = (
+        f"{INGEST_PIPELINE_VERSION}|{path.name}|"
+        f"{stat.st_size}|{int(stat.st_mtime)}"
+    )
     return hashlib.md5(raw.encode()).hexdigest()
 
 
@@ -101,15 +69,38 @@ def save_ingest_meta(meta: dict) -> None:
     temp_file.replace(META_FILE)
 
 
+def collection_count(db_dir: str = DB_DIR, name: str = COLLECTION) -> int | None:
+    """返回集合片段数；索引目录或集合不存在时返回 None（不加载任何模型）。"""
+    if not Path(db_dir).exists():  # PersistentClient 会自动建目录，所以先判断
+        return None
+    import chromadb
+
+    try:
+        return chromadb.PersistentClient(path=db_dir).get_collection(name).count()
+    except Exception:
+        return None
+
+
 def prepare_file_chunks(path: Path):
-    """解析并切分单个文件，返回可直接写入 Chroma 的文本、元数据和稳定 ID。"""
+    """编排解析、清洗和切分，返回 Chroma 载荷及预处理报告。"""
     fid = file_id(path)
-    chunks = SPLITTER.split_documents(load_document(path))
+    parsed_documents = load_document(path)
+    cleaned_documents, cleaning_report = clean_documents(parsed_documents)
+    chunks, splitting_report = split_documents(cleaned_documents)
     texts, metadatas, ids = [], [], []
     for index, chunk in enumerate(chunks):
         metadata = dict(chunk.metadata)
         metadata["fid"] = fid
+        metadata["chunk_index"] = index
+        metadata["content_hash"] = hashlib.sha256(
+            chunk.page_content.encode("utf-8")
+        ).hexdigest()[:16]
         texts.append(chunk.page_content)
         metadatas.append(metadata)
         ids.append(chunk_id(fid, index))
-    return texts, metadatas, ids
+    report = {
+        "parsed_documents": len(parsed_documents),
+        "cleaning": asdict(cleaning_report),
+        "splitting": asdict(splitting_report),
+    }
+    return texts, metadatas, ids, report

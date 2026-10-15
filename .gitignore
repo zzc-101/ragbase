@@ -5,6 +5,8 @@ __pycache__/
 .venv/
 .ingest_meta.json
 .DS_Store
+.ragas_cache/
+.bm25_cache/
 
 # 忽略 data/ 下的所有文档素材（PDF/Word/Markdown等）
 data/*
@@ -12,3 +14,4 @@ data/*
 
 # 评估结果
 eval_results.json
+eval_results.*.json

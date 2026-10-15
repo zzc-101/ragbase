@@ -9,18 +9,20 @@ from pathlib import Path
 
 from langchain_community.vectorstores import Chroma
 import chromadb
+from document_parser import list_documents, report_skipped
 from embed import Qwen3Embeddings
 from rag_common import (
     DATA_DIR, DB_DIR, COLLECTION, META_FILE,
-    build_ingest_meta, list_documents, prepare_file_chunks, save_ingest_meta,
+    build_ingest_meta, prepare_file_chunks, save_ingest_meta,
 )
 
 
 def main():
-    docs_paths = list_documents()
+    docs_paths, skipped = list_documents(DATA_DIR)
+    report_skipped(skipped)
     if not docs_paths:
         print(f"错误：在 {DATA_DIR} 下没找到文档")
-        print(f"支持格式：PDF / Word(.docx) / Markdown / 纯文本")
+        print("支持格式：PDF / Word(.docx) / Markdown / 纯文本")
         return
 
     # 清空旧索引后重建
@@ -44,7 +46,7 @@ def main():
     total = 0
     for file_index, path in enumerate(docs_paths, 1):
         print(f"  [{file_index}/{len(docs_paths)}] 解析并索引：{path.name}")
-        texts, metadatas, ids = prepare_file_chunks(path)
+        texts, metadatas, ids, report = prepare_file_chunks(path)
         for start in range(0, len(texts), batch_size):
             end = start + batch_size
             vectordb.add_texts(
@@ -53,7 +55,16 @@ def main():
                 ids=ids[start:end],
             )
         total += len(texts)
-        print(f"    -> {len(texts)} 个片段")
+        cleaning = report["cleaning"]
+        splitting = report["splitting"]
+        print(
+            f"    -> {len(texts)} 个片段 | "
+            f"清除模板行 {cleaning['repeated_boilerplate_lines_removed']} | "
+            f"空页 {cleaning['empty_documents_removed']} | "
+            f"重复片段 {splitting['duplicate_chunks_removed']}"
+        )
+        if report["parsed_documents"] and not texts:
+            print("    警告：文档没有可索引文本，扫描版 PDF 需要 OCR")
 
     # 只有全部文件成功入库后才更新元数据
     save_ingest_meta(build_ingest_meta(docs_paths))

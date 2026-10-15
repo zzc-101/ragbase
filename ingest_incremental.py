@@ -6,24 +6,28 @@
 """
 from langchain_community.vectorstores import Chroma
 import chromadb
+from document_parser import list_documents, report_skipped
 from embed import Qwen3Embeddings
 from rag_common import (
     DATA_DIR, DB_DIR, COLLECTION,
-    build_ingest_meta, list_documents, load_ingest_meta,
+    build_ingest_meta, collection_count, load_ingest_meta,
     prepare_file_chunks, save_ingest_meta,
 )
 
 
-def main():
-    docs_paths = list_documents()
-    old_meta = load_ingest_meta()
-    if not docs_paths and not old_meta:
-        print(f"错误：在 {DATA_DIR} 下没找到文档")
-        return
+def plan_changes(old_meta: dict, cur_meta: dict, collection_count: int | None):
+    """对比旧元数据和当前文件，返回 (to_add, deleted, unchanged, reason)。
 
-    cur_meta = build_ingest_meta(docs_paths)
+    collection_count 为 None 表示索引集合不存在。reason：
+    None=正常增量；"index_missing"=有元数据但索引缺失/为空，全量重建；
+    "legacy"=旧版索引（有数据但无元数据），迁移为可增量索引。
+    """
+    index_empty = not collection_count
+    if old_meta and index_empty:
+        return list(cur_meta), [], 0, "index_missing"
+    if not old_meta and not index_empty:
+        return list(cur_meta), [], 0, "legacy"
 
-    # 分类：新增/修改、未变、已删除
     to_add = []      # fid 列表
     unchanged = 0
     for fid, info in cur_meta.items():
@@ -33,6 +37,25 @@ def main():
         else:
             unchanged += 1
     deleted = [fid for fid in old_meta if fid not in cur_meta]
+    return to_add, deleted, unchanged, None
+
+
+def main():
+    docs_paths, skipped = list_documents(DATA_DIR)
+    report_skipped(skipped)
+    old_meta = load_ingest_meta()
+    if not docs_paths and not old_meta:
+        print(f"错误：在 {DATA_DIR} 下没找到文档")
+        return
+
+    cur_meta = build_ingest_meta(docs_paths)
+    to_add, deleted, unchanged, reason = plan_changes(
+        old_meta, cur_meta, collection_count(),
+    )
+    if reason == "index_missing":
+        print("检测到索引缺失或为空，将全量重建。")
+    elif reason == "legacy":
+        print("检测到旧版索引（缺少文件元数据），本次将迁移为可增量更新的索引。")
 
     print(f"文件状态：新增/修改 {len(to_add)} 个，未变 {unchanged} 个，已删除 {len(deleted)} 个")
 
@@ -43,18 +66,9 @@ def main():
     print("加载本地 embedding 模型 Qwen3-Embedding-0.6B...")
     embeddings = Qwen3Embeddings()
     client = chromadb.PersistentClient(path=DB_DIR)
-
-    # 兼容旧版全量索引：旧数据没有 fid，无法安全地按文件删除，首次增量时重建集合。
-    legacy_index = not old_meta
-    try:
-        legacy_index = legacy_index and client.get_collection(COLLECTION).count() > 0
-    except Exception:
-        legacy_index = False
-    if legacy_index:
-        print("检测到旧版索引（缺少文件元数据），本次将迁移为可增量更新的索引。")
+    if reason == "legacy":
+        # 旧数据没有 fid，无法安全地按文件删除，重建集合。
         client.delete_collection(COLLECTION)
-        to_add = list(cur_meta)
-        deleted = []
 
     vectordb = Chroma(
         client=client,
@@ -78,7 +92,7 @@ def main():
         collection.delete(where={"fid": fid})
 
         print(f"索引中：{info['name']}")
-        texts, metadatas, ids = prepare_file_chunks(path)
+        texts, metadatas, ids, report = prepare_file_chunks(path)
 
         # 必须通过 vectordb 写入，使其使用 Qwen3Embeddings 生成 1024 维向量。
         batch_size = 1000
@@ -88,7 +102,16 @@ def main():
                 metadatas=metadatas[i:i+batch_size],
                 ids=ids[i:i+batch_size],
             )
-        print(f"  -> {len(texts)} 个片段已入库")
+        cleaning = report["cleaning"]
+        splitting = report["splitting"]
+        print(
+            f"  -> {len(texts)} 个片段 | "
+            f"清除模板行 {cleaning['repeated_boilerplate_lines_removed']} | "
+            f"空页 {cleaning['empty_documents_removed']} | "
+            f"重复片段 {splitting['duplicate_chunks_removed']}"
+        )
+        if report["parsed_documents"] and not texts:
+            print("  警告：文档没有可索引文本，扫描版 PDF 需要 OCR")
 
     # 3. 保存新指纹
     save_ingest_meta(cur_meta)
