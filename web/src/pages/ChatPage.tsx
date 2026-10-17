@@ -11,6 +11,10 @@ import { Sheet, SheetContent, SheetDescription, SheetTitle } from '@/components/
 import { useHealth, useSessions } from '@/hooks/queries'
 import { useChat } from '@/hooks/useChat'
 import { useMediaQuery } from '@/hooks/useMediaQuery'
+import { safeStorage } from '@/lib/storage'
+import { cn } from '@/lib/utils'
+
+const SIDEBAR_COLLAPSED_KEY = 'rag.sidebar.collapsed'
 
 export function ChatPage() {
   const { sessionId: routeId } = useParams()
@@ -19,9 +23,17 @@ export function ChatPage() {
   const { data: sessions } = useSessions()
   const { data: health } = useHealth()
 
-  const wideSidebar = useMediaQuery('(min-width: 1024px)')
+  // ≥768px 会话栏常驻（可收起成图标栏）；<768px 改抽屉。依据面板 ≥1280px 才停靠，让位给会话导航。
+  const dockedSidebar = useMediaQuery('(min-width: 768px)')
   const wideSources = useMediaQuery('(min-width: 1280px)')
   const [sidebarSheet, setSidebarSheet] = useState(false)
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(() => safeStorage.get('local', SIDEBAR_COLLAPSED_KEY) === '1')
+  const toggleSidebar = useCallback(() => {
+    setSidebarCollapsed((prev) => {
+      safeStorage.set('local', SIDEBAR_COLLAPSED_KEY, prev ? null : '1')
+      return !prev
+    })
+  }, [])
   const [panelOpen, setPanelOpen] = useState(true) // 宽屏：右侧面板是否展开
   const [sourcesSheet, setSourcesSheet] = useState(false) // 窄屏：依据抽屉
   // 依据面板里手动选中的回答 / 编号；key 变化（换会话、来了新的带引用回答）后自动作废
@@ -54,6 +66,7 @@ export function ChatPage() {
   const onOpenSources = useCallback((messageId: string) => openSources(messageId, null), [openSources])
 
   const title = sessions?.find((s) => s.session_id === chat.sessionId)?.title
+  const heading = title ?? (chat.sessionId ? '对话' : '新对话')
   const empty = chat.messages.length === 0
   const agentDown = health && !(health.status === 'ok' && health.agent_ready)
 
@@ -68,21 +81,35 @@ export function ChatPage() {
 
   return (
     <div className="flex h-full min-h-0">
-      {wideSidebar && (
-        <aside className="w-[260px] shrink-0 border-r" aria-label="会话">
-          <SessionSidebar activeId={chat.sessionId} />
+      {dockedSidebar && (
+        <aside
+          className={cn(
+            'shrink-0 border-r transition-[width] duration-200 ease-out',
+            sidebarCollapsed ? 'w-14' : 'w-[220px] lg:w-[260px]',
+          )}
+          aria-label="会话"
+        >
+          <SessionSidebar activeId={chat.sessionId} collapsed={sidebarCollapsed} onToggleCollapsed={toggleSidebar} />
         </aside>
       )}
 
       <section className="flex min-w-0 flex-1 flex-col">
         <div className="flex h-11 shrink-0 items-center justify-between gap-2 border-b px-3">
           <div className="flex min-w-0 items-center gap-1">
-            {!wideSidebar && (
-              <Button variant="ghost" size="icon-sm" aria-label="打开会话列表" onClick={() => setSidebarSheet(true)}>
+            {dockedSidebar ? (
+              <h2 className="truncate px-1 text-sm text-muted-foreground">{heading}</h2>
+            ) : (
+              <Button
+                variant="ghost"
+                size="sm"
+                aria-label={`打开会话列表（当前：${heading}）`}
+                className="-ml-1 min-w-0 justify-start gap-1.5 px-2 text-muted-foreground"
+                onClick={() => setSidebarSheet(true)}
+              >
                 <PanelLeft />
+                <span className="truncate">{heading}</span>
               </Button>
             )}
-            <h2 className="truncate px-1 text-sm text-muted-foreground">{title ?? (chat.sessionId ? '对话' : '新对话')}</h2>
           </div>
           <Button
             variant="ghost"
@@ -144,9 +171,9 @@ export function ChatPage() {
         </aside>
       )}
 
-      {!wideSidebar && (
+      {!dockedSidebar && (
         <Sheet open={sidebarSheet} onOpenChange={setSidebarSheet}>
-          <SheetContent side="left" className="w-[280px] p-0" showCloseButton={false}>
+          <SheetContent side="left" className="w-[min(86vw,300px)] p-0" showCloseButton={false}>
             <SheetTitle className="sr-only">会话列表</SheetTitle>
             <SheetDescription className="sr-only">选择或删除历史会话，或开始新对话</SheetDescription>
             <SessionSidebar activeId={chat.sessionId} onNavigate={() => setSidebarSheet(false)} />

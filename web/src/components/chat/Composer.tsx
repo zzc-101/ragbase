@@ -36,7 +36,7 @@ export function Composer({ streaming, sources, onSourcesChange, onSend, onStop }
   }
 
   return (
-    <div className="shrink-0 bg-background px-4 pt-2 pb-4">
+    <div className="shrink-0 bg-background px-3 pt-2 pb-3 sm:px-4 sm:pb-4">
       <div className="mx-auto w-full max-w-[720px]">
         <div className="rounded-2xl border bg-card transition-shadow duration-150 focus-within:border-primary/50 focus-within:ring-[3px] focus-within:ring-ring/20">
           <textarea

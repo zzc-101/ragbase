@@ -48,7 +48,7 @@ export function MessageList({ messages, streaming, onSelectCitation, onOpenSourc
   return (
     <div className="relative min-h-0 flex-1">
       <ScrollArea className="h-full" viewportRef={viewport} onViewportScroll={onScroll}>
-        <div className="mx-auto w-full max-w-[720px] space-y-8 px-4 pt-6 pb-8" role="log" aria-live="off" aria-label="对话消息">
+        <div className="mx-auto w-full max-w-[720px] space-y-8 px-3 pt-6 pb-8 sm:px-4" role="log" aria-live="off" aria-label="对话消息">
           {messages.map((message) => (
             <MessageView
               key={message.id}

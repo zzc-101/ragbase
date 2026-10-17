@@ -89,7 +89,7 @@ export const MessageView = memo(function MessageView({ message, onSelectCitation
       )}
 
       {message.status === 'done' && hasText && (
-        <footer className="mt-2 flex items-center gap-1 text-xs text-muted-foreground">
+        <footer className="mt-2 flex flex-wrap items-center gap-1 text-xs text-muted-foreground">
           <CopyButton text={message.content} />
           {message.tookMs != null && <span className="tabular px-1">{formatDuration(message.tookMs)}</span>}
           {message.citations.length > 0 && (
