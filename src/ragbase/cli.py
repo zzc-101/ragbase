@@ -5,6 +5,7 @@
 """
 import argparse
 import json
+import logging
 import sys
 import uuid
 
@@ -13,7 +14,7 @@ from ragbase.config import VECTOR_STORES, get_settings, load_env
 
 LLM_MISSING_HINT = "错误：请先在 .env 里配置 RAG_LLM_API_KEY、RAG_LLM_MODEL 和 RAG_LLM_BASE_URL（旧的 ARK_* 变量同样有效）"
 INDEX_MISSING_HINT = "错误：索引不存在或为空，请先运行：ragbase ingest --full"
-MODEL_LOADING_HINT = "加载本地 embedding 与 reranker 模型..."
+MODEL_LOADING_HINT = "加载 embedding 与 reranker（本地模型或云端接口，按配置）..."
 
 
 # ---------------------------------------------------------------- init / models / doctor（开箱即用）
@@ -49,7 +50,7 @@ def _cmd_init(args) -> None:
     print(f"  {step}. 编辑 .env，填入大模型配置 RAG_LLM_BASE_URL / RAG_LLM_API_KEY / RAG_LLM_MODEL（任意 OpenAI 兼容服务）")
     if not api_key:
         print("     对外开放服务（RAG_HOST=0.0.0.0 / Docker）前，务必同时设置 RAG_API_KEY（可用 ragbase init --api-key --force 生成）")
-    print(f"  {step + 1}. 下载本地模型：ragbase models download   （国内网络：HF_ENDPOINT=https://hf-mirror.com ragbase models download）")
+    print(f"  {step + 1}. 下载本地模型：ragbase models download   （国内网络：HF_ENDPOINT=https://hf-mirror.com ragbase models download；embedding / reranker 都改用云端 API 则可跳过，见 .env 第 3 节）")
     print(f"  {step + 2}. 把文档放进 data/，然后建立索引：ragbase ingest")
     print(f"  {step + 3}. 体检：ragbase doctor；启动：ragbase serve   （浏览器打开 http://127.0.0.1:8000/）")
 
@@ -58,6 +59,9 @@ def _cmd_models_download(args) -> None:
     from ragbase.models.download import ensure_models
 
     settings = get_settings()
+    if not settings.uses_local_models:
+        print(f"embedding（{settings.embedding_provider}）与 reranker（{settings.reranker_provider}）都不使用本地模型，无需下载。")
+        return
     print("检查本地模型缓存（已缓存的会跳过，不联网）...")
     results = ensure_models(settings)
     failed = [spec for spec, status in results if status.startswith("failed")]
@@ -75,7 +79,7 @@ def _cmd_models_download(args) -> None:
 def _cmd_doctor(args) -> None:
     from ragbase.doctor import run_doctor
 
-    code = run_doctor(get_settings(), check_llm_call=args.check_llm)
+    code = run_doctor(get_settings(), check_llm_call=args.check_llm, check_models_call=args.check_models)
     if code:
         raise SystemExit(code)
 
@@ -111,8 +115,35 @@ def _ensure_models_for_serve(settings, download: bool) -> None:
     raise SystemExit(1)
 
 
+def _preflight(settings) -> str | None:
+    """启动前的快速检查（不加载任何模型）：云端提供方配置是否完整、索引的 embedding 签名是否与当前配置一致。
+    有问题返回要展示的中文说明，没问题返回 None。"""
+    from ragbase.index_info import IndexMismatchError, ensure_index_compatible
+    from ragbase.models.factory import provider_problems
+    from ragbase.vectorstores import create_vector_store
+
+    problems = provider_problems(settings)
+    if problems:
+        return "模型提供方配置有误：\n" + "\n".join(f"  - {text}" for text in problems)
+    store = create_vector_store(settings)
+    try:
+        ensure_index_compatible(settings, store)
+    except IndexMismatchError as exc:
+        return str(exc)
+    except Exception as exc:  # 向量库打不开等：交给后面的流程报错，这里不拦
+        logging.getLogger(__name__).debug("预检索引签名失败：%s", exc)
+    finally:
+        store.close()
+    return None
+
+
 def _cmd_serve(args) -> None:
-    _ensure_models_for_serve(get_settings(), args.download_models)
+    settings = get_settings()
+    problem = _preflight(settings)
+    if problem:
+        print(f"错误：{problem}")
+        raise SystemExit(1)
+    _ensure_models_for_serve(settings, args.download_models)
     from ragbase.api.app import serve
 
     serve(host=args.host, port=args.port)
@@ -121,18 +152,26 @@ def _cmd_serve(args) -> None:
 # ---------------------------------------------------------------- ingest（原 ingest_incremental.py / ingest.py）
 
 class LazyEmbedder:
-    """第一次真正需要向量化时才加载本地模型，没有变化时不必等模型加载。"""
+    """第一次真正需要向量化时才创建 embedding（本地模型加载较慢；云端只是建客户端），没有变化时不必等。"""
 
-    def __init__(self):
+    def __init__(self, settings=None):
+        self._settings = settings or get_settings()
         self._embeddings = None
 
     def __call__(self, texts):
         if self._embeddings is None:
-            from ragbase.models.embeddings import Qwen3Embeddings
-
-            print(f"加载本地 embedding 模型 {get_settings().embedding_model}...")
-            self._embeddings = Qwen3Embeddings()
+            self._embeddings = _create_embeddings(self._settings)
         return self._embeddings.embed_documents(texts)
+
+
+def _create_embeddings(settings):
+    from ragbase.models.factory import create_embeddings
+
+    if settings.embedding_provider == "local":
+        print(f"加载本地 embedding 模型 {settings.embedding_model}...")
+    else:
+        print(f"使用云端 embedding：{settings.embedding_provider} / {settings.embedding_model}")
+    return create_embeddings(settings)
 
 
 def _cmd_ingest(args) -> None:
@@ -147,15 +186,29 @@ def _ingest_incremental() -> None:
     from ragbase.ingest.service import print_progress, run_ingest
     from ragbase.vectorstores import create_vector_store
 
+    from ragbase.index_info import IndexMismatchError, IndexRecorder, ensure_index_compatible
+    from ragbase.models.factory import provider_problems
+
     settings = get_settings()
+    problems = provider_problems(settings)
+    if problems:
+        print("错误：模型提供方配置有误：\n" + "\n".join(f"  - {text}" for text in problems))
+        raise SystemExit(1)
     store = create_vector_store(settings)
     try:
+        try:
+            ensure_index_compatible(settings, store)  # embedding 配置与索引不一致就拒绝（--full 不受限）
+        except IndexMismatchError as exc:
+            print(f"错误：{exc}")
+            raise SystemExit(1)
+        recorder = IndexRecorder(settings, store)
         result = run_ingest(
             settings.data_dir,
             store,
-            LazyEmbedder(),
+            recorder.wrap(LazyEmbedder(settings)),
             settings.meta_file,
             progress=print_progress,
+            before_write=recorder.begin,
         )
         if result.failed_files:
             print(f"\n有 {len(result.failed_files)} 个文件入库失败，其余文件已写入；修复后重新运行即可重试。")
@@ -177,6 +230,9 @@ def _ingest_full() -> None:
     from ragbase.ingest.service import print_progress, run_ingest
     from ragbase.vectorstores import create_vector_store
 
+    from ragbase.index_info import IndexRecorder
+    from ragbase.models.factory import provider_problems
+
     settings = get_settings()
     data_dir, meta_file = settings.data_dir, settings.meta_file
     docs_paths, skipped = list_documents(data_dir)
@@ -185,21 +241,27 @@ def _ingest_full() -> None:
         print(f"错误：在 {data_dir} 下没找到文档")
         print("支持格式：PDF / Word(.docx) / Markdown / 纯文本")
         return
+    problems = provider_problems(settings)
+    if problems:
+        print("错误：模型提供方配置有误：\n" + "\n".join(f"  - {text}" for text in problems))
+        raise SystemExit(1)
 
     store = create_vector_store(settings)
     try:
+        # 先创建 embedding（本地模型加载 / 云端配置校验失败时不会动旧索引）
+        # 默认本地 Qwen3-Embedding-0.6B（100+ 语言含中文+代码）；RAG_EMBEDDING_PROVIDER=openai 改用云端接口
+        embeddings = _create_embeddings(settings)
         # 清空旧索引后重建
         store.reset()
-        # 避免重建中断后留下与半成品索引不匹配的旧元数据
+        # 避免重建中断后留下与半成品索引不匹配的旧元数据 / 旧签名（run_ingest 写入第一批前会登记新签名）
         meta_file.unlink(missing_ok=True)
-
-        # 本地 embedding：默认 Qwen3-Embedding-0.6B（2025年，100+语言含中文+代码），可用 RAG_EMBEDDING_MODEL 更换
-        print(f"加载本地 embedding 模型 {settings.embedding_model}...")
-        from ragbase.models.embeddings import Qwen3Embeddings
-
-        embeddings = Qwen3Embeddings()
+        settings.index_info_path.unlink(missing_ok=True)
+        recorder = IndexRecorder(settings, store)
         # 库已清空、无元数据，run_ingest 会把所有文件当作新增；每个文件成功后才写入其元数据
-        result = run_ingest(data_dir, store, embeddings.embed_documents, meta_file, progress=print_progress)
+        result = run_ingest(
+            data_dir, store, recorder.wrap(embeddings.embed_documents), meta_file,
+            progress=print_progress, before_write=recorder.begin,
+        )
     finally:
         store.close()
 
@@ -259,8 +321,12 @@ def _cmd_ask(args) -> None:
     if not collection_count(settings):
         print(INDEX_MISSING_HINT)
         return
+    problem = _preflight(settings)
+    if problem:
+        print(f"错误：{problem}")
+        return
 
-    print("加载本地 embedding 与 reranker 模型...")
+    print(MODEL_LOADING_HINT)
     pipeline, _ = build_pipeline(mode=args.mode)
     sources = list(dict.fromkeys(args.source)) or None
     if sources:
@@ -359,6 +425,10 @@ def _cmd_chat(args) -> None:
     if not collection_count(settings):
         print(INDEX_MISSING_HINT)
         return
+    problem = _preflight(settings)
+    if problem:
+        print(f"错误：{problem}")
+        return
 
     print(MODEL_LOADING_HINT)
     pipeline, _ = build_pipeline(settings=settings, build_bm25=True)
@@ -421,24 +491,29 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--api-key", action="store_true", help="生成一把随机接口密钥写入新 .env 的 RAG_API_KEY（对外开放服务时用）")
     init.set_defaults(func=_cmd_init)
 
-    models = sub.add_parser("models", help="管理本地模型（embedding + reranker）", description="管理本地模型。缓存位置跟随 HF_HOME，镜像用 HF_ENDPOINT。")
+    models = sub.add_parser("models", help="管理本地模型（embedding + reranker）", description="管理本地模型（只涉及提供方为 local 的那个；云端提供方无需下载）。缓存位置跟随 HF_HOME，镜像用 HF_ENDPOINT。")
     models_sub = models.add_subparsers(dest="models_command", metavar="{download}", required=True)
     download = models_sub.add_parser(
         "download",
         help="下载 embedding 与 reranker 权重到 Hugging Face 缓存",
         description=(
             f"下载 {settings.embedding_model}（RAG_EMBEDDING_MODEL）与 {settings.reranker_model}（RAG_RERANKER_MODEL）到 Hugging Face 缓存"
-            "（HF_HOME，默认 ~/.cache/huggingface）；已缓存的跳过。国内网络：HF_ENDPOINT=https://hf-mirror.com ragbase models download"
+            "（HF_HOME，默认 ~/.cache/huggingface）；已缓存的跳过；提供方是云端 API 的不下载。国内网络：HF_ENDPOINT=https://hf-mirror.com ragbase models download"
         ),
     )
     download.set_defaults(func=_cmd_models_download)
 
     doctor = sub.add_parser(
         "doctor",
-        help="环境自检（Python、路径、设备、模型、向量库、大模型配置、鉴权、Web 资源）",
+        help="环境自检（Python、路径、模型提供方与设备、向量库与索引签名、大模型配置、鉴权、Web 资源）",
         description="一屏环境自检，给出 ✓ / ! / ✗ 和修复提示；有 ✗ 时退出码非零。默认不调用大模型、不加载模型。",
     )
     doctor.add_argument("--check-llm", action="store_true", help="额外发一次最小的大模型请求，验证地址 / 密钥 / 模型名（会产生极少量 API 调用）")
+    doctor.add_argument(
+        "--check-models",
+        action="store_true",
+        help="额外对每个云端 embedding / rerank 接口各发一次最小请求，验证地址 / 密钥 / 模型名（会产生极少量 API 调用）",
+    )
     doctor.set_defaults(func=_cmd_doctor)
 
     serve = sub.add_parser("serve", help="启动 HTTP 服务（含 Web 界面）", description="启动 HTTP 服务（单进程，不要多 worker）")
@@ -564,9 +639,25 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _skip_torch_if_all_cloud(args) -> None:
+    """embedding 与 reranker 都不用本地模型时，不让 torch / transformers 被顺带加载（启动更快、更省内存），见 block_local_ml_imports。
+    只对会走检索 / 入库的命令生效；eval（ragas 可能用到它们）和 doctor / models 不受影响。"""
+    if args.command not in ("serve", "ask", "chat", "ingest"):
+        return
+    try:
+        settings = get_settings()
+    except Exception:  # 配置本身有误：交给各命令去报错
+        return
+    if not settings.uses_local_models:
+        from ragbase.config import block_local_ml_imports
+
+        block_local_ml_imports()
+
+
 def main(argv: list[str] | None = None) -> int:
     load_env()  # 载入主目录下的 .env（Settings 也会读它；这里让 ARK_* 等变量进入 os.environ）
     args = build_parser().parse_args(argv)
+    _skip_torch_if_all_cloud(args)
     args.func(args)
     return 0
 

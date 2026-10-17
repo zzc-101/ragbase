@@ -10,12 +10,12 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 
-from ragbase.config import CONTEXT_MIN_SCORE, RERANK_MIN_SCORE, Settings, get_settings, resolve_device
-from ragbase.models.embeddings import Qwen3Embeddings
+from ragbase.config import CONTEXT_MIN_SCORE, RERANK_MIN_SCORE, Settings, get_settings
+from ragbase.index_info import ensure_index_compatible
+from ragbase.models.factory import create_embeddings, create_reranker, resolve_local_device
 from ragbase.retrieval.hybrid import HybridRetriever
 from ragbase.llm.factory import create_chat_model
 from ragbase.vectorstores import create_vector_store
-from ragbase.models.reranker import Qwen3Reranker
 
 
 logger = logging.getLogger(__name__)
@@ -80,10 +80,10 @@ def is_timeout_error(exc: BaseException | None) -> bool:
 @dataclass
 class RAGPipeline:
     retriever: object
-    reranker: Qwen3Reranker
+    reranker: object  # rerank_with_scores(query, docs, top_k) -> [(index, score)]：本地 / 云端 / 不精排（score 为 None）
     answer_chain: object  # 未配置大模型时为 None（只能检索，不能 ask）
-    embeddings: Qwen3Embeddings
-    device: str = ""
+    embeddings: object  # embed_documents / embed_query：本地模型或云端 API
+    device: str = ""  # 本地模型的计算设备；全云端配置为 "cloud"
     # 本地 embedding / reranker 在 MPS 上不能并发使用：召回 + 精排期间持有该锁（不包含 LLM 调用）
     lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
@@ -109,9 +109,10 @@ def build_pipeline(
     build_bm25: bool | None = None,
     settings: Settings | None = None,
 ) -> tuple[RAGPipeline, BaseChatModel | None]:
-    """从本地缓存加载模型，并构建检索、精排和生成组件。
+    """加载 embedding / reranker（本地缓存或云端 API，见 ragbase.models.factory），并构建检索、精排和生成组件。
 
     未显式传入的参数取自 settings（默认 get_settings()）：召回数、每路召回数、默认模式、设备、回答模型。
+    索引的 embedding 签名与当前配置不一致时抛 IndexMismatchError（先于加载模型）；全云端配置时本项目自身的代码不导入 torch。
     mode: vector（仅向量）/ bm25（仅关键词）/ hybrid（两路 RRF 融合）。
     build_bm25: 是否构建 BM25 索引，默认 mode != vector 时构建；API 服务要按请求切换模式，传 True。
     回答模型未配置齐全时 answer_chain / llm 为 None，仍可检索。
@@ -120,15 +121,23 @@ def build_pipeline(
     retrieve_k = retrieve_k or settings.retrieve_k
     per_route_k = per_route_k or settings.per_route_k
     mode = mode or settings.mode
-    device = resolve_device(device or settings.device)
+    store = create_vector_store(settings)
+    ensure_index_compatible(settings, store)  # embedding 配置与索引不一致时在这里拒绝，不去加载模型
 
     # Transformers 并行初始化两个同系列 Qwen 模型时存在偶发 meta tensor 竞态，
     # 因此这里顺序加载；local_files_only 快路径已把冷启动压缩到数秒。
     start = time.perf_counter()
-    embeddings = Qwen3Embeddings(device=device)
-    reranker = Qwen3Reranker(device=device)
-    logger.info("本地模型加载完成（设备 %s），用时 %.1fs", device, time.perf_counter() - start)
-    store = create_vector_store(settings)
+    device = resolve_local_device(settings, device)  # 全云端为 "cloud"，不导入 torch
+    embeddings = create_embeddings(settings, device=device)
+    reranker = create_reranker(settings, device=device)
+    logger.info(
+        "模型就绪：embedding %s/%s，reranker %s%s（设备 %s），用时 %.1fs",
+        settings.embedding_provider, settings.embedding_model,
+        settings.reranker_provider, f"/{settings.reranker_model}" if settings.reranker_provider != "none" else "",
+        device, time.perf_counter() - start,
+    )
+    if settings.reranker_provider == "none":
+        logger.warning("未启用精排：不会按相关度拒答（RAG_RERANKER_PROVIDER=none，片段保持召回顺序，rerank_score 为空）")
     retriever = HybridRetriever(
         store,
         embeddings,
@@ -172,7 +181,7 @@ def retrieve_and_rerank(
 ):
     """召回并精排（不调用 LLM），返回 (精排片段, 原始候选片段)。
 
-    精排片段是候选的副本，metadata 里附带 rerank_score（P(相关)，0~1）；
+    精排片段是候选的副本，metadata 里附带 rerank_score（本地精排是 P(相关)，0~1；云端按服务商返回；不精排时为 None）；
     原始候选保持不变。mode 为 None 时用检索器构造时的默认模式；
     sources（书名 = 文件 basename 列表）不为空时只在这些书里检索。
     全程持有 pipeline.lock：本地模型不支持并发推理，多线程（API）调用时在此串行。
@@ -203,25 +212,29 @@ def retrieve_and_rerank(
 
 
 def should_refuse(docs, min_score: float | None) -> bool:
-    """没有精排片段，或最相关片段得分低于 min_score 时应拒答；min_score 为 None/0 则只看是否为空。"""
+    """没有精排片段，或最相关片段得分低于 min_score 时应拒答；min_score 为 None/0 则只看是否为空。
+
+    没有得分（rerank_score 缺失或为 None，如 RAG_RERANKER_PROVIDER=none 不精排）时无从比较，不按得分拒答，只有空召回才拒答。
+    """
     if not docs:
         return True
     if not min_score:
         return False
-    return docs[0].metadata.get("rerank_score", 1.0) < min_score
+    score = docs[0].metadata.get("rerank_score")
+    return score is not None and score < min_score
 
 
 def select_context_docs(docs, context_min_score: float | None):
     """只保留 rerank_score >= context_min_score 的片段（保持精排顺序）；top1 总是保留。
 
-    context_min_score 为 None/0 时不过滤；没有 rerank_score 的片段视为满分保留。
+    context_min_score 为 None/0 时不过滤；没有 rerank_score（缺失或为 None）的片段视为满分保留。
     """
     if not context_min_score:
         return list(docs)
     return [
         doc
         for index, doc in enumerate(docs)
-        if index == 0 or doc.metadata.get("rerank_score", 1.0) >= context_min_score
+        if index == 0 or (doc.metadata.get("rerank_score") is None) or doc.metadata["rerank_score"] >= context_min_score
     ]
 
 

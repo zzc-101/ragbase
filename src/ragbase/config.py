@@ -83,13 +83,19 @@ RERANK_MIN_SCORE = 0.7
 # 注意得分已饱和，提高阈值会开始裁掉对比 / 多方面题需要的片段，别盲目调高。
 CONTEXT_MIN_SCORE = 0.95
 
-# 本地模型的 Hugging Face 仓库名；RAG_EMBEDDING_MODEL / RAG_RERANKER_MODEL 可改。
-# 换 embedding 模型会改变向量维度，必须 ragbase ingest --full 重建索引；换 reranker 需要重新校准 RAG_MIN_SCORE。
+# 本地模型的 Hugging Face 仓库名；RAG_EMBEDDING_MODEL / RAG_RERANKER_MODEL 可改
+# （提供方为云端 API 时，同名变量是发给服务商的模型 ID）。
+# 换 embedding 模型（或提供方 / 维度）会让向量不兼容，必须 ragbase ingest --full 重建索引；换 reranker 需要重新校准 RAG_MIN_SCORE。
 DEFAULT_EMBEDDING_MODEL = "Qwen/Qwen3-Embedding-0.6B"
 DEFAULT_RERANKER_MODEL = "Qwen/Qwen3-Reranker-0.6B"
 
 DEFAULT_COLLECTION = "rag"  # 向量库里的集合名（Chroma collection / Qdrant collection）；RAG_COLLECTION 可改
 VECTOR_STORES = ("chroma", "qdrant")
+
+# 模型提供方：本地（sentence-transformers）或云端 API。
+# embedding: local | openai（OpenAI 兼容的 POST {base}/embeddings）；reranker: local | api（POST {base}/rerank）| none（不精排）
+EMBEDDING_PROVIDERS = ("local", "openai")
+RERANKER_PROVIDERS = ("local", "api", "none")
 
 HALF_PRECISION_DEVICES = ("mps", "cuda")  # 只有这些设备上用 fp16；CPU 上半精度又慢又不稳
 
@@ -115,6 +121,29 @@ class LLMConfig:
         return bool(self.model and self.base_url and self.api_key)
 
 
+@dataclass(frozen=True)
+class ApiEndpoint:
+    """某个云端模型接口（embedding / rerank）实际生效的连接参数（已合并对大模型配置的回退）；api_key 是 SecretStr，repr 只显示掩码。"""
+
+    base_url: str | None
+    api_key: SecretStr | None
+    timeout: float
+    max_retries: int
+    base_url_from_llm: bool = False  # 地址是否回退到了 RAG_LLM_BASE_URL（仅用于提示）
+    api_key_from_llm: bool = False  # 密钥是否回退到了 RAG_LLM_API_KEY
+
+
+def _origin(url: str | None) -> str:
+    """协议 + 主机 + 端口（小写），用来判断两个地址是不是同一个服务；解析不了返回空串。"""
+    from urllib.parse import urlsplit
+
+    try:
+        parts = urlsplit((url or "").strip())
+        return f"{parts.scheme}://{parts.netloc}".lower() if parts.scheme and parts.netloc else ""
+    except ValueError:
+        return ""
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="RAG_",
@@ -124,10 +153,26 @@ class Settings(BaseSettings):
         populate_by_name=True,
     )
 
-    # 本地模型（Hugging Face 仓库名）：换 embedding 需重建索引，换 reranker 需重新校准 min_score
+    # 模型提供方：本地（Hugging Face 仓库名）或云端 API（此时 *_model 是服务商的模型 ID）。
+    # 换 embedding（模型 / 提供方 / 维度）需重建索引，换 reranker 需重新校准 min_score
+    embedding_provider: Literal["local", "openai"] = "local"
     embedding_model: str = Field(DEFAULT_EMBEDDING_MODEL, min_length=1)
+    reranker_provider: Literal["local", "api", "none"] = "local"
     reranker_model: str = Field(DEFAULT_RERANKER_MODEL, min_length=1)
-    # 本地模型设备：auto -> mps（Apple Silicon）> cuda > cpu
+    # 云端 embedding（OpenAI 兼容 POST {base}/embeddings）：地址 / 密钥留空则回退到 RAG_LLM_BASE_URL / RAG_LLM_API_KEY
+    embedding_base_url: str | None = None
+    embedding_api_key: SecretStr | None = None
+    embedding_dimensions: int | None = Field(None, ge=1)  # 设置后作为 dimensions 参数发给服务端（支持 Matryoshka 的模型）；也计入索引签名
+    embedding_batch_size: int = Field(16, ge=1)  # 每次请求最多发多少条文本（部分服务商有上限）
+    embedding_query_instruction: str = ""  # 只加在查询前面的指令前缀（如 Qwen3 的 "Instruct: ...\nQuery: "）；文档不加；本地模型不用它
+    embedding_timeout: float | None = Field(None, gt=0)  # 单次请求超时（秒）；留空沿用 RAG_LLM_TIMEOUT
+    embedding_max_retries: int | None = Field(None, ge=0)  # 超时 / 连接错误 / 429 / 5xx 的重试次数；留空沿用 RAG_LLM_MAX_RETRIES
+    # 云端 rerank（POST {base}/rerank，{model, query, documents, top_n}）：同样可回退到大模型的地址 / 密钥
+    reranker_base_url: str | None = None
+    reranker_api_key: SecretStr | None = None
+    reranker_timeout: float | None = Field(None, gt=0)
+    reranker_max_retries: int | None = Field(None, ge=0)
+    # 本地模型设备（只对 local 提供方生效）：auto -> mps（Apple Silicon）> cuda > cpu
     device: Literal["auto", "mps", "cuda", "cpu"] = "auto"
     # 默认召回方式；API 可按请求覆盖
     mode: Literal["vector", "bm25", "hybrid"] = "hybrid"
@@ -149,6 +194,7 @@ class Settings(BaseSettings):
     data_dir: Path = Field(default_factory=lambda: project_home() / "data")  # 文档目录：POST /documents 上传到这里，POST /ingest 扫描这里
     db_dir: Path = Field(default_factory=lambda: project_home() / "chroma_db")  # Chroma 持久化目录（RAG_VECTOR_STORE=chroma 时用）
     meta_file: Path = Field(default_factory=lambda: project_home() / ".ingest_meta.json")  # 增量入库的文件指纹
+    index_info_file: Path | None = None  # 索引的 embedding 签名（提供方 / 模型 / 维度）；留空 = 与 meta_file 同目录的 .index_info.json
     cache_dir: Path = Field(default_factory=lambda: project_home() / ".bm25_cache")  # BM25 分词缓存
     web_dist: Path = Field(default_factory=default_web_dist)  # 前端构建产物：默认 <主目录>/web/dist，没有则用随包的副本；相对路径按主目录解析，目录存在时由 API 服务托管
     max_upload_mb: int = Field(300, ge=1)  # POST /documents 的单文件大小上限（最大的教材 PDF 约 235 MB）
@@ -201,6 +247,27 @@ class Settings(BaseSettings):
             raise ValueError("模型名不能为空")
         return value
 
+    @field_validator("embedding_provider", "reranker_provider", mode="before")
+    @classmethod
+    def _normalize_provider(cls, value):
+        return value.strip().lower() if isinstance(value, str) else value
+
+    @field_validator("embedding_base_url", "reranker_base_url", mode="before")
+    @classmethod
+    def _blank_api_url_to_none(cls, value):
+        return (value.strip() or None) if isinstance(value, str) else value
+
+    @field_validator("embedding_dimensions", "embedding_timeout", "embedding_max_retries", "reranker_timeout", "reranker_max_retries", "index_info_file", mode="before")
+    @classmethod
+    def _blank_number_to_none(cls, value):
+        return (value.strip() or None) if isinstance(value, str) else value
+
+    @field_validator("embedding_query_instruction")
+    @classmethod
+    def _unescape_instruction(cls, value: str) -> str:
+        """环境变量 / .env 里很难写真正的换行，所以把两个字符 \\n 还原成换行（"Instruct: ...\\nQuery: "）。"""
+        return value.replace("\\n", "\n")
+
     @field_validator("log_level")
     @classmethod
     def _normalize_log_level(cls, value: str) -> str:
@@ -231,7 +298,9 @@ class Settings(BaseSettings):
             value = value.split(",")
         return [item.strip().rstrip("/") for item in value if isinstance(item, str) and item.strip()]
 
-    @field_validator("api_key", "llm_api_key", "eval_llm_api_key", "qdrant_api_key", mode="before")
+    @field_validator(
+        "api_key", "llm_api_key", "eval_llm_api_key", "qdrant_api_key", "embedding_api_key", "reranker_api_key", mode="before"
+    )
     @classmethod
     def _blank_secret_to_none(cls, value):
         return (value.strip() or None) if isinstance(value, str) else value
@@ -250,6 +319,51 @@ class Settings(BaseSettings):
             max_retries=self.llm_max_retries,
         )
 
+    def _api_endpoint(self, base_url, api_key, timeout, max_retries) -> ApiEndpoint:
+        """云端 embedding / rerank 的连接参数：地址未设置回退到大模型的地址；密钥未设置时，仅当最终地址与大模型是同一个服务（同协议 + 主机 + 端口）
+        才回退到大模型的密钥——避免把 A 服务商的密钥发给显式配置的 B 服务；超时 / 重试未设置沿用大模型的。"""
+        llm = self.llm_config("answer")
+        url, url_from_llm = (base_url, False) if base_url else (llm.base_url, bool(llm.base_url))
+        key, key_from_llm = api_key, False
+        if key is None and llm.api_key is not None and _origin(url) and _origin(url) == _origin(llm.base_url):
+            key, key_from_llm = llm.api_key, True
+        return ApiEndpoint(
+            base_url=url,
+            api_key=key,
+            timeout=timeout if timeout is not None else llm.timeout,
+            max_retries=max_retries if max_retries is not None else llm.max_retries,
+            base_url_from_llm=url_from_llm,
+            api_key_from_llm=key_from_llm,
+        )
+
+    def embedding_endpoint(self) -> ApiEndpoint:
+        return self._api_endpoint(
+            self.embedding_base_url, self.embedding_api_key, self.embedding_timeout, self.embedding_max_retries
+        )
+
+    def reranker_endpoint(self) -> ApiEndpoint:
+        return self._api_endpoint(
+            self.reranker_base_url, self.reranker_api_key, self.reranker_timeout, self.reranker_max_retries
+        )
+
+    @property
+    def index_info_path(self) -> Path:
+        """索引 embedding 签名文件的位置：RAG_INDEX_INFO_FILE，缺省与 meta_file 同目录（默认即 <主目录>/.index_info.json）。"""
+        return self.index_info_file or self.meta_file.with_name(".index_info.json")
+
+    @property
+    def uses_local_embedding(self) -> bool:
+        return self.embedding_provider == "local"
+
+    @property
+    def uses_local_reranker(self) -> bool:
+        return self.reranker_provider == "local"
+
+    @property
+    def uses_local_models(self) -> bool:
+        """是否至少有一个本地模型（需要 torch / 设备 / 模型缓存）。"""
+        return self.uses_local_embedding or self.uses_local_reranker
+
     @property
     def llm_configured(self) -> bool:
         """回答模型三项配置是否齐全（只返回布尔值，不暴露密钥）。"""
@@ -260,6 +374,26 @@ class Settings(BaseSettings):
 def get_settings() -> Settings:
     """进程内缓存的全局配置；测试里改了环境变量后用 get_settings.cache_clear() 重新读取。"""
     return Settings()
+
+
+LOCAL_ML_MODULES = ("torch", "transformers", "sentence_transformers")
+
+
+def block_local_ml_imports() -> list[str]:
+    """把 torch / transformers / sentence_transformers 标记为“不可导入”（sys.modules[name] = None），返回被标记的模块名。
+
+    用途：embedding 与 reranker 都用云端（或不精排）时，本项目自己的代码不需要它们，但 langchain-core 只要发现
+    transformers 已安装就会在 import 时顺带加载 transformers + torch（约 1 秒、数百 MB 内存）。在导入 langchain 之前调用本函数，
+    它的 try/except ImportError 就会跳过。已经导入过的模块不动。命令行入口只在全云端配置的 serve / ask / chat / ingest 下调用。
+    """
+    import sys
+
+    blocked = []
+    for name in LOCAL_ML_MODULES:
+        if name not in sys.modules:
+            sys.modules[name] = None  # type: ignore[assignment]
+            blocked.append(name)
+    return blocked
 
 
 def resolve_device(device: str = "auto") -> str:

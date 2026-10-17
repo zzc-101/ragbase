@@ -2,7 +2,7 @@
 
 启动：uv run ragbase serve [--host 127.0.0.1] [--port 8000]（默认读取 RAG_HOST / RAG_PORT；也可 uv run uvicorn ragbase.api.app:app）
 
-必须单进程（不要加 --workers）：embedding / reranker / BM25 索引都加载在本进程内，
+必须单进程（不要加 --workers）：embedding / reranker（本地模型时）/ BM25 索引都加载在本进程内，
 多 worker 会让每个进程各占一份模型显存，且 MPS 模型本身不能并发推理——
 并发请求由线程池接住，召回 + 精排在 pipeline.lock 内串行，大模型生成在锁外并行。
 
@@ -57,6 +57,7 @@ from ragbase.api.schemas import (
     HealthResponse,
     LivenessResponse,
     JobResponse,
+    ModelInfo,
     SearchRequest,
     SearchResponse,
     SessionDeleteResponse,
@@ -68,6 +69,7 @@ from ragbase.api.schemas import (
 )
 from ragbase.agent.service import ChatService, build_chat_service
 from ragbase.config import Settings, get_settings
+from ragbase.index_info import IndexRecorder
 from ragbase.ingest.parser import LEGACY_EXTS, SUPPORTED_EXTS, sanitize_filename
 from ragbase.ingest.jobs import IngestJobManager, JobRunningError, progress_handler
 from ragbase.ingest.service import delete_document, run_ingest
@@ -116,14 +118,17 @@ def default_chat_factory(pipeline: RAGPipeline, settings: Settings) -> ChatServi
 
 
 def default_ingest_fn(pipeline: RAGPipeline, settings: Settings, progress):
-    """真实入库：向量化用流水线里同一个 embedding 模型，每个批次持 pipeline.lock。"""
+    """真实入库：向量化用流水线里同一个 embedding（本地模型或云端 API），每个批次持 pipeline.lock；同时登记索引的 embedding 签名。"""
+    store = pipeline.retriever.store
+    recorder = IndexRecorder(settings, store)
     return run_ingest(
         settings.data_dir,
-        pipeline.retriever.store,
-        pipeline.embeddings.embed_documents,
+        store,
+        recorder.wrap(pipeline.embeddings.embed_documents),
         settings.meta_file,
         lock=pipeline.lock,
         progress=progress,
+        before_write=recorder.begin,
     )
 
 
@@ -139,6 +144,11 @@ def _validation_detail(exc: RequestValidationError) -> str:
         location = ".".join(str(item) for item in error["loc"] if item != "body")
         parts.append(f"{location}: {error['msg']}" if location else error["msg"])
     return "; ".join(parts)
+
+
+def _device_text(settings: Settings) -> str:
+    """流水线未就绪时 /health 显示的设备：全云端没有本地设备。"""
+    return settings.device if settings.uses_local_models else "cloud"
 
 
 def _bm25_ready(pipeline: RAGPipeline) -> bool:
@@ -341,7 +351,12 @@ def create_app(pipeline_factory=None, settings: Settings | None = None, ingest_f
             bm25_ready=pipeline is not None and _bm25_ready(pipeline),
             bm25_built_at=_iso(getattr(retriever, "bm25_built_at", None)),
             bm25_chunk_count=getattr(retriever, "bm25_chunk_count", None),
-            device=(pipeline.device if pipeline is not None and pipeline.device else settings.device),
+            device=(pipeline.device if pipeline is not None and pipeline.device else _device_text(settings)),
+            embedding=ModelInfo(provider=settings.embedding_provider, model=settings.embedding_model),
+            reranker=ModelInfo(
+                provider=settings.reranker_provider,
+                model=None if settings.reranker_provider == "none" else settings.reranker_model,
+            ),
             mode=settings.mode,
             llm_configured=(
                 pipeline.answer_chain is not None if pipeline is not None else settings.llm_configured

@@ -135,11 +135,13 @@ def run_ingest(
     lock=None,
     progress=None,
     batch_size: int = EMBED_BATCH_SIZE,
+    before_write=None,
 ) -> IngestResult:
     """增量入库：新增 / 修改的文件重新索引，已删除的文件移除片段。
 
     embed_fn(texts: list[str]) -> list[list[float]]：文档向量化（输入已含章节路径前缀）。
     lock：任何带 __enter__/__exit__ 的锁，None 表示不加锁。
+    before_write：无参回调，有文件要写入向量之前调用一次（用于登记索引的 embedding 签名，见 ragbase.index_info）。
     首次运行（库为空）等价于全量；旧版索引（有片段但没有元数据）会先按 ID 分批清空再重建。
     """
     notify = progress or (lambda event, **info: None)
@@ -173,6 +175,8 @@ def run_ingest(
     # index_missing / legacy 都是整体重建：旧元数据作废，从空开始逐文件记录
     new_meta = {} if result.reason else dict(old_meta)
     try:
+        if to_add and before_write is not None:
+            before_write()
         if result.reason == "legacy":
             # 旧数据没有 fid，无法按文件删除。不能 reset 集合（运行中的服务持有该对象），按 ID 分批清空。
             old_ids = store.all_ids()

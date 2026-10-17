@@ -56,7 +56,7 @@ Web 界面需要前端构建产物：仓库里运行 `scripts/build_web.sh`（No
 
 ### 体检：`ragbase doctor`
 
-一屏检查 Python 版本、目录是否可写、`.env`、计算设备、模型是否已缓存、向量库是否可访问及片段数、是否需要 `ragbase ingest`、大模型是否配置（只显示协议 / 模型 / 地址，不显示密钥）、接口鉴权、Web 资源，每项给出 `✓`（正常）/ `!`（警告）/ `✗`（必须修复）和修复提示；有 `✗` 时退出码非零。默认**不调用大模型**；加 `--check-llm` 才会发一次最小请求验证地址 / 密钥 / 模型名。
+一屏检查 Python 版本、目录是否可写、`.env`、embedding / reranker 提供方与模型（本地：计算设备与模型缓存；云端：地址 / 密钥是否配置）、向量库是否可访问及片段数、索引的 embedding 签名是否与配置一致、是否需要 `ragbase ingest`、大模型是否配置（只显示协议 / 模型 / 地址，不显示密钥）、接口鉴权、Web 资源，每项给出 `✓`（正常）/ `!`（警告）/ `✗`（必须修复）和修复提示；有 `✗` 时退出码非零。默认**不调用大模型**，也不调用云端 embedding / rerank；加 `--check-llm` 才会发一次最小请求验证地址 / 密钥 / 模型名，加 `--check-models` 对每个云端 embedding / rerank 接口各发一次最小请求。
 
 ### 国内网络：Hugging Face 镜像
 
@@ -69,13 +69,59 @@ HF_ENDPOINT=https://hf-mirror.com uv run ragbase models download
 
 模型缓存位置跟随 `HF_HOME`（默认 `~/.cache/huggingface`）；已缓存的模型会跳过，下载中断后重跑可续传。`ragbase serve` 在**索引非空而模型缺失**时会提示先运行 `ragbase models download`（而不是抛一长串报错）；加 `ragbase serve --download-models` 则缺什么先下什么。
 
-### 换模型
+### 模型配置：本地或云端
 
-默认模型可通过 `RAG_EMBEDDING_MODEL`（默认 `Qwen/Qwen3-Embedding-0.6B`）和 `RAG_RERANKER_MODEL`（默认 `Qwen/Qwen3-Reranker-0.6B`）更换，`ragbase models download` / `doctor` 会跟着用新名字。
+embedding 和 reranker 各自可以选择本地模型或云端 API。没有 GPU 的机器用云端更快：不用下载模型；embedding 与 reranker 都用云端时，`ragbase serve / ask / chat / ingest` 启动不再加载 torch（本项目自身的代码不需要它，命令行入口还会阻止 langchain 顺带导入 transformers / torch；用 `uvicorn ragbase.api.app:app` 等其他方式启动时 langchain 仍可能加载它，只影响启动速度和内存，不影响功能）。
 
-- **更换 embedding 模型会改变向量维度，必须重新入库**：`ragbase ingest --full`（旧索引与新向量不兼容）。
-- **更换 reranker 后得分分布会变，需要重新校准 `RAG_MIN_SCORE`**（拒答阈值，默认 0.7 是按 Qwen3-Reranker-0.6B 校准的），可用 `scripts/calibrate_rerank_threshold.py`；`RAG_CONTEXT_MIN_SCORE` 同理。
-- 目前代码按 Qwen3 系列的用法编写（查询 prompt、yes/no logit 打分）；换成别家模型不保证可用。
+| | `local`（默认） | `openai` / `api` | `none` |
+| --- | --- | --- | --- |
+| **embedding**（`RAG_EMBEDDING_PROVIDER`） | sentence-transformers 加载 Qwen3-Embedding，查询自动加 query prompt | `openai`：OpenAI 兼容 `POST {地址}/embeddings`（OpenAI、SiliconFlow、DashScope 兼容模式、火山方舟、Ollama、vLLM、Xinference 等） | 不支持 |
+| **reranker**（`RAG_RERANKER_PROVIDER`） | CrossEncoder 加载 Qwen3-Reranker，得分 = sigmoid(logit) = P(相关) | `api`：通用 `POST {地址}/rerank`，请求 `{model, query, documents, top_n}`，响应 `{results:[{index, relevance_score}]}`（Jina、SiliconFlow、Cohere v2 兼容网关、Xinference、vLLM 等的常见形状），分数原样透传 | 跳过精排：保持召回（RRF）顺序取前 `RAG_RERANK_K` 个；没有得分，**不会按相关度拒答**（只有召回为空才拒答），启动时会警告 |
+| 模型名 | `RAG_*_MODEL` = Hugging Face 仓库名 | `RAG_*_MODEL` = 服务商的模型 ID | — |
+| 需要下载 | 是（`ragbase models download`，只下载 `local` 的那个） | 否（会提示“云端提供方，无需下载”） | 否 |
+
+云端接口的连接参数：
+
+- `RAG_EMBEDDING_BASE_URL` / `RAG_EMBEDDING_API_KEY`、`RAG_RERANKER_BASE_URL` / `RAG_RERANKER_API_KEY`；**留空时回退到 `RAG_LLM_BASE_URL` / `RAG_LLM_API_KEY`**（很多服务商同一个地址和密钥同时提供大模型、embedding、rerank）。为避免把 A 服务商的密钥发给 B 服务，只有最终地址与 `RAG_LLM_BASE_URL` 是同一个服务（协议 + 主机 + 端口相同）时才沿用大模型密钥；单独指定了别的地址就必须单独填密钥（本机 Ollama / vLLM 不校验密钥的可以不填）。
+- embedding 另有：`RAG_EMBEDDING_DIMENSIONS`（可选，作为 `dimensions` 参数发出，并计入索引签名）、`RAG_EMBEDDING_BATCH_SIZE`（每次请求的条数，默认 16；部分服务商有上限，请查服务商文档）、`RAG_EMBEDDING_QUERY_INSTRUCTION`（可选，只加在查询前面的指令前缀，如 Qwen3-Embedding 的 `Instruct: ...\nQuery: `；文档不加；本地模型自带 query prompt，不用它）。返回的向量会做 L2 归一化，与本地模型的排序保持一致。
+- 超时与重试：`RAG_EMBEDDING_TIMEOUT` / `RAG_EMBEDDING_MAX_RETRIES`、`RAG_RERANKER_TIMEOUT` / `RAG_RERANKER_MAX_RETRIES`，留空沿用 `RAG_LLM_TIMEOUT` / `RAG_LLM_MAX_RETRIES`（超时、连接错误、429、5xx 才重试）。报错信息里不含密钥。
+
+**三套示例**（地址与模型名只是示例，未逐一验证，请以服务商文档为准；完整的 `.env` 片段见 [.env.example](.env.example) 第 3 节）：
+
+```bash
+# 1) 全本地（默认，什么都不用配）：需要 ragbase models download；有 GPU / Apple Silicon 时最合适
+# RAG_EMBEDDING_PROVIDER=local
+# RAG_RERANKER_PROVIDER=local
+
+# 2) 全云端（无 GPU 的机器）：不下载模型、启动时不加载 torch
+RAG_EMBEDDING_PROVIDER=openai
+RAG_EMBEDDING_BASE_URL=https://api.siliconflow.cn/v1      # 示例：SiliconFlow 风格
+RAG_EMBEDDING_API_KEY=请替换为你的密钥
+RAG_EMBEDDING_MODEL=BAAI/bge-m3
+RAG_RERANKER_PROVIDER=api
+RAG_RERANKER_BASE_URL=https://api.siliconflow.cn/v1
+RAG_RERANKER_API_KEY=请替换为你的密钥
+RAG_RERANKER_MODEL=BAAI/bge-reranker-v2-m3
+# 然后重建索引并重新标定拒答阈值（见下）
+
+# 3) 混合：云端 embedding（入库和查询的主要耗时）+ 本地 reranker；或本机 Ollama 做 embedding
+RAG_EMBEDDING_PROVIDER=openai
+RAG_EMBEDDING_BASE_URL=http://localhost:11434/v1          # 示例：Ollama 的 OpenAI 兼容接口，密钥可不填
+RAG_EMBEDDING_MODEL=bge-m3
+# RAG_RERANKER_PROVIDER=local（默认）
+```
+
+**两条必须遵守的规则**
+
+- **换 embedding（提供方 / 模型 / 维度）必须重建索引**：`ragbase ingest --full`。入库时会把 embedding 签名（提供方、模型、维度）写到索引旁的 `.index_info.json`（位置可用 `RAG_INDEX_INFO_FILE` 改；放文件而不是向量库元数据，是因为它与向量库后端无关，`migrate-store` 后仍然有效）。`serve` / `ask` / `chat` / 增量 `ingest` 启动时比对，**不一致就拒绝**并提示“请运行 ragbase ingest --full 重建索引”，只有 `ingest --full` 会改写它；`doctor` 也会检查。没有该文件的旧索引视为默认本地模型建的：当前配置恰好是默认值就自动补记，否则拒绝。入库时还会校验返回的向量长度与索引里已有向量一致。
+- **换 reranker（模型或云端服务商）必须重新标定 `RAG_MIN_SCORE` / `RAG_CONTEXT_MIN_SCORE`**：默认的 0.7 / 0.95 是按本地 Qwen3-Reranker-0.6B 的 P(相关) 分布标定的，别家的分数分布不同（有的整体偏低）。运行 `scripts/calibrate_rerank_threshold.py`（它经同一个工厂创建 reranker，对任何提供方通用；云端提供方会产生约 66 次 rerank 调用）。`doctor` 在 reranker 不是默认本地模型而 `RAG_MIN_SCORE` 仍是 0.7 时会警告。
+
+`ragbase doctor` 会显示 embedding / reranker 的提供方和模型、云端地址与密钥是否已配置（不打印密钥）、索引签名是否一致，全云端时跳过设备与模型缓存检查；加 `--check-models` 才会对每个云端接口各发一次最小请求。`GET /health` 返回 `embedding` / `reranker`（`provider` + `model`），Web 界面的状态弹窗里也能看到。
+
+本地模型的补充：
+
+- 默认 `RAG_EMBEDDING_MODEL=Qwen/Qwen3-Embedding-0.6B`、`RAG_RERANKER_MODEL=Qwen/Qwen3-Reranker-0.6B`；`ragbase models download` / `doctor` 会跟着用新名字。
+- 本地实现按 Qwen3 系列的用法编写（查询 prompt、yes/no logit 打分）；换成别家本地模型不保证可用（云端模型不受此限制）。
 
 ### 硬件与速度
 
@@ -183,7 +229,7 @@ data/ chroma_db/ qdrant_db/ ...  运行时数据，默认都在项目主目录�
 
 精排后，如果最相关片段的 `rerank_score` 低于阈值，直接回答“我没有在文档中找到相关内容。”，**不调用大模型**（省钱，也避免模型凭空编造）。
 
-- `rerank_score` 是 Reranker 给出的 P(相关)，范围 0~1（模型原始输出是 logit 差，经 sigmoid 转换）。每个返回片段的 metadata 里都有，命令行来源会显示成 `xxx.pdf:第12页[V2+B1|0.93]`。
+- `rerank_score` 是 Reranker 给出的 P(相关)，范围 0~1（模型原始输出是 logit 差，经 sigmoid 转换）。每个返回片段的 metadata 里都有，命令行来源会显示成 `xxx.pdf:第12页[V2+B1|0.93]`。云端 reranker 的分数按服务商返回的原样使用（多数是 0~1，但分布不同，见“模型配置”里的重新标定）；`RAG_RERANKER_PROVIDER=none` 时 `rerank_score` 为 `null`，不按得分拒答。
 - 默认阈值是 [src/ragbase/config.py](src/ragbase/config.py) 的 `RERANK_MIN_SCORE`（也可用 `RAG_MIN_SCORE` 环境变量覆盖）；临时调整用 `--min-score`，`0` 表示不拒答：
 
 ```bash
@@ -443,16 +489,21 @@ curl -s -X DELETE 'http://127.0.0.1:8000/documents/新教材.pdf'
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
 | `RAG_DEVICE` | `auto` | 本地模型设备：`auto`（mps > cuda > cpu）/ `mps` / `cuda` / `cpu` |
+| `RAG_EMBEDDING_PROVIDER` / `RAG_RERANKER_PROVIDER` | `local` / `local` | embedding：`local` / `openai`；reranker：`local` / `api` / `none`，详见“模型配置：本地或云端” |
+| `RAG_EMBEDDING_MODEL` / `RAG_RERANKER_MODEL` | Qwen3-Embedding-0.6B / Qwen3-Reranker-0.6B | 本地：Hugging Face 仓库名；云端：服务商的模型 ID |
+| `RAG_EMBEDDING_BASE_URL` / `_API_KEY` / `_DIMENSIONS` / `_BATCH_SIZE` / `_QUERY_INSTRUCTION` / `_TIMEOUT` / `_MAX_RETRIES` | 空（地址 / 密钥回退 `RAG_LLM_*`）/ 空 / 空 / `16` / 空 / 空 / 空 | 云端 embedding 连接参数 |
+| `RAG_RERANKER_BASE_URL` / `_API_KEY` / `_TIMEOUT` / `_MAX_RETRIES` | 空（地址 / 密钥回退 `RAG_LLM_*`）| 云端 rerank 连接参数 |
 | `RAG_MODE` | `hybrid` | 默认召回方式 |
 | `RAG_RETRIEVE_K` | `20` | 精排前的候选数 |
 | `RAG_PER_ROUTE_K` | `30` | 混合检索每一路各取多少 |
 | `RAG_RERANK_K` | `5` | 精排后保留的片段数 |
-| `RAG_MIN_SCORE` | `0.7` | 拒答阈值，0 表示不拒答 |
+| `RAG_MIN_SCORE` | `0.7` | 拒答阈值，0 表示不拒答；按默认本地 reranker 标定，换 reranker 要重新标定；`RAG_RERANKER_PROVIDER=none` 时不生效 |
 | `RAG_CONTEXT_MIN_SCORE` | `0.95` | 交给大模型的片段最低精排得分，0 表示不过滤 |
 | `RAG_HOME`（须为真正的环境变量） | 当前工作目录 | 项目主目录：下面各路径的默认位置、`.env`、`bm25_userdict.txt`、`eval_questions.json` 都在它下面 |
 | `RAG_DATA_DIR` / `RAG_DB_DIR` | 主目录下 `data/` / `chroma_db/` | 文档目录 / Chroma 持久化目录（命令行脚本和服务共用） |
 | `RAG_VECTOR_STORE` / `RAG_COLLECTION` | `chroma` / `rag` | 向量库后端与集合名，详见下面的“向量库”一节 |
 | `RAG_META_FILE` / `RAG_CACHE_DIR` | 主目录下 `.ingest_meta.json` / `.bm25_cache/` | 入库元数据文件 / BM25 分词缓存目录 |
+| `RAG_INDEX_INFO_FILE` | 与 `RAG_META_FILE` 同目录的 `.index_info.json` | 索引的 embedding 签名文件 |
 | `RAG_MAX_UPLOAD_MB` | `300` | `POST /documents` 单文件大小上限 |
 | `RAG_AGENT_MAX_TOOL_CALLS` | `4` | 对话 Agent 每轮用户消息最多调用几次工具 |
 | `RAG_AGENT_MAX_MODEL_CALLS` | `6` | 对话 Agent 每轮用户消息最多调用几次大模型（至少 2） |
@@ -625,7 +676,7 @@ uv run ragbase serve                        # 浏览器打开 http://127.0.0.1:8
 
 - 切分大小与重叠：[src/ragbase/ingest/splitter.py](src/ragbase/ingest/splitter.py)
 - 召回数、精排数、阈值、设备、服务地址、前端构建目录：[src/ragbase/config.py](src/ragbase/config.py)（均可用 `RAG_*` 环境变量覆盖，见“服务化运行”）；`ragbase ask` / `ragbase eval` 的命令行参数优先级更高
-- 本地模型与设备：[src/ragbase/models/embeddings.py](src/ragbase/models/embeddings.py)、[src/ragbase/models/reranker.py](src/ragbase/models/reranker.py)
+- 本地模型与设备：[src/ragbase/models/embeddings.py](src/ragbase/models/embeddings.py)、[src/ragbase/models/reranker.py](src/ragbase/models/reranker.py)；云端实现：[api_embeddings.py](src/ragbase/models/api_embeddings.py)、[api_reranker.py](src/ragbase/models/api_reranker.py)；统一入口 [factory.py](src/ragbase/models/factory.py)；索引签名 [src/ragbase/index_info.py](src/ragbase/index_info.py)
 
 扫描版 PDF 或文本层质量较差的 PDF 需要另行增加 OCR；当前项目不会自动 OCR。
 
@@ -636,5 +687,7 @@ uv run ragbase serve                        # 浏览器打开 http://127.0.0.1:8
 - MPS 不可用：设置环境变量 `RAG_DEVICE=cpu`（默认 `auto` 会自动回落到 CUDA / CPU）。
 - 依赖环境异常：重新执行 `uv sync`。
 - 不知道哪里没配好：运行 `ragbase doctor`，按 `✗` / `!` 项的提示修复。
+- 提示“当前 embedding 配置与索引不一致”：换过 embedding 提供方 / 模型 / 维度，运行 `ragbase ingest --full` 重建索引，或把配置改回去。
+- 换了 reranker 后总是拒答（或从不拒答）：分数分布变了，运行 `scripts/calibrate_rerank_threshold.py` 重新标定 `RAG_MIN_SCORE`。
 - `ragbase serve` 提示“本地模型尚未下载”：运行 `ragbase models download`（国内网络加 `HF_ENDPOINT=https://hf-mirror.com`）。
 - 模型下载很慢 / 超时：见“快速开始 -> 国内网络”；也可以在能访问 Hugging Face 的机器上下载后，把整个 `HF_HOME` 目录（或 Docker 的 `ragbase-models` 卷）拷过来。

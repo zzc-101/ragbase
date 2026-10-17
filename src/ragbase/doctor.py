@@ -1,8 +1,9 @@
 """ragbase doctor：一屏环境自检，每项给出 ✓（正常）/ !（警告，不影响启动）/ ✗（必须修复）和修复提示。
 
-- 默认不调用大模型、不修改任何文件、不加载 embedding / reranker 模型；--check-llm 才会发一次最小的大模型请求。
+- 默认不调用大模型 / embedding / rerank 接口、不修改任何文件、不加载 embedding / reranker 模型；
+  --check-llm 才会发一次最小的大模型请求，--check-models 才会对每个云端 embedding / rerank 接口各发一次最小请求。
 - 只要有一项 ✗ 就以非零码退出；警告不影响退出码。
-- 绝不打印任何密钥（大模型 / API / Qdrant 的 Key 只报“是否已设置”）。
+- 绝不打印任何密钥（大模型 / embedding / rerank / API / Qdrant 的 Key 只报“是否已设置”）。
 """
 import os
 import sys
@@ -10,7 +11,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-from ragbase.config import Settings, project_home
+from ragbase.config import DEFAULT_RERANKER_MODEL, RERANK_MIN_SCORE, Settings, project_home
 
 OK, WARN, FAIL = "ok", "warn", "fail"
 MIN_PYTHON = (3, 12)
@@ -66,6 +67,102 @@ def check_env_file() -> list[Check]:
     return [Check(WARN, f"没有 .env：{path}", "运行：ragbase init （生成模板），然后填写 LLM 配置；也可以直接用环境变量配置")]
 
 
+def _endpoint_checks(settings: Settings, role: str, endpoint, url_env: str, key_env: str) -> list[Check]:
+    """云端接口的地址 / 密钥是否配置（只报是否设置，不打印密钥）。"""
+    if not endpoint.base_url:
+        return [Check(FAIL, f"{role}：未配置接口地址", f"设置 {url_env}（或让该服务与大模型共用，设置 RAG_LLM_BASE_URL）")]
+    results = []
+    if not endpoint.base_url.lower().startswith(("http://", "https://")):
+        return [Check(FAIL, f"{role}：接口地址 {_strip_userinfo(endpoint.base_url)} 必须以 http:// 或 https:// 开头", f"检查 {url_env}")]
+    source = "（沿用 RAG_LLM_BASE_URL）" if endpoint.base_url_from_llm else ""
+    if endpoint.api_key is not None:
+        key_note = "沿用 RAG_LLM_API_KEY" if endpoint.api_key_from_llm else "已设置"
+        results.append(Check(OK, f"{role}：地址 {_strip_userinfo(endpoint.base_url)}{source}，密钥{key_note}"))
+    else:
+        results.append(Check(
+            WARN,
+            f"{role}：地址 {_strip_userinfo(endpoint.base_url)}{source}，未设置密钥",
+            f"云端服务通常需要密钥：设置 {key_env}；本机 Ollama / vLLM 等可忽略。（地址与大模型不同源时不会沿用 RAG_LLM_API_KEY）",
+        ))
+    return results
+
+
+def check_providers(
+    settings: Settings,
+    call: bool = False,
+    embed_probe: Callable | None = None,
+    rerank_probe: Callable | None = None,
+) -> list[Check]:
+    """embedding / reranker 的提供方与模型、云端地址 / 密钥是否配置、RAG_MIN_SCORE 是否需要重新标定；call=True 才发最小请求。"""
+    results = []
+    # ---- embedding
+    if settings.embedding_provider == "local":
+        results.append(Check(OK, f"embedding：本地模型 {settings.embedding_model}"))
+    else:
+        dims = f"，dimensions={settings.embedding_dimensions}" if settings.embedding_dimensions else ""
+        results.append(Check(OK, f"embedding：云端（{settings.embedding_provider}）模型 {settings.embedding_model}{dims}"))
+        results += _endpoint_checks(settings, "embedding", settings.embedding_endpoint(), "RAG_EMBEDDING_BASE_URL", "RAG_EMBEDDING_API_KEY")
+    # ---- reranker
+    if settings.reranker_provider == "local":
+        results.append(Check(OK, f"reranker：本地模型 {settings.reranker_model}"))
+    elif settings.reranker_provider == "api":
+        results.append(Check(OK, f"reranker：云端（api）模型 {settings.reranker_model}"))
+        results += _endpoint_checks(settings, "reranker", settings.reranker_endpoint(), "RAG_RERANKER_BASE_URL", "RAG_RERANKER_API_KEY")
+    else:
+        results.append(Check(
+            WARN,
+            "reranker：未启用精排（RAG_RERANKER_PROVIDER=none）：不会按相关度拒答，只有空召回才拒答",
+            "检索质量与拒答能力都会下降；有条件请用本地或云端 reranker",
+        ))
+    if settings.reranker_provider != "none":
+        default_reranker = settings.reranker_provider == "local" and settings.reranker_model == DEFAULT_RERANKER_MODEL
+        if not default_reranker and settings.min_score == RERANK_MIN_SCORE:
+            results.append(Check(
+                WARN,
+                f"reranker 不是默认的本地 {DEFAULT_RERANKER_MODEL}，但 RAG_MIN_SCORE 仍是默认 {RERANK_MIN_SCORE}（它是按默认模型的得分分布标定的）",
+                "建议用 scripts/calibrate_rerank_threshold.py 重新标定 RAG_MIN_SCORE / RAG_CONTEXT_MIN_SCORE",
+            ))
+    from ragbase.models.factory import provider_problems
+
+    if call and not provider_problems(settings):
+        results += _probe_providers(settings, embed_probe, rerank_probe)
+    return results
+
+
+def _probe_providers(settings: Settings, embed_probe: Callable | None, rerank_probe: Callable | None) -> list[Check]:
+    """--check-models：对每个云端 embedding / rerank 接口各发一次最小请求；错误信息里的密钥会被抹掉。"""
+    from ragbase.models.api_client import ApiClient
+    from ragbase.models.api_embeddings import OpenAIEmbeddings
+    from ragbase.models.api_reranker import ApiReranker
+
+    results = []
+    jobs = []
+    if settings.embedding_provider == "openai":
+        jobs.append(("embedding", settings.embedding_endpoint(), embed_probe, lambda client: OpenAIEmbeddings(
+            client, settings.embedding_model, dimensions=settings.embedding_dimensions, batch_size=1).probe(), "RAG_EMBEDDING_*"))
+    if settings.reranker_provider == "api":
+        jobs.append(("reranker", settings.reranker_endpoint(), rerank_probe, lambda client: ApiReranker(client, settings.reranker_model).probe(), "RAG_RERANKER_*"))
+    for role, endpoint, probe, default_probe, env_prefix in jobs:
+        secret = endpoint.api_key.get_secret_value() if endpoint.api_key else ""
+        try:
+            if probe is not None:
+                detail = probe()
+            else:
+                client = ApiClient(endpoint, role)
+                try:
+                    detail = default_probe(client)
+                finally:
+                    client.close()
+        except Exception as exc:
+            message = f"{type(exc).__name__}: {exc}"
+            message = (message.replace(secret, "***") if secret else message)[:300]
+            results.append(Check(FAIL, f"{role} 接口调用失败：{message}", f"检查 {env_prefix} 的地址（通常以 /v1 结尾）、密钥和模型名"))
+        else:
+            extra = f"，向量维度 {detail}" if role == "embedding" and isinstance(detail, int) else ""
+            results.append(Check(OK, f"{role} 接口调用成功（一次最小请求{extra}）"))
+    return results
+
+
 def check_device(settings: Settings) -> list[Check]:
     try:
         from ragbase.config import resolve_device
@@ -75,7 +172,7 @@ def check_device(settings: Settings) -> list[Check]:
         return [Check(FAIL, f"无法探测计算设备：{type(exc).__name__}: {exc}", "重新安装依赖：uv sync --locked")]
     source = f"RAG_DEVICE={settings.device}" if settings.device != "auto" else "自动选择"
     if device == "cpu":
-        return [Check(WARN, f"计算设备：cpu（{source}）", "纯 CPU 可以运行，但精排（rerank）较慢，每个问题可能多等数秒；有 Apple Silicon（MPS）或 NVIDIA GPU（CUDA）会快很多")]
+        return [Check(WARN, f"计算设备：cpu（{source}）", "纯 CPU 可以运行，但精排（rerank）较慢，每个问题可能多等数秒；有 Apple Silicon（MPS）或 NVIDIA GPU（CUDA）会快很多，也可改用云端 embedding / reranker（见 README“模型配置”）")]
     return [Check(OK, f"计算设备：{device}（{source}）")]
 
 
@@ -138,6 +235,7 @@ def check_knowledge(settings: Settings) -> list[Check]:
         results = [Check(OK, f"向量库：{backend}（{store.location}）{reach}，共 {count} 个片段")]
         if not settings.meta_file.is_file():
             results.append(Check(WARN, f"索引非空但没有入库记录 {settings.meta_file.name}", "下次运行 ragbase ingest 会把所有文档视为新文档并重新处理"))
+        results += check_index_signature(settings, store)
         return results
 
     results = [Check(OK, f"向量库：{backend}（{store.location}）{reach}")]
@@ -148,6 +246,25 @@ def check_knowledge(settings: Settings) -> list[Check]:
     if docs and docs[1]:
         results.append(Check(WARN, f"有 {docs[1]} 个旧版 .doc 文件会被跳过", "请另存为 .docx"))
     return results
+
+
+def check_index_signature(settings: Settings, store) -> list[Check]:
+    """索引的 embedding 签名（提供方 / 模型 / 维度）与当前配置是否一致（只读，不补写签名文件）。"""
+    from ragbase.index_info import IndexMismatchError, check_index
+
+    try:
+        result = check_index(settings, store, write_legacy=False)
+    except IndexMismatchError as exc:
+        return [Check(FAIL, str(exc))]
+    if result.status == "mismatch":
+        return [Check(
+            FAIL,
+            f"当前 embedding 配置与索引不一致（索引：{result.stored.describe()}；当前：{result.current.describe()}）",
+            "运行：ragbase ingest --full 重建索引（或把 embedding 配置改回索引建立时的值）；不重建 serve / ask / chat 会拒绝启动",
+        )]
+    if result.status == "legacy_default":
+        return [Check(OK, f"索引 embedding：{result.stored.describe()}（旧索引没有签名记录，按默认本地模型处理；下次启动 / 入库时自动补记）")]
+    return [Check(OK, f"索引 embedding 与当前配置一致：{result.stored.describe()}")]
 
 
 def check_llm(settings: Settings, call: bool = False, invoke: Callable | None = None) -> list[Check]:
@@ -207,11 +324,20 @@ def check_web(settings: Settings) -> list[Check]:
 
 # ---------------------------------------------------------------- 汇总与输出
 
-def run_checks(settings: Settings, check_llm_call: bool = False) -> list[tuple[str, list[Check]]]:
+def _local_model_checks(settings: Settings) -> list[Check]:
+    """只有用到本地模型时才检查设备和模型缓存（全云端配置不探测 torch）。"""
+    if not settings.uses_local_models:
+        return [Check(OK, "未使用本地模型：跳过设备与模型缓存检查")]
+    return check_device(settings) + check_models(settings)
+
+
+def run_checks(
+    settings: Settings, check_llm_call: bool = False, check_models_call: bool = False
+) -> list[tuple[str, list[Check]]]:
     """按分组运行全部检查；某项检查自己抛异常时记为 ✗，不影响其余项。"""
     groups: list[tuple[str, Callable[[], list[Check]]]] = [
         ("运行环境", lambda: check_python() + check_paths(settings) + check_env_file()),
-        ("本地模型", lambda: check_device(settings) + check_models(settings)),
+        ("模型（embedding / reranker）", lambda: check_providers(settings, call=check_models_call) + _local_model_checks(settings)),
         ("知识库", lambda: check_knowledge(settings)),
         ("大模型", lambda: check_llm(settings, call=check_llm_call)),
         ("服务", lambda: check_auth(settings) + check_web(settings)),
@@ -251,6 +377,6 @@ def render(results: list[tuple[str, list[Check]]], color: bool = False, out=prin
     return 1 if counts[FAIL] else 0
 
 
-def run_doctor(settings: Settings, check_llm_call: bool = False, out=print) -> int:
+def run_doctor(settings: Settings, check_llm_call: bool = False, out=print, check_models_call: bool = False) -> int:
     color = sys.stdout.isatty() and "NO_COLOR" not in os.environ
-    return render(run_checks(settings, check_llm_call), color=color, out=out)
+    return render(run_checks(settings, check_llm_call, check_models_call), color=color, out=out)

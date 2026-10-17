@@ -5,13 +5,19 @@
       阈值应让它们全部通过；
   (b) 本脚本里的库外问题：库里没有答案，阈值应尽量把它们拦下。
 
+适用于任何 reranker 提供方（RAG_RERANKER_PROVIDER=local / api）：换了 reranker（模型或云端服务）后分数分布会变，
+用本脚本重新标定后，把推荐阈值写进 RAG_MIN_SCORE（必要时同时调整 RAG_CONTEXT_MIN_SCORE）。
+provider=none 没有分数，无需标定。云端提供方每个问题会调用一次 rerank 接口（共约 66 次，会产生少量费用）。
+
 运行（在项目主目录，即 RAG_HOME，默认当前目录下）：uv run python scripts/calibrate_rerank_threshold.py [--mode hybrid]
 """
 import argparse
 import json
 import statistics
 
-from ragbase.config import eval_questions_file, load_env
+from ragbase.config import eval_questions_file, get_settings, load_env
+from ragbase.index_info import IndexMismatchError
+from ragbase.models.factory import ProviderConfigError
 from ragbase.retrieval.pipeline import build_pipeline, retrieve_and_rerank
 
 load_env()
@@ -78,8 +84,14 @@ def main():
     parser.add_argument("--mode", choices=("vector", "bm25", "hybrid"), default="hybrid")
     args = parser.parse_args()
 
-    print("加载本地 embedding 与 reranker 模型...")
-    pipeline, _ = build_pipeline(retrieve_k=20, mode=args.mode)
+    settings = get_settings()
+    if settings.reranker_provider == "none":
+        raise SystemExit("RAG_RERANKER_PROVIDER=none：没有精排得分，无需标定拒答阈值。")
+    print(f"加载 embedding（{settings.embedding_provider}）与 reranker（{settings.reranker_provider}，{settings.reranker_model}）...")
+    try:
+        pipeline, _ = build_pipeline(retrieve_k=20, mode=args.mode, settings=settings)  # 经工厂创建，本地 / 云端提供方通用
+    except (IndexMismatchError, ProviderConfigError) as exc:
+        raise SystemExit(f"错误：{exc}")
 
     answerable = []
     print("\n(a) 库内可回答（评测题 + 口语化补充题）：top1 rerank_score")

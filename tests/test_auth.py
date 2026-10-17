@@ -34,6 +34,7 @@ INDEX_HTML = "<!doctype html><title>RAG 知识库</title><div id=root></div>"
 HEALTH_KEYS = {
     "status", "chunk_count", "bm25_ready", "bm25_built_at", "bm25_chunk_count", "device", "mode",
     "llm_configured", "vector_store", "llm_protocol", "llm_model", "agent_ready", "auth_required",
+    "embedding", "reranker",
 }
 
 

@@ -13,7 +13,7 @@ class Scores(BaseModel):
     vec_rank: int | None = Field(None, description="向量路内排名（1 起），未命中为 null")
     bm25_rank: int | None = Field(None, description="BM25 路内排名（1 起），未命中为 null")
     rrf_score: float | None = Field(None, description="RRF 融合分数")
-    rerank_score: float | None = Field(None, description="精排得分 P(相关)，0~1；精排前的候选为 null")
+    rerank_score: float | None = Field(None, description="精排得分（本地精排为 P(相关)，0~1；云端按服务商返回）；精排前的候选、以及未启用精排时为 null")
 
 
 class Chunk(BaseModel):
@@ -134,13 +134,20 @@ class SessionDeleteResponse(BaseModel):
     deleted: bool
 
 
+class ModelInfo(BaseModel):
+    provider: str = Field(description="提供方：embedding 为 local / openai；reranker 为 local / api / none")
+    model: str | None = Field(description="模型名（本地为 Hugging Face 仓库名，云端为服务商的模型 ID）；不精排时为 null")
+
+
 class HealthResponse(BaseModel):
     status: Literal["ok", "not_ready"]
     chunk_count: int | None = Field(description="索引片段数，索引不存在为 null")
     bm25_ready: bool
     bm25_built_at: str | None = Field(None, description="当前 BM25 索引的构建时间（UTC，ISO 8601）；未构建为 null")
     bm25_chunk_count: int | None = Field(None, description="当前 BM25 索引覆盖的片段数；与 chunk_count 不同说明刷新尚未完成")
-    device: str
+    device: str = Field(description="本地模型的计算设备；embedding 与 reranker 都用云端时为 cloud")
+    embedding: ModelInfo
+    reranker: ModelInfo
     mode: Mode
     llm_configured: bool
     vector_store: str = Field(description="向量库后端（RAG_VECTOR_STORE）：chroma / qdrant")

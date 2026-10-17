@@ -175,6 +175,8 @@ def test_health_ok():
         "status": "ok", "chunk_count": 6408, "bm25_ready": True,
         "bm25_built_at": "2025-10-09T08:53:20+00:00", "bm25_chunk_count": 6408,
         "device": "cpu", "mode": "hybrid", "llm_configured": True, "vector_store": "chroma",
+        "embedding": {"provider": "local", "model": "Qwen/Qwen3-Embedding-0.6B"},
+        "reranker": {"provider": "local", "model": "Qwen/Qwen3-Reranker-0.6B"},
         "llm_protocol": "openai", "llm_model": "test-model",
         "agent_ready": False,  # 测试配置没有 base_url -> 大模型未配齐 -> 对话 Agent 未启用
         "auth_required": False,  # 未设置 RAG_API_KEY

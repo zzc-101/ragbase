@@ -1,4 +1,4 @@
-"""本地模型（embedding + reranker）的缓存检查与下载。
+"""本地模型（embedding + reranker）的缓存检查与下载；提供方是云端 API（或不精排）的那一个不需要下载，会被跳过。
 
 只依赖 huggingface_hub（不导入 torch / sentence_transformers），所以 `ragbase models download`、`ragbase doctor`
 和 serve 启动前的检查都很快。缓存位置跟随 HF_HOME（默认 ~/.cache/huggingface），镜像用 HF_ENDPOINT
@@ -20,10 +20,25 @@ class ModelSpec:
 
 
 def required_models(settings: Settings) -> list[ModelSpec]:
-    return [
-        ModelSpec("embedding", settings.embedding_model, "RAG_EMBEDDING_MODEL"),
-        ModelSpec("reranker", settings.reranker_model, "RAG_RERANKER_MODEL"),
-    ]
+    """需要在本地缓存里的模型：只包含提供方为 local 的那些。"""
+    specs = []
+    if settings.uses_local_embedding:
+        specs.append(ModelSpec("embedding", settings.embedding_model, "RAG_EMBEDDING_MODEL"))
+    if settings.uses_local_reranker:
+        specs.append(ModelSpec("reranker", settings.reranker_model, "RAG_RERANKER_MODEL"))
+    return specs
+
+
+def cloud_roles(settings: Settings) -> list[tuple[str, str]]:
+    """不需要下载的角色：[(角色, 说明)]，用于提示“云端提供方，无需下载”。"""
+    roles = []
+    if not settings.uses_local_embedding:
+        roles.append(("embedding", f"{settings.embedding_provider} / {settings.embedding_model}"))
+    if settings.reranker_provider == "api":
+        roles.append(("reranker", f"api / {settings.reranker_model}"))
+    elif settings.reranker_provider == "none":
+        roles.append(("reranker", "none（不精排）"))
+    return roles
 
 
 def cached_snapshot(repo_id: str) -> Path | None:
@@ -70,6 +85,8 @@ def ensure_models(settings: Settings, download=download_model, out=print) -> lis
     """
     endpoint, cache_dir = hub_info()
     results: list[tuple[ModelSpec, str]] = []
+    for role, detail in cloud_roles(settings):
+        out(f"[跳过] {role}：{detail}：云端提供方，无需下载")
     for spec in required_models(settings):
         if is_model_cached(spec.repo_id):
             out(f"[跳过] {spec.role}：{spec.repo_id} 已在本地缓存")

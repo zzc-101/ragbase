@@ -25,13 +25,22 @@ export interface ToolCallInfo {
   args: Record<string, unknown>
 }
 
+/** embedding / reranker 的提供方与模型：embedding 为 local | openai；reranker 为 local | api | none（不精排时 model 为 null）。 */
+export interface ModelInfo {
+  provider: string
+  model: string | null
+}
+
 export interface Health {
   status: 'ok' | 'not_ready'
   chunk_count: number | null
   bm25_ready: boolean
   bm25_built_at: string | null
   bm25_chunk_count: number | null
+  /** 本地模型的计算设备；embedding 与 reranker 都用云端时为 "cloud" */
   device: string
+  embedding: ModelInfo
+  reranker: ModelInfo
   mode: 'vector' | 'bm25' | 'hybrid'
   llm_configured: boolean
   llm_protocol: string

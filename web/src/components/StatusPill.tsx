@@ -1,7 +1,7 @@
 import { Button } from '@/components/ui/button'
 import { useHealth } from '@/hooks/queries'
 import { useAuth } from '@/hooks/useAuth'
-import { ApiError, type Health } from '@/lib/api'
+import { ApiError, type Health, type ModelInfo } from '@/lib/api'
 import { replaceKey } from '@/lib/auth'
 import { relativeTime } from '@/lib/time'
 import { cn } from '@/lib/utils'
@@ -26,11 +26,21 @@ function summarize(health: Health | undefined, offline: boolean, locked: boolean
   return { tone: 'bad', label: '未就绪' }
 }
 
+const PROVIDER_LABEL: Record<string, string> = { local: '本地', openai: '云端', api: '云端' }
+
+/** 模型一行：“本地 · 模型名”或“云端 · 模型名”；reranker 为 none 时显示“未启用（不精排）”。模型名可能很长，放在可换行、可悬停查看的 span 里。 */
+function modelText(info: ModelInfo | undefined): string {
+  if (!info) return '—'
+  if (info.provider === 'none') return '未启用（不精排）'
+  const provider = PROVIDER_LABEL[info.provider] ?? info.provider
+  return info.model ? `${provider} · ${info.model}` : provider
+}
+
 function Row({ label, children }: { label: string; children: React.ReactNode }) {
   return (
     <div className="flex items-baseline justify-between gap-6 py-1.5">
       <dt className="shrink-0 text-muted-foreground">{label}</dt>
-      <dd className="tabular text-right">{children}</dd>
+      <dd className="tabular min-w-0 break-words text-right">{children}</dd>
     </div>
   )
 }
@@ -54,7 +64,7 @@ export function StatusPill() {
           {label}
         </button>
       </PopoverTrigger>
-      <PopoverContent align="end" className="w-72 p-4 text-sm">
+      <PopoverContent align="end" className="w-80 max-w-[calc(100vw-2rem)] p-4 text-sm">
         <div className="mb-2 flex items-center gap-2 font-medium">
           <span className={cn('size-2 rounded-full', DOT[tone])} aria-hidden />
           {label}
@@ -65,7 +75,17 @@ export function StatusPill() {
             <Row label="BM25 构建时间">
               <span title={health.bm25_built_at ?? undefined}>{relativeTime(health.bm25_built_at)}</span>
             </Row>
-            <Row label="设备">{health.device}</Row>
+            <Row label="Embedding">
+              <span title={health.embedding ? `${health.embedding.provider}: ${health.embedding.model}` : undefined}>
+                {modelText(health.embedding)}
+              </span>
+            </Row>
+            <Row label="Reranker">
+              <span title={health.reranker ? `${health.reranker.provider}: ${health.reranker.model ?? ''}` : undefined}>
+                {modelText(health.reranker)}
+              </span>
+            </Row>
+            <Row label="设备">{health.device === 'cloud' ? '无（云端模型）' : health.device}</Row>
             <Row label="召回模式">{MODE_LABEL[health.mode]}</Row>
             <Row label="大模型">
               {health.llm_configured && health.llm_model

@@ -249,6 +249,17 @@ def print_summary(results, mode: str):
         print("原有检索裁判：", retrievals)
 
 
+def _build_pipeline_or_exit(settings, mode):
+    """构建流水线；embedding 配置与索引不一致 / 云端提供方配置有误时给出说明后退出，而不是抛 traceback。"""
+    from ragbase.index_info import IndexMismatchError
+    from ragbase.models.factory import ProviderConfigError
+
+    try:
+        return build_pipeline(mode=mode, settings=settings)[0]
+    except (IndexMismatchError, ProviderConfigError) as exc:
+        raise SystemExit(f"错误：{exc}")
+
+
 def run(args):
     """运行评测；args 是 `ragbase eval` 解析出的命令行参数（见 ragbase.cli）。"""
     settings = get_settings()
@@ -264,8 +275,8 @@ def run(args):
     mode = args.retrieval_mode
     result_file = result_path(mode, args.retrieval_only)
     print(f"加载 {len(questions)} 道测试题，开始评估（召回模式：{mode}）...")
-    print("加载本地 embedding 与 reranker 模型...")
-    pipeline, _ = build_pipeline(mode=mode)
+    print("加载 embedding 与 reranker（本地模型或云端接口，按配置）...")
+    pipeline = _build_pipeline_or_exit(settings, mode)
     # 中文裁判与 ragas 用评测模型（eval_llm_*，缺省沿用回答模型）；回答仍由 pipeline 里的回答模型生成
     judge_llm = None if args.retrieval_only else create_chat_model(settings, "eval")
     ragas_evaluator = None

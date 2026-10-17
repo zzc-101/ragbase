@@ -15,7 +15,6 @@ from ragas.metrics.collections import (
 )
 
 from ragbase.config import Settings, ragas_cache_dir
-from ragbase.models.embeddings import Qwen3Embeddings
 from ragbase.llm.factory import create_ragas_llm
 
 
@@ -25,9 +24,9 @@ LEXICAL_HIT_THRESHOLD = 0.35
 
 
 class QwenRagasEmbeddings(BaseRagasEmbedding):
-    """把项目已加载的 Qwen embedding 适配到 Ragas 0.4 接口。"""
+    """把项目已加载的 embedding（本地或云端）适配到 Ragas 0.4 接口。"""
 
-    def __init__(self, embeddings: Qwen3Embeddings):
+    def __init__(self, embeddings):  # 本地 Qwen3Embeddings 或云端 OpenAIEmbeddings（需有 embed_query / embed_queries）
         super().__init__()
         self.embeddings = embeddings
 
@@ -128,7 +127,7 @@ def lexical_retrieval_metrics(documents, reference: str) -> dict[str, float]:
 class RagasEvaluator:
     """用配置的评测模型（eval_llm_*，缺省沿用回答模型；OpenAI 兼容协议）运行 Ragas 0.4 指标。"""
 
-    def __init__(self, settings: Settings, embeddings: Qwen3Embeddings):
+    def __init__(self, settings: Settings, embeddings):
         cache = DiskCacheBackend(cache_dir=str(ragas_cache_dir()))
         llm = create_ragas_llm(settings, cache=cache)
         if llm is None:
