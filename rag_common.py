@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 from document_cleaner import clean_documents
 from document_parser import load_document
 from document_splitter import split_documents
+from document_toc import pdf_page_headings
 
 load_dotenv()
 
@@ -17,7 +18,7 @@ DATA_DIR = BASE_DIR / "data"
 DB_DIR = str(BASE_DIR / "chroma_db")
 COLLECTION = "rag"
 META_FILE = BASE_DIR / ".ingest_meta.json"  # 记录文件指纹，用于增量更新
-INGEST_PIPELINE_VERSION = "2"  # 解析/清洗/切分规则变化时递增
+INGEST_PIPELINE_VERSION = "3"  # 解析/清洗/切分/章节标题规则变化时递增（3：PDF 片段加 heading_path）
 
 
 def file_fingerprint(path: Path) -> str:
@@ -52,24 +53,40 @@ def build_ingest_meta(paths: list[Path]) -> dict:
     }
 
 
-def load_ingest_meta() -> dict:
+def load_ingest_meta(meta_path: Path = META_FILE) -> dict:
     """读取上次成功入库时保存的文件元数据。"""
-    if not META_FILE.exists():
+    if not meta_path.exists():
         return {}
-    return json.loads(META_FILE.read_text(encoding="utf-8"))
+    return json.loads(meta_path.read_text(encoding="utf-8"))
 
 
-def save_ingest_meta(meta: dict) -> None:
+def save_ingest_meta(meta: dict, meta_path: Path = META_FILE) -> None:
     """原子写入文件元数据，避免中断时留下半截 JSON。"""
-    temp_file = META_FILE.with_suffix(".tmp")
+    temp_file = meta_path.with_suffix(".tmp")
     temp_file.write_text(
         json.dumps(meta, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
-    temp_file.replace(META_FILE)
+    temp_file.replace(meta_path)
 
 
-def collection_count(db_dir: str = DB_DIR, name: str = COLLECTION) -> int | None:
+def with_heading(text: str, metadata: dict, separator: str) -> str:
+    """片段有章节路径（heading_path）时，把它拼在正文前面；没有则原样返回。"""
+    heading = (metadata or {}).get("heading_path")
+    return f"{heading}{separator}{text}" if heading else text
+
+
+def embedding_input(text: str, metadata: dict) -> str:
+    """向量化的输入：章节路径 + 换行 + 正文（Chroma 里存的 document 仍是纯正文）。"""
+    return with_heading(text, metadata, "\n")
+
+
+def bm25_input(text: str, metadata: dict) -> str:
+    """BM25 分词的输入：章节路径 + 空格 + 正文。"""
+    return with_heading(text, metadata, " ")
+
+
+def collection_count(db_dir: str | Path = DB_DIR, name: str = COLLECTION) -> int | None:
     """返回集合片段数；索引目录或集合不存在时返回 None（不加载任何模型）。"""
     if not Path(db_dir).exists():  # PersistentClient 会自动建目录，所以先判断
         return None
@@ -85,6 +102,8 @@ def prepare_file_chunks(path: Path):
     """编排解析、清洗和切分，返回 Chroma 载荷及预处理报告。"""
     fid = file_id(path)
     parsed_documents = load_document(path)
+    # PDF 书签 -> 每页章节路径；其他格式暂无章节信息
+    page_headings = pdf_page_headings(path) if path.suffix.lower() == ".pdf" else []
     cleaned_documents, cleaning_report = clean_documents(parsed_documents)
     chunks, splitting_report = split_documents(cleaned_documents)
     texts, metadatas, ids = [], [], []
@@ -95,6 +114,9 @@ def prepare_file_chunks(path: Path):
         metadata["content_hash"] = hashlib.sha256(
             chunk.page_content.encode("utf-8")
         ).hexdigest()[:16]
+        page = metadata.get("page")
+        if isinstance(page, int) and 0 <= page < len(page_headings) and page_headings[page]:
+            metadata["heading_path"] = page_headings[page]  # 未知时不写该字段（Chroma 元数据只能是标量）
         texts.append(chunk.page_content)
         metadatas.append(metadata)
         ids.append(chunk_id(fid, index))
@@ -102,5 +124,6 @@ def prepare_file_chunks(path: Path):
         "parsed_documents": len(parsed_documents),
         "cleaning": asdict(cleaning_report),
         "splitting": asdict(splitting_report),
+        "heading_chunks": sum(1 for metadata in metadatas if metadata.get("heading_path")),
     }
     return texts, metadatas, ids, report

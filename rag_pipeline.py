@@ -13,7 +13,7 @@ from langchain_openai import ChatOpenAI
 from config import CONTEXT_MIN_SCORE, RERANK_MIN_SCORE, Settings, get_settings, resolve_device
 from embed import Qwen3Embeddings
 from hybrid_retriever import HybridRetriever
-from rag_common import COLLECTION, DB_DIR
+from rag_common import COLLECTION
 from reranker import Qwen3Reranker
 
 
@@ -107,7 +107,7 @@ def build_pipeline(
     embeddings = Qwen3Embeddings(device=device)
     reranker = Qwen3Reranker(device=device)
     logger.info("本地模型加载完成（设备 %s），用时 %.1fs", device, time.perf_counter() - start)
-    client = chromadb.PersistentClient(path=DB_DIR)
+    client = chromadb.PersistentClient(path=str(settings.db_dir))
     collection = client.get_collection(COLLECTION)
     retriever = HybridRetriever(
         collection,
@@ -116,6 +116,7 @@ def build_pipeline(
         per_route_k=per_route_k,
         final_k=retrieve_k,
         build_bm25=build_bm25,
+        cache_dir=settings.cache_dir,
     )
 
     llm = None
@@ -138,10 +139,13 @@ def build_pipeline(
 
 
 def format_docs(docs) -> str:
-    return "\n\n".join(
-        f"[片段{i + 1}] {doc.page_content}"
-        for i, doc in enumerate(docs)
-    )
+    """拼成交给 LLM 的上下文；片段有章节路径时写在编号后面：[片段1]（第11章 > 11.3 挣值分析）正文。"""
+    parts = []
+    for i, doc in enumerate(docs):
+        heading = doc.metadata.get("heading_path")
+        label = f"[片段{i + 1}]（{heading}）" if heading else f"[片段{i + 1}] "
+        parts.append(f"{label}{doc.page_content}")
+    return "\n\n".join(parts)
 
 
 def retrieve_and_rerank(
@@ -149,20 +153,26 @@ def retrieve_and_rerank(
     question: str,
     rerank_k: int = 5,
     mode: str | None = None,
+    sources: list[str] | None = None,
 ):
     """召回并精排（不调用 LLM），返回 (精排片段, 原始候选片段)。
 
     精排片段是候选的副本，metadata 里附带 rerank_score（P(相关)，0~1）；
-    原始候选保持不变。mode 为 None 时用检索器构造时的默认模式。
+    原始候选保持不变。mode 为 None 时用检索器构造时的默认模式；
+    sources（书名 = 文件 basename 列表）不为空时只在这些书里检索。
     全程持有 pipeline.lock：本地模型不支持并发推理，多线程（API）调用时在此串行。
     """
+    options = {}
+    if mode is not None:
+        options["mode"] = mode
+    if sources:
+        options["sources"] = sources
     with pipeline.lock:
-        if mode is None:
-            candidates = pipeline.retriever.invoke(question)
-        else:
-            candidates = pipeline.retriever.invoke(question, mode=mode)
+        candidates = pipeline.retriever.invoke(question, **options)
         if not candidates:
             return [], []  # 空召回不调用 reranker
+        # 精排输入只用正文，不拼章节路径：拒答阈值（RERANK_MIN_SCORE）是按纯正文的得分分布校准的，
+        # 改了输入会让分数分布漂移、阈值失效。章节路径只参与向量化和 BM25 分词。
         ranked = pipeline.reranker.rerank_with_scores(
             question,
             [doc.page_content for doc in candidates],
@@ -256,16 +266,17 @@ def ask(
     min_score: float | None = RERANK_MIN_SCORE,
     context_min_score: float | None = CONTEXT_MIN_SCORE,
     mode: str | None = None,
+    sources: list[str] | None = None,
 ) -> AskResult:
     """执行召回、精排和生成，返回 AskResult。
 
     无召回结果，或最相关片段的 rerank_score < min_score 时直接返回 NO_ANSWER、
     不调用 LLM（reranked 仍会返回，便于查看最接近的片段）。min_score 为 None 或 0 时不按得分拒答。
     通过后只把 rerank_score >= context_min_score 的片段交给 LLM（None/0 不过滤），
-    LLM 输出的【依据】/【回答】会被拆开。mode 为 None 时用默认召回模式；
+    LLM 输出的【依据】/【回答】会被拆开。mode 为 None 时用默认召回模式；sources 限定检索的书；
     大模型调用失败抛 GenerationError（不在锁内，慢生成不会阻塞别的检索）。
     """
-    reranked, candidates = retrieve_and_rerank(pipeline, question, rerank_k, mode)
+    reranked, candidates = retrieve_and_rerank(pipeline, question, rerank_k, mode, sources)
     top_score = reranked[0].metadata["rerank_score"] if reranked else None
     if should_refuse(reranked, min_score):
         return AskResult(NO_ANSWER, "", [], reranked, candidates, True, top_score)

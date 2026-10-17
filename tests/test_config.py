@@ -23,6 +23,11 @@ def test_defaults_match_current_behavior():
     assert settings.context_min_score == CONTEXT_MIN_SCORE == 0.95
     assert (settings.host, settings.port, settings.log_level) == ("127.0.0.1", 8000, "INFO")
     assert not settings.llm_configured
+    # 数据 / 索引路径默认指向仓库内原有位置，上传上限 300 MB
+    root = Path(__file__).resolve().parent.parent
+    assert settings.data_dir == root / "data" and settings.db_dir == root / "chroma_db"
+    assert settings.meta_file == root / ".ingest_meta.json" and settings.cache_dir == root / ".bm25_cache"
+    assert settings.max_upload_mb == 300
     assert rag_pipeline.RERANK_MIN_SCORE == RERANK_MIN_SCORE  # 旧的导入路径仍可用
 
 
@@ -30,6 +35,7 @@ def test_rag_env_prefix_and_ark_aliases():
     import os
     env = {
         "RAG_PORT": "9001", "RAG_MODE": "bm25", "RAG_LOG_LEVEL": "debug", "RAG_MIN_SCORE": "0",
+        "RAG_DATA_DIR": "/tmp/ragdemo-test-data", "RAG_DB_DIR": "/tmp/ragdemo-test-db", "RAG_MAX_UPLOAD_MB": "50",
         "ARK_CHAT_MODEL": "ep-test", "ARK_CHAT_API_KEY": "sk-unit-test", "ARK_BASE_URL": "http://llm.test/v3",
     }
     saved = {key: os.environ.get(key) for key in env}
@@ -44,6 +50,8 @@ def test_rag_env_prefix_and_ark_aliases():
                 os.environ[key] = value
     assert settings.port == 9001 and settings.mode == "bm25" and settings.log_level == "DEBUG"
     assert settings.min_score == 0
+    assert settings.data_dir == Path("/tmp/ragdemo-test-data") and settings.db_dir == Path("/tmp/ragdemo-test-db")
+    assert settings.max_upload_mb == 50
     assert settings.chat_model == "ep-test" and settings.base_url == "http://llm.test/v3"
     assert settings.chat_api_key.get_secret_value() == "sk-unit-test"
     assert "sk-unit-test" not in repr(settings)
@@ -51,7 +59,7 @@ def test_rag_env_prefix_and_ark_aliases():
 
 
 def test_invalid_values_rejected():
-    for kwargs in ({"mode": "nope"}, {"device": "tpu"}, {"min_score": 2}, {"port": 0}, {"log_level": "loud"}):
+    for kwargs in ({"mode": "nope"}, {"device": "tpu"}, {"min_score": 2}, {"port": 0}, {"log_level": "loud"}, {"max_upload_mb": 0}):
         try:
             _settings(**kwargs)
         except ValueError:

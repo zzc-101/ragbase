@@ -21,6 +21,7 @@ class Chunk(BaseModel):
     text: str
     source: str = Field(description="来源文件名（不含目录）")
     page: int | None = Field(None, description="页码（1 起，仅 PDF 有）")
+    heading_path: str | None = Field(None, description="章节路径（PDF 书签），如 第11章 > 11.3 挣值分析；旧索引 / 无书签为 null")
     scores: Scores
 
 
@@ -30,10 +31,21 @@ class Citation(BaseModel):
     text: str
     source: str = Field(description="来源文件名（不含目录）")
     page: int | None = Field(None, description="页码（1 起，仅 PDF 有）")
+    heading_path: str | None = Field(None, description="章节路径（PDF 书签）；旧索引 / 无书签为 null")
     scores: Scores
 
 
-class SearchRequest(BaseModel):
+class SourcesField(BaseModel):
+    """/search 与 /ask 共用的按书过滤字段。"""
+
+    sources: list[str] | None = Field(
+        None,
+        max_length=50,
+        description="只在这些书里检索（文件名，取自 GET /documents 的 name）；不传或空列表表示全部；有未知书名返回 400",
+    )
+
+
+class SearchRequest(SourcesField):
     model_config = ConfigDict(str_strip_whitespace=True)
 
     query: str = Field(min_length=1, max_length=1000, description="问题（首尾空白会被去掉，不能为空）")
@@ -51,7 +63,7 @@ class SearchResponse(BaseModel):
     took_ms: float
 
 
-class AskRequest(BaseModel):
+class AskRequest(SourcesField):
     model_config = ConfigDict(str_strip_whitespace=True)
 
     query: str = Field(min_length=1, max_length=1000, description="问题（首尾空白会被去掉，不能为空）")
@@ -75,9 +87,45 @@ class HealthResponse(BaseModel):
     status: Literal["ok", "not_ready"]
     chunk_count: int | None = Field(description="索引片段数，索引不存在为 null")
     bm25_ready: bool
+    bm25_built_at: str | None = Field(None, description="当前 BM25 索引的构建时间（UTC，ISO 8601）；未构建为 null")
+    bm25_chunk_count: int | None = Field(None, description="当前 BM25 索引覆盖的片段数；与 chunk_count 不同说明刷新尚未完成")
     device: str
     mode: Mode
     llm_configured: bool
+
+
+class DocumentInfo(BaseModel):
+    name: str = Field(description="文件名（不含目录），可用于 sources 过滤和 DELETE /documents/{name}")
+    chunk_count: int
+    heading_chunks: int = Field(description="带章节路径的片段数")
+    has_headings: bool = Field(description="是否有章节路径（旧索引或无书签的 PDF 为 false）")
+
+
+class DocumentsResponse(BaseModel):
+    documents: list[DocumentInfo]
+
+
+class JobResponse(BaseModel):
+    job_id: str
+    status: Literal["pending", "running", "succeeded", "failed"]
+    files_total: int = 0
+    files_done: int = 0
+    current_file: str | None = None
+    chunks_added: int = 0
+    chunks_deleted: int = 0
+    skipped_files: list[str] = Field(default_factory=list, description="被跳过的文件（旧版 .doc）")
+    error: str | None = None
+    started_at: str | None = Field(None, description="UTC，ISO 8601")
+    finished_at: str | None = None
+
+
+class UploadResponse(JobResponse):
+    filename: str = Field(description="实际保存的文件名（已去掉目录部分）")
+
+
+class DeleteResponse(BaseModel):
+    name: str
+    chunks_deleted: int
 
 
 class ErrorResponse(BaseModel):
@@ -94,6 +142,7 @@ def _chunk_fields(doc: Document) -> dict:
         "source": os.path.basename(metadata.get("source", "?")),
         # 元数据里的 page 是 0 起，对外与命令行 / 评测一致，用 1 起的页码
         "page": page + 1 if isinstance(page, int) else None,
+        "heading_path": metadata.get("heading_path") or None,
         "scores": Scores(
             vec_rank=metadata.get("vec_rank"),
             bm25_rank=metadata.get("bm25_rank"),

@@ -343,6 +343,8 @@ python-dotenv==1.2.2
     #   -r requirements.txt
     #   pydantic-settings
     #   uvicorn
+python-multipart==0.0.32
+    # via -r requirements.txt
 pyyaml==6.0.3
     # via
     #   chromadb

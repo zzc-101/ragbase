@@ -8,6 +8,7 @@ import os
 
 from dotenv import load_dotenv
 from config import get_settings
+from hybrid_retriever import UnknownSourceError
 from rag_common import collection_count
 from rag_pipeline import ask, build_pipeline
 
@@ -35,6 +36,13 @@ def parse_args():
         default=settings.context_min_score,
         help=f"只把精排得分不低于该值的片段交给大模型（最相关片段总是保留；默认 {settings.context_min_score}；0 表示不过滤）",
     )
+    parser.add_argument(
+        "--source",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="只在这本书里检索（文件名，如 xxx.pdf；可重复指定多本）；不指定则检索全部",
+    )
     return parser.parse_args()
 
 
@@ -49,13 +57,15 @@ def route_label(metadata: dict) -> str:
 
 
 def source_label(metadata: dict) -> str:
-    """引用来源：文件名[:第N页][召回路径[|精排得分]]；仅在元数据有 page（PDF）时显示页码。"""
+    """引用来源：文件名[:第N页][「末级章节」][召回路径[|精排得分]]；仅在元数据有 page（PDF）时显示页码，有 heading_path 时显示章节。"""
     name = os.path.basename(metadata.get("source", "?"))
     page = metadata.get("page")
     page_text = f":第{page + 1}页" if isinstance(page, int) else ""
+    heading = metadata.get("heading_path")
+    heading_text = f"「{heading.split(' > ')[-1]}」" if heading else ""  # 只显示最末一级，保持简短
     score = metadata.get("rerank_score")
     score_text = f"|{score:.2f}" if isinstance(score, float) else ""
-    return f"{name}{page_text}[{route_label(metadata)}{score_text}]"
+    return f"{name}{page_text}{heading_text}[{route_label(metadata)}{score_text}]"
 
 
 def main():
@@ -64,14 +74,23 @@ def main():
     if not settings.chat_api_key:
         print("错误：请先在 .env 文件里填写 ARK_CHAT_API_KEY")
         return
-    if not collection_count():
+    if not collection_count(settings.db_dir):
         print("错误：索引不存在或为空，请先运行：uv run ingest.py")
         return
 
     print("加载本地 embedding 与 reranker 模型...")
     pipeline, _ = build_pipeline(mode=args.mode)
+    sources = list(dict.fromkeys(args.source)) or None
+    if sources:
+        try:
+            pipeline.retriever.resolve_sources(sources)
+        except UnknownSourceError as exc:
+            print(f"错误：未知的书名 {exc.unknown}")
+            print("可选：" + "、".join(exc.valid))
+            return
 
-    print(f"RAG 问答已就绪（召回模式：{args.mode}），输入问题开始（输入 exit 退出）")
+    scope = f"，限定：{'、'.join(sources)}" if sources else ""
+    print(f"RAG 问答已就绪（召回模式：{args.mode}{scope}），输入问题开始（输入 exit 退出）")
     while True:
         q = input("\n问：").strip()
         if q.lower() in ("exit", "quit", "q"):
@@ -85,6 +104,7 @@ def main():
             rerank_k=settings.rerank_k,
             min_score=args.min_score,
             context_min_score=args.context_min_score,
+            sources=sources,
         )
 
         if result.refused:

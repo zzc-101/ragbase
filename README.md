@@ -20,17 +20,30 @@
 - `document_parser.py`：文件格式解析
 - `document_cleaner.py`：文本规范化、重复页眉页脚和空页清理
 - `document_splitter.py`：递归切分、空片段与重复片段过滤
+- `document_toc.py`：PDF 书签 -> 每页章节路径（`heading_path`）
 - `rag_common.py`：稳定 ID、文件指纹和入库编排
+- `ingest_service.py`：增量入库逻辑（命令行和 HTTP 服务共用，依赖全部显式传入，便于用临时目录 + 假 embedding 测试）
 
 ## 混合检索
 
 [hybrid_retriever.py](hybrid_retriever.py) 同时走两路召回：向量路直接查 Chroma（各取 30），BM25 路用 `jieba` 分词 + `bm25s` 打分（各取 30），再用 RRF（`score = Σ 1/(60+rank)`，只看排名）融合取前 20 交给 Reranker。专有名词、缩写和公式（如 TOGAF、SPI）这类向量容易漏的内容，由 BM25 补召回。
 
 - BM25 索引在启动时从 Chroma 已有的片段文本现建，无需改动入库流程。
-- 分词结果缓存在 `.bm25_cache/`（已忽略），片段数、`.ingest_meta.json` 或用户词典变化后自动重建。
+- 分词结果缓存在 `.bm25_cache/`（已忽略）；缓存键包含全部片段内容的摘要和用户词典，入库 / 删除 / 章节标题变化后自动失效，旧缓存文件会被清掉。
+- BM25 索引、语料和书目录打包成不可变的“快照”，入库或删除文档后在后台建好新快照，再整体替换一个引用（原子切换），检索期间不会看到半成品索引。
 - 领域词典放在仓库根目录的 [bm25_userdict.txt](bm25_userdict.txt)（jieba 格式：`词 词频 词性`）。不要放进 `data/`，那里的 `.txt` 会被当作文档入库。修改后下次启动自动生效。
 - 召回模式用 `--mode` 切换：`uv run query.py --mode {vector,bm25,hybrid}`（默认 `hybrid`）。答案后的来源会标出召回路径，如 `[V3+B1]` 表示向量路第 3、BM25 路第 1。
 - 单元测试：`uv run python tests/test_hybrid.py`。
+
+## 章节标题（PDF 书签）
+
+入库时读取 PDF 书签（目录），给每个片段加上 `heading_path`（如 `第11章 项目成本管理 > 11.3 挣值分析`），见 [document_toc.py](document_toc.py)：
+
+- 对第 p 页，路径 = 起始页不晚于该页的各层级“最近一条”书签标题，用 ` > ` 连接；标题会去首尾空白、压缩空白，纯数字 / 标点的标题（如考试大纲里的 `1`）直接丢弃，没有可用书签则该文件没有章节。非 PDF 暂无章节。
+- **近似**：书签只记录起始页，不记录页内位置，一节从页中间开始时，整页都归给这一节。
+- 向量化输入 = `heading_path + "\n" + 正文`，BM25 分词输入 = `heading_path + " " + 正文`；Chroma 里存的 document 仍是纯正文。**精排 Reranker 的输入只用正文**，这样按纯正文校准的拒答阈值仍然有效。
+- 展示：`/search` 的 `chunks`、`/ask` 的 `citations` 带 `heading_path`（没有为 `null`）；交给大模型的上下文写成 `[片段1]（第11章 … > 11.3 …）正文`；`query.py` 的来源标签带末级章节，如 `xxx.pdf:第12页「11.3 挣值分析」[V2+B1|0.93]`。
+- `INGEST_PIPELINE_VERSION` 已升到 `3`、分词版本升到 `3`：下次增量入库会把所有文件视为已变化并重新索引（这才会给现有的 PDF 加上章节）。**旧索引（没有 `heading_path`）无需改动即可继续使用**，章节全部为 `null`。
 
 ## 低相关度拒答
 
@@ -118,7 +131,9 @@ uv run ingest.py
 uv run ingest_incremental.py
 ```
 
-全量入库和增量入库使用相同的稳定片段 ID，并通过 `.ingest_meta.json` 记录文件状态。旧版索引首次执行增量命令时会自动迁移重建。
+全量入库和增量入库使用相同的稳定片段 ID，并通过 `.ingest_meta.json` 记录文件状态（每个文件成功后立即写入，中途失败不会重做已完成的文件；失败的文件下次重试）。旧版索引首次执行增量命令时会迁移重建：先按 ID 分批清空旧片段，再逐文件写入（不删除 collection）。
+
+> **服务运行期间不要运行 `ingest.py`**：它会删除整个 `chroma_db/` 目录，而服务进程还持有该索引。服务在线时请用下面的 `POST /documents` / `POST /ingest` / `DELETE /documents/{name}`（或先停服务再跑命令行）。`ingest_incremental.py` 同样不要与服务同时运行（两个进程会同时写同一个库）。
 
 ## 问答与评测
 
@@ -174,18 +189,23 @@ uv run uvicorn api:app --host 127.0.0.1 --port 8000   # 或：uv run api.py（�
 ```
 
 - **必须单进程，不要加 `--workers`**：embedding / reranker / BM25 索引都加载在服务进程内，多 worker 会让每个进程各占一份显存，且 MPS 模型不能并发推理。并发请求由线程池接住，召回 + 精排在一把锁内串行，大模型生成在锁外并行（慢生成不会阻塞检索）。
-- 启动约 10 秒（加载两个本地模型和 BM25 索引）。索引不存在或为空时服务仍会启动，`/health` 报告 `not_ready`，`/search` 与 `/ask` 返回 503（“索引不存在或为空，请先运行 uv run ingest.py”）；入库后需重启服务。
+- 启动约 10 秒（加载两个本地模型和 BM25 索引）。索引不存在或为空时服务仍会启动，`/health` 报告 `not_ready`，`/search`、`/ask` 以及文档管理接口返回 503（“索引不存在或为空，请先运行 uv run ingest.py”）；用命令行建好索引后需重启服务（在线入库要求服务启动时索引已存在）。
 - 每个响应带 `X-Request-ID`（请求头里带了就沿用，否则生成），每个请求输出一行访问日志（方法、路径、状态码、耗时；`/search`、`/ask` 另带 `refused` 和 `top_score`）。
-- 错误统一为 `{"error": "...", "detail": "..."}`：422 参数校验、400 请求了未构建的 BM25 模式、502 大模型调用失败、503 索引 / 大模型未就绪、500 未处理异常（详情只写日志）。
+- 错误统一为 `{"error": "...", "detail": "..."}`：422 参数校验、400 请求了未构建的 BM25 模式 / 未知书名 / 非法上传、404 找不到文档或任务、409 已有入库任务在运行、413 上传文件过大、502 大模型调用失败、503 索引 / 大模型未就绪、500 未处理异常（详情只写日志）。
 - 交互式文档：<http://127.0.0.1:8000/docs>。
 
 | 接口 | 说明 |
 | --- | --- |
-| `GET /health` | `status`（`ok` / `not_ready`）、`chunk_count`、`bm25_ready`、`device`、`mode`、`llm_configured` |
+| `GET /health` | `status`（`ok` / `not_ready`）、`chunk_count`、`bm25_ready`、`bm25_built_at`（当前 BM25 索引的构建时间，UTC）、`bm25_chunk_count`（BM25 覆盖的片段数，与 `chunk_count` 不同说明刷新未完成）、`device`、`mode`、`llm_configured` |
 | `POST /search` | 召回 + 精排，不调用大模型 |
 | `POST /ask` | 召回 + 精排 + 大模型回答；得分过低时拒答且不调用大模型 |
+| `GET /documents` | 已入库的文档：`name`、`chunk_count`、`heading_chunks`、`has_headings`（按 `source` 的文件名汇总，旧版索引同样可用） |
+| `POST /documents` | 上传文档（multipart，字段名 `file`），保存到数据目录并立即开始增量入库，返回 202 + 任务信息 |
+| `DELETE /documents/{name}` | 删除文档：源文件、索引片段、元数据，并同步刷新 BM25 |
+| `POST /ingest` | 对数据目录做一次增量入库，返回 202 + `job_id` |
+| `GET /ingest/jobs/{job_id}` | 任务状态 |
 
-`/search` 请求：`query`（1~1000 字，首尾空白会被去掉）必填；可选 `mode`（`vector` / `bm25` / `hybrid`）、`top_k`（精排后返回数，默认 5）、`min_score`（0 表示不拒答）、`include_candidates`（同时返回精排前的候选，默认 false）。
+`/search` 请求：`query`（1~1000 字，首尾空白会被去掉）必填；可选 `mode`（`vector` / `bm25` / `hybrid`）、`top_k`（精排后返回数，默认 5）、`min_score`（0 表示不拒答）、`include_candidates`（同时返回精排前的候选，默认 false）、`sources`（见下“按书过滤”）。
 
 ```bash
 curl -s -X POST http://127.0.0.1:8000/search -H 'Content-Type: application/json' \
@@ -200,15 +220,16 @@ curl -s -X POST http://127.0.0.1:8000/search -H 'Content-Type: application/json'
   "top_score": 0.9996,
   "chunks": [
     {"rank": 1, "chunk_id": "...", "text": "...", "source": "xxx.pdf", "page": 333,
+     "heading_path": "第11章 项目成本管理 > 11.3 挣值分析",
      "scores": {"vec_rank": 2, "bm25_rank": 2, "rrf_score": 0.0323, "rerank_score": 0.9996}}
   ],
   "took_ms": 3512.4
 }
 ```
 
-`refused` 为 true 表示最相关片段得分低于 `min_score`（`chunks` 仍会返回，便于查看）；`page` 为 1 起的页码，仅 PDF 有，否则为 null。
+`refused` 为 true 表示最相关片段得分低于 `min_score`（`chunks` 仍会返回，便于查看）；`page` 为 1 起的页码，仅 PDF 有，否则为 null；`heading_path` 是章节路径，旧版索引或没有书签的 PDF 为 null。
 
-`/ask` 请求：`query` 必填；可选 `mode`、`min_score`、`context_min_score`。
+`/ask` 请求：`query` 必填；可选 `mode`、`min_score`、`context_min_score`、`sources`。
 
 ```bash
 curl -s -X POST http://127.0.0.1:8000/ask -H 'Content-Type: application/json' \
@@ -228,7 +249,28 @@ curl -s -X POST http://127.0.0.1:8000/ask -H 'Content-Type: application/json' \
 }
 ```
 
-`citations[n-1]` 对应回答中的 `[片段n]`；拒答时 `citations` 为空。
+`citations[n-1]` 对应回答中的 `[片段n]`（含 `heading_path`）；拒答时 `citations` 为空。
+
+**按书过滤**：`/search` 与 `/ask` 的 `sources` 是书名（文件名，取自 `GET /documents` 的 `name`）列表，只在这些书里检索；缺省或空列表表示全部；有未知书名返回 400 并列出可选项。服务端用检索器内存里的语料把书名解析成库里存的 `source` 原始值（旧索引存的是绝对路径，不会自己拼路径）；向量路用 Chroma 的 `where={"source": {"$in": [...]}}`，BM25 路用 bm25s 的 `weight_mask`，过滤后没有命中则判定拒答。命令行：`uv run query.py --source 书名.pdf`（可重复）。
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/search -H 'Content-Type: application/json' \
+  -d '{"query": "挣值分析", "sources": ["某某教程.pdf"]}'
+```
+
+**在线入库**（任务在服务进程的后台线程里跑，同一时刻只有一个）：
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/documents -F 'file=@新教材.pdf'      # 上传并开始入库 -> 202 {"job_id": "...", "status": "running", ...}
+curl -s http://127.0.0.1:8000/ingest/jobs/<job_id>                        # 轮询：pending|running|succeeded|failed
+curl -s -X POST http://127.0.0.1:8000/ingest                              # 不上传，只对数据目录重新做一次增量入库
+curl -s -X DELETE 'http://127.0.0.1:8000/documents/新教材.pdf'
+```
+
+- 任务状态字段：`job_id`、`status`、`files_total`、`files_done`、`current_file`、`chunks_added`、`chunks_deleted`、`skipped_files`（旧版 `.doc` 和入库失败的文件）、`error`、`started_at`、`finished_at`。`succeeded` 表示入库完成**且 BM25 已刷新**；有文件失败时整体 `failed`，其余文件已正常入库并写入元数据。
+- `POST /documents` 校验：扩展名（不区分大小写，支持 `.pdf/.docx/.md/.markdown/.txt`，`.doc` 提示另存为 `.docx`）、大小（`RAG_MAX_UPLOAD_MB`，默认 300，流式写盘不整体读入内存，超限 413）、文件名只取最后一段（`../x.pdf` 会存成 `x.pdf`），空 / 隐藏 / `~$` / `README` 开头的名字返回 400；同名文件覆盖（原子替换）。已有任务在运行时文件仍会保存，但返回 409，稍后调用 `POST /ingest` 即可。
+- **并发**：入库每 64 个片段为一批（向量化 + 写入）单独持有 `pipeline.lock`，批间释放，所以入库期间 `/search` 可以插进来（会比平时慢一点，本地模型同一时刻只服务一个调用）。同名修改的文件先 upsert 新片段、再删不再存在的旧片段，重建期间该文件仍可检索。任务结束后重建 BM25 快照并原子替换。删除文档期间也算“忙”，此时新任务 / 其他删除返回 409。
+- 旧版索引（片段无 `fid`、ID 是 UUID）第一次 `POST /ingest` 或上传时会迁移：按 ID 分批清空旧片段（不删除 collection）再逐文件重建，耗时与全量入库相当。`DELETE` 对旧片段按 `source` 的文件名匹配。
 
 **配置**（环境变量或 `.env`，环境变量优先；[config.py](config.py) 是唯一来源，`query.py` / `evaluate.py` 的默认值也取自这里，命令行参数仍可覆盖）：
 
@@ -241,6 +283,9 @@ curl -s -X POST http://127.0.0.1:8000/ask -H 'Content-Type: application/json' \
 | `RAG_RERANK_K` | `5` | 精排后保留的片段数 |
 | `RAG_MIN_SCORE` | `0.7` | 拒答阈值，0 表示不拒答 |
 | `RAG_CONTEXT_MIN_SCORE` | `0.95` | 交给大模型的片段最低精排得分，0 表示不过滤 |
+| `RAG_DATA_DIR` / `RAG_DB_DIR` | 仓库内 `data/` / `chroma_db/` | 文档目录 / Chroma 持久化目录（命令行脚本和服务共用） |
+| `RAG_META_FILE` / `RAG_CACHE_DIR` | 仓库内 `.ingest_meta.json` / `.bm25_cache/` | 入库元数据文件 / BM25 分词缓存目录 |
+| `RAG_MAX_UPLOAD_MB` | `300` | `POST /documents` 单文件大小上限 |
 | `RAG_LOG_LEVEL` | `INFO` | 日志级别 |
 | `RAG_HOST` / `RAG_PORT` | `127.0.0.1` / `8000` | `uv run api.py` 的监听地址 |
 | `ARK_CHAT_API_KEY` | 无 | 方舟 API Key（以 `SecretStr` 保存，不会出现在日志 / `repr` 中） |
@@ -249,7 +294,8 @@ curl -s -X POST http://127.0.0.1:8000/ask -H 'Content-Type: application/json' \
 
 未配置 `ARK_*` 时服务仍可启动，`/search` 可用，`/ask` 返回 503。
 
-- 单元测试：`uv run python tests/test_api.py`（假流水线，不加载模型、不调用大模型）、`tests/test_config.py`。
+- 单元测试（均不加载模型、不访问网络、不碰真实数据）：`uv run python tests/test_api.py`（假流水线 / 假入库，另有用临时 Chroma 的端到端用例）、`tests/test_ingest_service.py`（临时目录 + 假 embedding）、`tests/test_sources.py`（按书过滤、快照刷新、分词缓存）、`tests/test_toc.py`（用 fitz 生成带书签的 PDF）、`tests/test_config.py`。
+- 依赖：文件上传需要 `python-multipart`（已加入 `requirements.txt` / `requirements.lock`，旧环境请重新执行 `uv pip sync requirements.lock`）。
 
 ## 性能设计
 

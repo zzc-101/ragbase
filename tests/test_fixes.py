@@ -8,7 +8,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from document_parser import list_documents
+from document_parser import list_documents, sanitize_filename
 from evaluate import parse_answer_verdict, parse_retrieval_verdict
 from ingest_incremental import plan_changes
 from query import source_label
@@ -95,6 +95,22 @@ def test_source_label():
     assert source_label({"source": "/x/a.pdf", "page": 0, "vec_rank": 2}) == "a.pdf:第1页[V2]"
     assert source_label({"source": "/x/a.md", "bm25_rank": 1, "vec_rank": 3}) == "a.md[V3+B1]"
     assert source_label({}) == "?[?]"
+
+
+def test_source_label_with_heading_shows_only_leaf_level():
+    meta = {"source": "/x/a.pdf", "page": 11, "vec_rank": 2, "heading_path": "第11章 项目成本管理 > 11.3 挣值分析"}
+    assert source_label(meta) == "a.pdf:第12页「11.3 挣值分析」[V2]"
+    assert source_label({**meta, "heading_path": "第1章 概述"}) == "a.pdf:第12页「第1章 概述」[V2]"
+    assert source_label({**meta, "heading_path": ""}) == "a.pdf:第12页[V2]"  # 空串等于没有
+
+
+def test_sanitize_filename():
+    assert sanitize_filename("book.pdf") == "book.pdf"
+    assert sanitize_filename("  我的 笔记.md ") == "我的 笔记.md"
+    assert sanitize_filename("../../etc/passwd.txt") == "passwd.txt"  # 只留最后一段
+    assert sanitize_filename("C:\\Users\\x\\a.docx") == "a.docx"
+    for bad in (None, "", "   ", ".", "..", "dir/", ".hidden.md", "~$lock.docx", "README.md", "Readme.TXT", "a\x00b.md", "x" * 300 + ".md"):
+        assert sanitize_filename(bad) is None, bad
 
 
 class _Boom:

@@ -11,7 +11,8 @@ from typing import Literal
 from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-ENV_FILE = Path(__file__).parent / ".env"
+BASE_DIR = Path(__file__).parent
+ENV_FILE = BASE_DIR / ".env"
 
 # 最相关片段的精排得分（P(相关)，0~1）低于该值就拒答、不调用 LLM。
 # 校准（scripts/calibrate_rerank_threshold.py）：45 道库内问题 top1 得分 0.937~0.9999（中位 0.9994），
@@ -55,6 +56,13 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     host: str = "127.0.0.1"
     port: int = Field(8000, ge=1, le=65535)
+
+    # 数据与索引位置（默认即仓库内的 data/、chroma_db/ 等；测试里指向临时目录）
+    data_dir: Path = BASE_DIR / "data"  # 文档目录：POST /documents 上传到这里，POST /ingest 扫描这里
+    db_dir: Path = BASE_DIR / "chroma_db"  # Chroma 持久化目录
+    meta_file: Path = BASE_DIR / ".ingest_meta.json"  # 增量入库的文件指纹
+    cache_dir: Path = BASE_DIR / ".bm25_cache"  # BM25 分词缓存
+    max_upload_mb: int = Field(300, ge=1)  # POST /documents 的单文件大小上限（最大的教材 PDF 约 235 MB）
 
     # 回答模型（火山方舟，OpenAI 兼容接口），沿用原有 ARK_* 变量名
     chat_model: str | None = Field(None, validation_alias="ARK_CHAT_MODEL")

@@ -15,6 +15,7 @@ from rag_pipeline import (
     NO_ANSWER,
     RAGPipeline,
     ask,
+    format_docs,
     select_context_docs,
     split_evidence_answer,
 )
@@ -165,6 +166,18 @@ def test_split_unformatted_text():
 def test_prompt_has_format_and_rules():
     for needle in ("【依据】", "【回答】", "[片段N]", "逐字", NO_ANSWER, "{context}"):
         assert needle in ANSWER_SYSTEM_PROMPT, needle
+
+
+def test_format_docs_prefixes_heading_when_present():
+    docs = [
+        Document(page_content="正文甲", metadata={"heading_path": "第11章 项目成本管理 > 11.3 挣值分析"}),
+        Document(page_content="正文乙", metadata={}),  # 旧版片段：没有章节
+        Document(page_content="正文丙", metadata={"heading_path": ""}),
+    ]
+    assert format_docs(docs) == (
+        "[片段1]（第11章 项目成本管理 > 11.3 挣值分析）正文甲\n\n[片段2] 正文乙\n\n[片段3] 正文丙"
+    )
+    assert format_docs([]) == ""
 
 
 if __name__ == "__main__":

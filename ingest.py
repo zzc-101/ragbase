@@ -3,73 +3,51 @@
 运行：uv run ingest.py
 可重复运行，每次会先清空旧索引重建。
 支持格式：PDF / Word(.docx) / Markdown / 纯文本
+
+警告：本脚本会删除整个 chroma_db 目录。HTTP 服务（api.py）运行期间绝对不要运行它——
+服务进程还握着旧的索引文件；服务在线时请用 POST /documents、POST /ingest 增量更新。
 """
 import shutil
-from pathlib import Path
 
-from langchain_community.vectorstores import Chroma
 import chromadb
+
+from config import get_settings
 from document_parser import list_documents, report_skipped
-from embed import Qwen3Embeddings
-from rag_common import (
-    DATA_DIR, DB_DIR, COLLECTION, META_FILE,
-    build_ingest_meta, prepare_file_chunks, save_ingest_meta,
-)
+from ingest_service import print_progress, run_ingest
+from rag_common import COLLECTION
 
 
 def main():
-    docs_paths, skipped = list_documents(DATA_DIR)
-    report_skipped(skipped)
+    settings = get_settings()
+    data_dir, db_dir, meta_file = settings.data_dir, settings.db_dir, settings.meta_file
+    docs_paths, skipped = list_documents(data_dir)
     if not docs_paths:
-        print(f"错误：在 {DATA_DIR} 下没找到文档")
+        report_skipped(skipped)
+        print(f"错误：在 {data_dir} 下没找到文档")
         print("支持格式：PDF / Word(.docx) / Markdown / 纯文本")
         return
 
     # 清空旧索引后重建
-    if Path(DB_DIR).exists():
-        shutil.rmtree(DB_DIR)
+    if db_dir.exists():
+        shutil.rmtree(db_dir)
     # 避免重建中断后留下与半成品索引不匹配的旧元数据
-    META_FILE.unlink(missing_ok=True)
+    meta_file.unlink(missing_ok=True)
 
     # 本地 embedding：Qwen3-Embedding-0.6B（2025年，100+语言含中文+代码）
     print("加载本地 embedding 模型 Qwen3-Embedding-0.6B...")
+    from embed import Qwen3Embeddings
+
     embeddings = Qwen3Embeddings()
-    client = chromadb.PersistentClient(path=DB_DIR)
-    vectordb = Chroma(
-        client=client,
-        collection_name=COLLECTION,
-        embedding_function=embeddings,
-    )
+    client = chromadb.PersistentClient(path=str(db_dir))
+    collection = client.get_or_create_collection(COLLECTION)
 
-    # 逐文件解析，并以稳定 ID 分批写入
-    batch_size = 1000
-    total = 0
-    for file_index, path in enumerate(docs_paths, 1):
-        print(f"  [{file_index}/{len(docs_paths)}] 解析并索引：{path.name}")
-        texts, metadatas, ids, report = prepare_file_chunks(path)
-        for start in range(0, len(texts), batch_size):
-            end = start + batch_size
-            vectordb.add_texts(
-                texts=texts[start:end],
-                metadatas=metadatas[start:end],
-                ids=ids[start:end],
-            )
-        total += len(texts)
-        cleaning = report["cleaning"]
-        splitting = report["splitting"]
-        print(
-            f"    -> {len(texts)} 个片段 | "
-            f"清除模板行 {cleaning['repeated_boilerplate_lines_removed']} | "
-            f"空页 {cleaning['empty_documents_removed']} | "
-            f"重复片段 {splitting['duplicate_chunks_removed']}"
-        )
-        if report["parsed_documents"] and not texts:
-            print("    警告：文档没有可索引文本，扫描版 PDF 需要 OCR")
+    # 库已清空、无元数据，run_ingest 会把所有文件当作新增；每个文件成功后才写入其元数据
+    result = run_ingest(data_dir, collection, embeddings.embed_documents, meta_file, progress=print_progress)
 
-    # 只有全部文件成功入库后才更新元数据
-    save_ingest_meta(build_ingest_meta(docs_paths))
-
-    print(f"\n完成！共写入 {total} 个片段，向量库已存到 {DB_DIR}")
+    print(f"\n完成！共写入 {result.chunks_added} 个片段，向量库已存到 {db_dir}")
+    if result.failed_files:
+        print(f"有 {len(result.failed_files)} 个文件入库失败（见上方提示），修复后可运行 ingest_incremental.py 重试。")
+        raise SystemExit(1)
     print("现在可以运行：uv run query.py 开始问答")
 
 

@@ -6,6 +6,26 @@ SUPPORTED_EXTS = {".pdf", ".docx", ".md", ".markdown", ".txt"}
 LEGACY_EXTS = {".doc"}  # 旧版二进制 Word，Docx2txtLoader 读不了，只提示不入库
 
 
+def is_ignored_name(name: str) -> bool:
+    """README 说明文件、隐藏文件和 Word 临时锁文件（~$开头）不当作文档。"""
+    return Path(name).stem.lower() == "readme" or name.startswith((".", "~$"))
+
+
+def sanitize_filename(raw: str | None) -> str | None:
+    """把上传的文件名规整成安全的纯文件名；不合法（空、隐藏、~$、README、含控制字符、过长）返回 None。
+
+    只取最后一段（同时按 / 和 \\ 切分），所以 "../../a.pdf" 会变成 "a.pdf"，不可能写出数据目录。
+    """
+    if not raw:
+        return None
+    name = raw.replace("\\", "/").split("/")[-1].strip()
+    if not name or name in (".", "..") or is_ignored_name(name):
+        return None
+    if any(ord(char) < 32 or ord(char) == 127 for char in name) or len(name.encode("utf-8")) > 255:
+        return None
+    return name
+
+
 def list_documents(data_dir: Path) -> tuple[list[Path], list[Path]]:
     """列出目录（不递归）下所有支持的文档，返回 (文档列表, 被跳过的旧版 .doc 列表)。
 
@@ -13,11 +33,7 @@ def list_documents(data_dir: Path) -> tuple[list[Path], list[Path]]:
     """
     files, skipped = [], []
     for path in data_dir.iterdir():
-        if (
-            not path.is_file()
-            or path.stem.lower() == "readme"
-            or path.name.startswith((".", "~$"))
-        ):
+        if not path.is_file() or is_ignored_name(path.name):
             continue
         extension = path.suffix.lower()
         if extension in SUPPORTED_EXTS:
