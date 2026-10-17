@@ -1,22 +1,20 @@
 """运行 Ragas、词面检索指标和原有中文裁判的综合评测。"""
-import argparse
 import asyncio
 import json
 import os
 from pathlib import Path
 
-from dotenv import load_dotenv
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 
-from config import get_settings
-from evaluation_metrics import (
+from ragbase.config import eval_questions_file, get_settings, project_home
+from ragbase.evaluation.metrics import (
     RagasEvaluator,
     lexical_retrieval_metrics,
     mean_scores,
 )
-from llm_factory import create_chat_model
-from rag_pipeline import (
+from ragbase.llm.factory import create_chat_model
+from ragbase.retrieval.pipeline import (
     ask,
     build_pipeline,
     retrieve_and_rerank,
@@ -24,61 +22,15 @@ from rag_pipeline import (
     should_refuse,
 )
 
-load_dotenv()
-
-BASE_DIR = Path(__file__).parent
-EVAL_FILE = BASE_DIR / "eval_questions.json"
-
 
 def result_path(mode: str, retrieval_only: bool) -> Path:
     """按召回模式区分结果文件；仅检索评测另加后缀，避免覆盖完整评测。"""
     suffix = ".retrieval" if retrieval_only else ""
-    return BASE_DIR / f"eval_results.{mode}{suffix}.json"
-
-
-def parse_args():
-    settings = get_settings()  # 默认值来自配置（环境变量 / .env），命令行参数可覆盖
-    parser = argparse.ArgumentParser(description="评估 RAG 检索与回答质量")
-    parser.add_argument("--limit", type=int, help="只评估前 N 道题，适合冒烟测试")
-    parser.add_argument("--start-id", type=int, default=1, help="从指定题号开始")
-    parser.add_argument(
-        "--skip-ragas",
-        action="store_true",
-        help="跳过 Ragas 指标，减少 API 调用",
-    )
-    parser.add_argument(
-        "--skip-legacy-judge",
-        action="store_true",
-        help="跳过原有中文 LLM 裁判",
-    )
-    parser.add_argument(
-        "--retrieval-mode",
-        choices=("vector", "bm25", "hybrid"),
-        default=settings.mode,
-        help=f"召回方式：向量 / BM25 / 两路 RRF 融合（默认 {settings.mode}，可由 RAG_MODE 设置）",
-    )
-    parser.add_argument(
-        "--retrieval-only",
-        action="store_true",
-        help="只评估召回与精排的词面指标，不调用 LLM / Ragas / 裁判（不产生 API 费用）",
-    )
-    parser.add_argument(
-        "--min-score",
-        type=float,
-        default=settings.min_score,
-        help=f"最相关片段的精排得分低于该值则拒答、不调用 LLM（默认 {settings.min_score}；0 表示不拒答）",
-    )
-    parser.add_argument(
-        "--context-min-score",
-        type=float,
-        default=settings.context_min_score,
-        help=f"只把精排得分不低于该值的片段交给 LLM（top1 总是保留；默认 {settings.context_min_score}；0 表示不过滤）",
-    )
-    return parser.parse_args()
+    return project_home() / f"eval_results.{mode}{suffix}.json"
 
 
 def load_eval_questions(start_id: int = 1, limit: int | None = None):
-    questions = json.loads(EVAL_FILE.read_text(encoding="utf-8"))
+    questions = json.loads(eval_questions_file().read_text(encoding="utf-8"))
     questions = [question for question in questions if question["id"] >= start_id]
     return questions[:limit] if limit is not None else questions
 
@@ -297,8 +249,8 @@ def print_summary(results, mode: str):
         print("原有检索裁判：", retrievals)
 
 
-def main():
-    args = parse_args()
+def run(args):
+    """运行评测；args 是 `ragbase eval` 解析出的命令行参数（见 ragbase.cli）。"""
     settings = get_settings()
     if not args.retrieval_only and not settings.llm_configured:
         raise SystemExit(
@@ -407,6 +359,3 @@ def main():
     print_summary(results, mode)
     print(f"\n详细结果已保存到 {result_file}")
 
-
-if __name__ == "__main__":
-    main()

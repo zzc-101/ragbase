@@ -1,17 +1,14 @@
-"""document_toc 的单元测试：用 fitz 在临时目录生成带书签的小 PDF（不加载模型、不访问网络）。
+"""ragbase.ingest.toc 的单元测试：用 fitz 在临时目录生成带书签的小 PDF（不加载模型、不访问网络）。
 
 运行：uv run python tests/test_toc.py
 """
-import sys
 import tempfile
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
 import pymupdf
 
-from document_toc import build_page_headings, clean_title, clean_toc, pdf_page_headings
-from rag_common import bm25_input, embedding_input, prepare_file_chunks
+from ragbase.ingest.toc import build_page_headings, clean_title, clean_toc, pdf_page_headings
+from ragbase.ingest.common import bm25_input, embedding_input, prepare_file_chunks
 
 
 def _make_pdf(path: Path, pages: int, toc: list | None, text_prefix: str = "正文"):

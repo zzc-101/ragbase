@@ -70,7 +70,7 @@ export function StatusPill() {
           </dl>
         ) : (
           <p className="text-muted-foreground">
-            {isError ? '无法连接后端服务。请确认已启动：uv run api.py（默认端口 8000）。' : '正在检测服务状态…'}
+            {isError ? '无法连接后端服务。请确认已启动：uv run ragbase serve（默认端口 8000）。' : '正在检测服务状态…'}
           </p>
         )}
         {health && health.status === 'ok' && !health.agent_ready && (

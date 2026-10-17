@@ -9,7 +9,7 @@
 """
 from langchain_core.language_models import BaseChatModel
 
-from config import LLMConfig, LlmPurpose, Settings
+from ragbase.config import LLMConfig, LlmPurpose, Settings
 
 SUPPORTED_PROTOCOLS = ("openai",)
 

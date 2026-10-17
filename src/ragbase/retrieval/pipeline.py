@@ -11,19 +11,19 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 
-from config import CONTEXT_MIN_SCORE, RERANK_MIN_SCORE, Settings, get_settings, resolve_device
-from embed import Qwen3Embeddings
-from hybrid_retriever import HybridRetriever
-from llm_factory import create_chat_model
-from rag_common import COLLECTION
-from reranker import Qwen3Reranker
+from ragbase.config import CONTEXT_MIN_SCORE, RERANK_MIN_SCORE, Settings, get_settings, resolve_device
+from ragbase.models.embeddings import Qwen3Embeddings
+from ragbase.retrieval.hybrid import HybridRetriever
+from ragbase.llm.factory import create_chat_model
+from ragbase.ingest.common import COLLECTION
+from ragbase.models.reranker import Qwen3Reranker
 
 
 logger = logging.getLogger(__name__)
 
 NO_ANSWER = "我没有在文档中找到相关内容。"  # 召回为空或精排得分过低时的固定回答
 
-# 拒答阈值 RERANK_MIN_SCORE 与上下文过滤阈值 CONTEXT_MIN_SCORE 的取值依据见 config.py
+# 拒答阈值 RERANK_MIN_SCORE 与上下文过滤阈值 CONTEXT_MIN_SCORE 的取值依据见 ragbase/config.py
 # （从那里 import，本模块照旧可导入）。
 
 ANSWER_SYSTEM_PROMPT = f"""你是一个文档问答助手。请只根据下面提供的上下文片段回答用户的问题。

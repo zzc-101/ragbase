@@ -2,13 +2,10 @@
 
 运行：uv run python tests/test_config.py
 """
-import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
-from config import CONTEXT_MIN_SCORE, RERANK_MIN_SCORE, Settings, resolve_device
-import rag_pipeline
+from ragbase.config import CONTEXT_MIN_SCORE, RERANK_MIN_SCORE, Settings, resolve_device
+from ragbase.retrieval import pipeline as rag_pipeline
 
 
 def _settings(**kwargs):
@@ -44,10 +41,11 @@ def test_defaults_match_current_behavior():
     assert not settings.llm_configured
     assert settings.llm_protocol == "openai" and settings.llm_temperature == 0 and settings.llm_max_tokens is None
     assert (settings.llm_timeout, settings.llm_max_retries) == (60, 2)
-    # 数据 / 索引路径默认指向仓库内原有位置，上传上限 300 MB
-    root = Path(__file__).resolve().parent.parent
+    # 数据 / 索引路径默认在项目主目录（RAG_HOME 未设置时即当前工作目录，run_all.py 在仓库根目录运行），上传上限 300 MB
+    root = Path.cwd().resolve()
     assert settings.data_dir == root / "data" and settings.db_dir == root / "chroma_db"
     assert settings.meta_file == root / ".ingest_meta.json" and settings.cache_dir == root / ".bm25_cache"
+    assert settings.web_dist == root / "web" / "dist"
     assert settings.max_upload_mb == 300
     assert rag_pipeline.RERANK_MIN_SCORE == RERANK_MIN_SCORE  # 旧的导入路径仍可用
 
@@ -134,7 +132,7 @@ def test_eval_llm_overrides_fall_back_to_main():
     assert "sk-judge" not in repr(settings)
     # 只配了评测覆盖项不算回答模型已配置
     only_eval = _settings(
-        llm_model=None, llm_api_key=None, llm_base_url=None,  # rag_common 导入时会把 .env 灌进环境变量，这里显式清空
+        llm_model=None, llm_api_key=None, llm_base_url=None,  # ragbase.ingest.common 导入时会把 .env 灌进环境变量，这里显式清空
         eval_llm_model="j", eval_llm_base_url="http://j", eval_llm_api_key="k",
     )
     assert not only_eval.llm_configured and only_eval.llm_config("eval").configured
@@ -150,6 +148,29 @@ def test_invalid_values_rejected():
         except ValueError:
             continue
         raise AssertionError(f"应拒绝 {kwargs}")
+
+
+def test_rag_home_drives_default_paths():
+    import os
+    import tempfile
+    from ragbase.config import env_file, eval_questions_file, project_home, userdict_file
+
+    with _without_rag_env(), tempfile.TemporaryDirectory(prefix="ragdemo-home-test-") as tmp:
+        home = Path(tmp).resolve()
+        (home / ".env").write_text("RAG_PORT=9123\n", encoding="utf-8")
+        os.environ["RAG_HOME"] = str(home)
+        try:
+            assert project_home() == home and env_file() == home / ".env"
+            assert userdict_file() == home / "bm25_userdict.txt" and eval_questions_file() == home / "eval_questions.json"
+            settings = Settings()  # 默认读取 RAG_HOME 下的 .env
+            assert settings.port == 9123
+            assert settings.data_dir == home / "data" and settings.db_dir == home / "chroma_db"
+            assert settings.meta_file == home / ".ingest_meta.json" and settings.cache_dir == home / ".bm25_cache"
+            assert settings.web_dist == home / "web" / "dist"
+            assert _settings(web_dist="dist-x").web_dist == home / "dist-x"  # 相对路径按主目录解析
+            assert _settings().port == 8000  # 显式 _env_file=None 不读 .env
+        finally:
+            os.environ.pop("RAG_HOME", None)
 
 
 def test_resolve_device():

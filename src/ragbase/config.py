@@ -1,19 +1,52 @@
-"""集中配置：环境变量 / .env -> Settings，命令行脚本与 API 服务共用，保证默认值只有一个来源。
+"""集中配置：环境变量 / .env -> Settings，命令行与 API 服务共用，保证默认值只有一个来源。
 
 - 自有配置统一加 RAG_ 前缀（如 RAG_DEVICE、RAG_PORT）；大模型用 RAG_LLM_*，旧的 ARK_* 变量名仍然兼容（RAG_LLM_* 优先）。
 - API Key 用 SecretStr 保存，repr / 日志里只会显示掩码；读取明文请用 get_secret_value()。
 - 本模块不 import torch 等重型依赖（resolve_device 里才懒加载），可在任何脚本里放心导入。
 """
+import os
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
+from dotenv import load_dotenv
 from pydantic import AliasChoices, Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-BASE_DIR = Path(__file__).parent
-ENV_FILE = BASE_DIR / ".env"
+
+def project_home() -> Path:
+    """项目主目录：环境变量 RAG_HOME，未设置则为当前工作目录。
+
+    data/、chroma_db/、.ingest_meta.json、.bm25_cache/、web/dist、bm25_userdict.txt、eval_questions.json、.env
+    的默认位置都从这里推导（在仓库根目录运行时与旧版布局完全一致）。
+    注意 RAG_HOME 必须是真正的环境变量：.env 的位置本身依赖它，所以不能写在 .env 里。
+    每次调用都重新读取环境变量（不缓存），便于测试里临时切换。
+    """
+    return Path(os.environ.get("RAG_HOME") or Path.cwd()).expanduser().resolve()
+
+
+def env_file() -> Path:
+    return project_home() / ".env"
+
+
+def userdict_file() -> Path:
+    """BM25 用户词典；放在主目录而不是 data/ 下：data/*.txt 会被当文档入库。"""
+    return project_home() / "bm25_userdict.txt"
+
+
+def eval_questions_file() -> Path:
+    return project_home() / "eval_questions.json"
+
+
+def ragas_cache_dir() -> Path:
+    return project_home() / ".ragas_cache"
+
+
+def load_env() -> None:
+    """把主目录下的 .env 载入 os.environ（不覆盖已有的环境变量）；文件不存在时什么也不做。"""
+    load_dotenv(env_file())
+
 
 # 最相关片段的精排得分（P(相关)，0~1）低于该值就拒答、不调用 LLM。
 # 校准（scripts/calibrate_rerank_threshold.py）：45 道库内问题 top1 得分 0.937~0.9999（中位 0.9994），
@@ -60,7 +93,7 @@ class LLMConfig:
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="RAG_",
-        env_file=ENV_FILE,
+        env_file=None,  # .env 位置随 RAG_HOME 变化，在 __init__ 里按调用时的主目录指定
         env_file_encoding="utf-8",
         extra="ignore",  # .env 里还有 CHROMA_* 等别的变量
         populate_by_name=True,
@@ -79,18 +112,18 @@ class Settings(BaseSettings):
     host: str = "127.0.0.1"
     port: int = Field(8000, ge=1, le=65535)
 
-    # 数据与索引位置（默认即仓库内的 data/、chroma_db/ 等；测试里指向临时目录）
-    data_dir: Path = BASE_DIR / "data"  # 文档目录：POST /documents 上传到这里，POST /ingest 扫描这里
-    db_dir: Path = BASE_DIR / "chroma_db"  # Chroma 持久化目录
-    meta_file: Path = BASE_DIR / ".ingest_meta.json"  # 增量入库的文件指纹
-    cache_dir: Path = BASE_DIR / ".bm25_cache"  # BM25 分词缓存
-    web_dist: Path = BASE_DIR / "web" / "dist"  # 前端构建产物（pnpm build）；相对路径按仓库根目录解析，目录存在时由 API 服务托管
+    # 数据与索引位置（默认都在项目主目录 RAG_HOME 下，即运行目录里的 data/、chroma_db/ 等；测试里指向临时目录）
+    data_dir: Path = Field(default_factory=lambda: project_home() / "data")  # 文档目录：POST /documents 上传到这里，POST /ingest 扫描这里
+    db_dir: Path = Field(default_factory=lambda: project_home() / "chroma_db")  # Chroma 持久化目录
+    meta_file: Path = Field(default_factory=lambda: project_home() / ".ingest_meta.json")  # 增量入库的文件指纹
+    cache_dir: Path = Field(default_factory=lambda: project_home() / ".bm25_cache")  # BM25 分词缓存
+    web_dist: Path = Field(default_factory=lambda: project_home() / "web" / "dist")  # 前端构建产物（pnpm build）；相对路径按主目录解析，目录存在时由 API 服务托管
     max_upload_mb: int = Field(300, ge=1)  # POST /documents 的单文件大小上限（最大的教材 PDF 约 235 MB）
 
     # 大模型（默认 OpenAI 兼容协议）：RAG_LLM_*，未设置时回退到旧的 ARK_* 变量名（方舟，同为 OpenAI 兼容）。
     # 注意：validation_alias 会绕过 env_prefix，所以两个名字都要写全；环境变量里先出现的别名优先，
     # 但“环境变量里的 ARK_*”仍高于“.env 里的 RAG_LLM_*”（pydantic-settings 按来源分层，环境变量整体优先于 .env）。
-    llm_protocol: Literal["openai"] = "openai"  # 新增协议（如 anthropic）：这里加字面量 + llm_factory 加一个分支
+    llm_protocol: Literal["openai"] = "openai"  # 新增协议（如 anthropic）：这里加字面量 + llm.factory 加一个分支
     llm_base_url: str | None = Field(None, validation_alias=AliasChoices("RAG_LLM_BASE_URL", "ARK_BASE_URL"))
     llm_api_key: SecretStr | None = Field(None, validation_alias=AliasChoices("RAG_LLM_API_KEY", "ARK_CHAT_API_KEY"))
     llm_model: str | None = Field(None, validation_alias=AliasChoices("RAG_LLM_MODEL", "ARK_CHAT_MODEL"))
@@ -106,15 +139,19 @@ class Settings(BaseSettings):
     chat_max_sessions: int = Field(200, ge=1)  # 内存中最多保留的会话数，超出时淘汰最久未使用的空闲会话
     chat_session_ttl: float = Field(3600, gt=0)  # 会话空闲多少秒后过期（秒）
 
-    # 评测裁判（evaluate.py 的 ragas 与中文裁判）可单独指定模型；留空则沿用上面的回答模型配置
+    # 评测裁判（评测 runner 的 ragas 与中文裁判）可单独指定模型；留空则沿用上面的回答模型配置
     eval_llm_base_url: str | None = None
     eval_llm_api_key: SecretStr | None = None
     eval_llm_model: str | None = None
 
+    def __init__(self, **values):
+        values.setdefault("_env_file", env_file())  # 显式传 _env_file=None 仍可禁用 .env（测试用）
+        super().__init__(**values)
+
     @field_validator("web_dist")
     @classmethod
     def _resolve_web_dist(cls, value: Path) -> Path:
-        return value if value.is_absolute() else BASE_DIR / value
+        return value if value.is_absolute() else project_home() / value
 
     @field_validator("log_level")
     @classmethod

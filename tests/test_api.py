@@ -4,22 +4,19 @@
 """
 import logging
 import os
-import sys
 import tempfile
 import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
 from fastapi.testclient import TestClient
 from langchain_core.documents import Document
 
-import api
-from config import Settings, get_settings
-from ingest_service import IngestResult
-from rag_pipeline import NO_ANSWER, RAGPipeline
+from ragbase.api import app as api
+from ragbase.config import Settings, get_settings
+from ragbase.ingest.service import IngestResult
+from ragbase.retrieval.pipeline import NO_ANSWER, RAGPipeline
 
 # 所有测试默认把数据 / 索引 / 元数据目录指向这个临时目录，绝不碰真实的 data/、chroma_db/
 _SCRATCH = tempfile.TemporaryDirectory(prefix="ragdemo-api-test-")
@@ -200,7 +197,7 @@ def test_health_not_ready_when_index_missing():
         for path in ("/search", "/ask"):
             response = client.post(path, json={"query": "什么是软件工程"})
             body = _assert_error(response, 503, "service_unavailable")
-            assert body["detail"] == "索引不存在或为空，请先运行 uv run ingest.py"
+            assert body["detail"] == "索引不存在或为空，请先运行 ragbase ingest --full"
 
 
 def test_health_not_ready_when_index_empty():
@@ -386,12 +383,12 @@ def test_unhandled_error_returns_500_unified_and_logs_traceback():
             records.append(record)
 
     handler = _Capture(level=logging.INFO)
-    logging.getLogger("api").addHandler(handler)
+    logging.getLogger("ragbase.api.app").addHandler(handler)
     try:
         with _client(_pipeline(retriever=retriever)) as client:
             response = client.post("/search", json={"query": "q"}, headers={"X-Request-ID": "boom-1"})
     finally:
-        logging.getLogger("api").removeHandler(handler)
+        logging.getLogger("ragbase.api.app").removeHandler(handler)
     body = _assert_error(response, 500, "internal_error")
     assert "sk-leak-123" not in response.text and "检索内部出错" not in response.text
     assert response.headers["X-Request-ID"] == "boom-1"
@@ -408,7 +405,7 @@ def test_access_log_line_has_method_path_status_latency_and_search_fields():
             records.append(record.getMessage())
 
     handler = _Capture(level=logging.INFO)
-    logger = logging.getLogger("api")
+    logger = logging.getLogger("ragbase.api.app")
     previous_level = logger.level
     logger.setLevel(logging.INFO)
     logger.addHandler(handler)
@@ -658,8 +655,8 @@ def test_only_one_job_at_a_time_and_upload_during_job_keeps_file():
 def test_job_failure_paths():
     with tempfile.TemporaryDirectory() as tmp:
         settings = _ingest_settings(tmp)
-        logging.getLogger("ingest_jobs").disabled = True  # 预期内的失败，不在测试输出里刷堆栈
-        logging.getLogger("api").disabled = True
+        logging.getLogger("ragbase.ingest.jobs").disabled = True  # 预期内的失败，不在测试输出里刷堆栈
+        logging.getLogger("ragbase.api.app").disabled = True
         try:
             # 入库函数抛异常：任务 failed，但仍尝试刷新 BM25（索引可能已部分改动）
             pipeline = _pipeline()
@@ -689,8 +686,8 @@ def test_job_failure_paths():
                 job = _wait_job(client, client.post("/ingest").json()["job_id"])
                 assert job["status"] == "failed" and "BM25" in job["error"]
         finally:
-            logging.getLogger("ingest_jobs").disabled = False
-            logging.getLogger("api").disabled = False
+            logging.getLogger("ragbase.ingest.jobs").disabled = False
+            logging.getLogger("ragbase.api.app").disabled = False
 
 
 class _VectorEmbeddings:
@@ -718,7 +715,7 @@ def _real_pipeline(tmp, legacy_chunks=1):
     """真实 HybridRetriever + 临时 Chroma + 假 embedding：用来端到端验证上传 / 过滤 / 删除。"""
     import chromadb
 
-    from hybrid_retriever import HybridRetriever
+    from ragbase.retrieval.hybrid import HybridRetriever
 
     embeddings = _VectorEmbeddings()
     collection = chromadb.PersistentClient(path=str(Path(tmp) / "chroma")).get_or_create_collection("rag")
@@ -772,7 +769,7 @@ def test_end_to_end_upload_filter_and_delete_on_a_legacy_index():
             assert empty["chunks"] == [] and empty["refused"] is True and empty["top_score"] is None
 
             # 删除：片段、文件、元数据、BM25 都更新
-            from rag_common import load_ingest_meta
+            from ragbase.ingest.common import load_ingest_meta
 
             assert {info["name"] for info in load_ingest_meta(settings.meta_file).values()} == {"first.md", "second.txt"}
             deleted = client.delete("/documents/second.txt")

@@ -2,17 +2,14 @@
 
 运行：uv run python tests/test_fixes.py
 """
-import sys
 import tempfile
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
-from document_parser import list_documents, sanitize_filename
-from evaluate import parse_answer_verdict, parse_retrieval_verdict
-from ingest_incremental import plan_changes
-from query import source_label
-from rag_pipeline import NO_ANSWER, RAGPipeline, ask, retrieve_and_rerank
+from ragbase.ingest.parser import list_documents, sanitize_filename
+from ragbase.evaluation.runner import parse_answer_verdict, parse_retrieval_verdict
+from ragbase.ingest.service import plan_changes
+from ragbase.retrieval.labels import source_label
+from ragbase.retrieval.pipeline import NO_ANSWER, RAGPipeline, ask, retrieve_and_rerank
 
 
 def test_answer_verdict():
@@ -142,7 +139,7 @@ def test_empty_recall_skips_rerank_and_llm():
 
 
 def test_empty_results_metrics_ok():
-    from evaluation_metrics import lexical_retrieval_metrics, mean_scores
+    from ragbase.evaluation.metrics import lexical_retrieval_metrics, mean_scores
 
     metrics = lexical_retrieval_metrics([], "要点一；要点二")
     assert metrics == {"point_recall": 0.0, "context_precision": 0.0, "mrr": 0.0}

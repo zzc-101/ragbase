@@ -1,15 +1,12 @@
-"""hybrid_retriever 的纯单元测试（不加载模型、不访问 Chroma）。
+"""ragbase.retrieval.hybrid 的纯单元测试（不加载模型、不访问 Chroma）。
 
 运行：uv run python tests/test_hybrid.py
 """
-import sys
 import tempfile
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
-import hybrid_retriever
-from hybrid_retriever import HybridRetriever, rrf_fuse, tokenize
+from ragbase.retrieval import hybrid as hybrid_retriever
+from ragbase.retrieval.hybrid import HybridRetriever, rrf_fuse, tokenize
 
 
 def test_rrf_worked_example():
@@ -83,13 +80,8 @@ def _ids(docs):
 
 
 def test_invoke_mode_override_per_call():
-    original_cache_dir = hybrid_retriever.CACHE_DIR
-    with tempfile.TemporaryDirectory() as tmp:
-        hybrid_retriever.CACHE_DIR = Path(tmp)  # 别动真实的 .bm25_cache
-        try:
-            retriever = HybridRetriever(_Collection(), _Embeddings(), mode="vector", build_bm25=True)
-        finally:
-            hybrid_retriever.CACHE_DIR = original_cache_dir
+    with tempfile.TemporaryDirectory() as tmp:  # 别动真实的 .bm25_cache
+        retriever = HybridRetriever(_Collection(), _Embeddings(), mode="vector", build_bm25=True, cache_dir=Path(tmp))
     assert retriever.mode == "vector" and retriever.bm25_ready
     assert _ids(retriever.invoke("关键路径法")) == ["d3", "d1", "d2"]  # 默认模式 vector
     bm25_docs = retriever.invoke("关键路径法", mode="bm25")

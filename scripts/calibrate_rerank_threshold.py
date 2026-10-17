@@ -5,23 +5,17 @@
       阈值应让它们全部通过；
   (b) 本脚本里的库外问题：库里没有答案，阈值应尽量把它们拦下。
 
-运行：uv run python scripts/calibrate_rerank_threshold.py [--mode hybrid]
+运行（在项目主目录，即 RAG_HOME，默认当前目录下）：uv run python scripts/calibrate_rerank_threshold.py [--mode hybrid]
 """
 import argparse
 import json
 import statistics
-import sys
-from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from ragbase.config import eval_questions_file, load_env
+from ragbase.retrieval.pipeline import build_pipeline, retrieve_and_rerank
 
-from dotenv import load_dotenv
+load_env()
 
-from rag_pipeline import build_pipeline, retrieve_and_rerank
-
-load_dotenv()
-
-EVAL_FILE = Path(__file__).resolve().parent.parent / "eval_questions.json"
 CANDIDATE_THRESHOLDS = [0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95]
 SAFETY_MARGIN = 0.75  # 推荐阈值 = 可回答题最低分 * 该系数，给没测到的题留余量
 
@@ -63,7 +57,7 @@ OUT_OF_SCOPE = [
 
 
 def load_answerable() -> list[str]:
-    questions = json.loads(EVAL_FILE.read_text(encoding="utf-8"))
+    questions = json.loads(eval_questions_file().read_text(encoding="utf-8"))
     return [item["question"] for item in questions] + EXTRA_ANSWERABLE
 
 

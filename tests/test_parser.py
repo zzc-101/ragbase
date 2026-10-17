@@ -1,20 +1,17 @@
-"""document_parser 的单元测试：用临时生成的 PDF / DOCX / 文本文件，不依赖 data/ 里的真实文档。
+"""ragbase.ingest.parser 的单元测试：用临时生成的 PDF / DOCX / 文本文件，不依赖 data/ 里的真实文档。
 
 DOCX 没有用 python-docx（项目不依赖它），而是手工打包最小的 .docx（zip + document.xml），docx2txt 能照常解析。
 
 运行：uv run python tests/test_parser.py
 """
 import re
-import sys
 import tempfile
 import zipfile
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
 import pymupdf
 
-from document_parser import load_document
+from ragbase.ingest.parser import load_document
 
 ROOT = Path(__file__).resolve().parent.parent
 TMP = tempfile.TemporaryDirectory(prefix="ragdemo-parser-test-")
@@ -150,14 +147,16 @@ def test_unsupported_extension_and_str_path():
 def test_project_does_not_import_langchain_community_or_construct_chatopenai_elsewhere():
     pattern_community = re.compile(r"^\s*(?:from|import)\s+langchain_community", re.MULTILINE)
     offenders, direct = [], []
-    for source in ROOT.glob("*.py"):
+    package = ROOT / "src" / "ragbase"
+    for source in package.rglob("*.py"):
         text = source.read_text(encoding="utf-8")
+        name = source.relative_to(package).as_posix()
         if pattern_community.search(text):
-            offenders.append(source.name)
-        if "ChatOpenAI(" in text and source.name != "llm_factory.py":
-            direct.append(source.name)
+            offenders.append(name)
+        if "ChatOpenAI(" in text and name != "llm/factory.py":
+            direct.append(name)
     assert not offenders, f"仍在导入 langchain_community：{offenders}"
-    assert not direct, f"llm_factory 之外直接构造了 ChatOpenAI：{direct}"
+    assert not direct, f"llm/factory.py 之外直接构造了 ChatOpenAI：{direct}"
 
 
 if __name__ == "__main__":

@@ -1,17 +1,17 @@
 """RAG HTTP 服务（FastAPI）：检索 /search、问答 /ask、健康检查 /health。
 
-启动：uv run uvicorn api:app --host 127.0.0.1 --port 8000   （或 uv run api.py，读取 RAG_HOST / RAG_PORT）
+启动：uv run ragbase serve [--host 127.0.0.1] [--port 8000]（默认读取 RAG_HOST / RAG_PORT；也可 uv run uvicorn ragbase.api.app:app）
 
 必须单进程（不要加 --workers）：embedding / reranker / BM25 索引都加载在本进程内，
 多 worker 会让每个进程各占一份模型显存，且 MPS 模型本身不能并发推理——
 并发请求由线程池接住，召回 + 精排在 pipeline.lock 内串行，大模型生成在锁外并行。
 
-对话 Agent（POST /chat、POST /chat/stream、GET /chat/sessions、GET|DELETE /chat/sessions/{id}）见 chat_agent.py：模型按需调用知识库检索工具，
+对话 Agent（POST /chat、POST /chat/stream、GET /chat/sessions、GET|DELETE /chat/sessions/{id}）见 ragbase/agent/service.py：模型按需调用知识库检索工具，
 历史按会话保存在进程内存里；检索仍走 pipeline.lock，同会话的请求串行。
 
 文档管理（POST /documents、POST /ingest、DELETE /documents/{name}）也在本进程内完成：
 入库任务在后台线程里跑（同一时刻只有一个），每个批次单独持有 pipeline.lock，批间释放，/search 可以插进来；
-任务结束后重建 BM25 快照并原子替换。命令行 ingest.py（会删除整个 chroma_db）不能和服务同时运行。
+任务结束后重建 BM25 快照并原子替换。命令行 ragbase ingest --full（会删除整个 chroma_db）不能和服务同时运行。
 
 Web 界面：web/ 目录是前端工程，pnpm build 后产物在 web/dist（RAG_WEB_DIST 可改），本服务在同一端口托管它：
 /assets/* 是静态资源，/、/library、/c/{session_id} 返回 index.html（前端路由）；API 路由不受影响。
@@ -32,7 +32,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from api_schemas import (
+from ragbase.api.schemas import (
     SESSION_ID_PATTERN,
     AskRequest,
     AskResponse,
@@ -53,18 +53,18 @@ from api_schemas import (
     to_chunk,
     to_citation,
 )
-from chat_agent import ChatService, build_chat_service
-from config import Settings, get_settings
-from document_parser import LEGACY_EXTS, SUPPORTED_EXTS, sanitize_filename
-from ingest_jobs import IngestJobManager, JobRunningError, progress_handler
-from ingest_service import delete_document, run_ingest
-from logging_setup import request_id_var, setup_logging
-from rag_common import collection_count
-from rag_pipeline import GenerationError, RAGPipeline, ask, build_pipeline, retrieve_and_rerank, should_refuse
+from ragbase.agent.service import ChatService, build_chat_service
+from ragbase.config import Settings, get_settings
+from ragbase.ingest.parser import LEGACY_EXTS, SUPPORTED_EXTS, sanitize_filename
+from ragbase.ingest.jobs import IngestJobManager, JobRunningError, progress_handler
+from ragbase.ingest.service import delete_document, run_ingest
+from ragbase.logging_setup import request_id_var, setup_logging
+from ragbase.ingest.common import collection_count
+from ragbase.retrieval.pipeline import GenerationError, RAGPipeline, ask, build_pipeline, retrieve_and_rerank, should_refuse
 
 logger = logging.getLogger(__name__)
 
-INDEX_MISSING_MESSAGE = "索引不存在或为空，请先运行 uv run ingest.py"
+INDEX_MISSING_MESSAGE = "索引不存在或为空，请先运行 ragbase ingest --full"
 LLM_MISSING_MESSAGE = (
     "大模型未配置：请在 .env 中设置 RAG_LLM_API_KEY、RAG_LLM_MODEL 和 RAG_LLM_BASE_URL（旧的 ARK_* 变量同样有效）"
 )
@@ -72,7 +72,7 @@ WEB_MISSING_HINT = "前端未构建：cd web && pnpm install && pnpm build"
 LLM_FAILED_MESSAGE = "大模型调用失败，请稍后重试"
 LLM_TIMEOUT_MESSAGE = "大模型响应超时，请稍后重试"
 INTERNAL_ERROR_MESSAGE = "服务内部错误"
-INGEST_UNAVAILABLE_MESSAGE = "索引不存在或为空，服务无法在线入库：请先运行 uv run ingest_incremental.py 建立索引，再重启服务"
+INGEST_UNAVAILABLE_MESSAGE = "索引不存在或为空，服务无法在线入库：请先运行 ragbase ingest 建立索引，再重启服务"
 UPLOAD_CHUNK_BYTES = 1024 * 1024  # 上传流式写盘的块大小
 UPLOAD_SLACK_BYTES = 64 * 1024  # Content-Length 比文件上限多出的 multipart 边界 / 字段开销
 
@@ -611,12 +611,13 @@ def _mount_web(app: FastAPI, dist: Path) -> None:
 app = create_app()
 
 
-if __name__ == "__main__":
+def serve(host: str | None = None, port: int | None = None) -> None:
+    """用 uvicorn 在当前进程里启动服务（ragbase serve）；host / port 缺省取配置（RAG_HOST / RAG_PORT）。"""
     runtime = get_settings()
     uvicorn.run(
         app,
-        host=runtime.host,
-        port=runtime.port,
+        host=host or runtime.host,
+        port=port or runtime.port,
         log_level=runtime.log_level.lower(),
         access_log=False,  # 访问日志由上面的中间件统一输出（带请求 ID），避免重复
     )

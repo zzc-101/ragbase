@@ -1,4 +1,4 @@
-"""增量入库服务：命令行（ingest.py / ingest_incremental.py）与 HTTP 服务（POST /ingest）共用。
+"""增量入库服务：命令行（ragbase ingest [--full]）与 HTTP 服务（POST /ingest）共用。
 
 所有依赖都显式传入（文档目录、Chroma collection、向量化函数、元数据文件、锁、进度回调），
 所以测试可以用临时目录 + 假 embedding 运行，不碰真实数据。
@@ -27,8 +27,8 @@ from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from document_parser import list_documents
-from rag_common import (
+from ragbase.ingest.parser import list_documents
+from ragbase.ingest.common import (
     build_ingest_meta,
     embedding_input,
     file_id,

@@ -1,6 +1,6 @@
-# RAG Demo
+# ragbase
 
-面向中文 PDF、Word、Markdown 和文本资料的本地 RAG 命令行问答 Demo。
+面向中文 PDF、Word、Markdown 和文本资料的本地 RAG 知识库：混合检索 + 精排、命令行问答 / 对话 Agent、HTTP 服务与 Web 界面、评测。命令行入口为 `ragbase`。
 
 ## 架构
 
@@ -15,34 +15,57 @@
 - 回答模型通过 OpenAI 兼容接口调用火山引擎方舟。
 - 向量库、文档和密钥均已在 `.gitignore` 中排除。
 
-入库预处理按职责拆分为：
+入库预处理按职责拆分为（均在 `src/ragbase/ingest/` 下）：
 
-- `document_parser.py`：文件格式解析
-- `document_cleaner.py`：文本规范化、重复页眉页脚和空页清理
-- `document_splitter.py`：递归切分、空片段与重复片段过滤
-- `document_toc.py`：PDF 书签 -> 每页章节路径（`heading_path`）
-- `rag_common.py`：稳定 ID、文件指纹和入库编排
-- `ingest_service.py`：增量入库逻辑（命令行和 HTTP 服务共用，依赖全部显式传入，便于用临时目录 + 假 embedding 测试）
+- `parser.py`：文件格式解析
+- `cleaner.py`：文本规范化、重复页眉页脚和空页清理
+- `splitter.py`：递归切分、空片段与重复片段过滤
+- `toc.py`：PDF 书签 -> 每页章节路径（`heading_path`）
+- `common.py`：稳定 ID、文件指纹和入库编排
+- `service.py`：增量入库逻辑（命令行和 HTTP 服务共用，依赖全部显式传入，便于用临时目录 + 假 embedding 测试）
+- `jobs.py`：HTTP 服务里的后台入库任务
+
+## 项目结构
+
+```text
+pyproject.toml / uv.lock       依赖与锁文件（uv 管理）；命令行入口 ragbase = ragbase.cli:main
+src/ragbase/
+  cli.py  __main__.py          命令行：serve / ingest / ask / chat / eval（python -m ragbase 等价）
+  config.py  logging_setup.py  集中配置（RAG_* 环境变量 / .env）；日志
+  llm/factory.py               大模型工厂（OpenAI 兼容协议）
+  models/embeddings.py reranker.py   本地 Qwen3 embedding / reranker
+  ingest/                      parser / cleaner / splitter / toc / common / service / jobs
+  retrieval/                   hybrid（向量 + BM25 + RRF）、pipeline（召回 -> 精排 -> 拒答 -> 生成）、labels（来源标签）
+  agent/                       tools（检索工具与引用登记）、service（对话 Agent 与会话）
+  api/                         app（FastAPI 应用，ragbase.api.app:app）、schemas
+  evaluation/                  runner（评测流程）、metrics（Ragas 与词面指标）
+scripts/                       一次性脚本（如拒答阈值校准）
+tests/                         断言脚本式单元测试（tests/run_all.py 一次运行全部）
+web/                           前端工程（React + Vite）
+data/ chroma_db/ ...           运行时数据，默认都在项目主目录下（见下）
+```
+
+**项目主目录**：环境变量 `RAG_HOME`，未设置则为**当前工作目录**。`data/`、`chroma_db/`、`.ingest_meta.json`、`.bm25_cache/`、`web/dist`、`bm25_userdict.txt`、`eval_questions.json`、`eval_results.*.json`、`.ragas_cache/` 以及 `.env` 的默认位置都从它推导，所以请在仓库根目录运行命令（或设置 `RAG_HOME` 指向它）。`RAG_HOME` 必须是真正的环境变量，不能写在 `.env` 里（`.env` 的位置本身依赖它）。
 
 ## 混合检索
 
-[hybrid_retriever.py](hybrid_retriever.py) 同时走两路召回：向量路直接查 Chroma（各取 30），BM25 路用 `jieba` 分词 + `bm25s` 打分（各取 30），再用 RRF（`score = Σ 1/(60+rank)`，只看排名）融合取前 20 交给 Reranker。专有名词、缩写和公式（如 TOGAF、SPI）这类向量容易漏的内容，由 BM25 补召回。
+[src/ragbase/retrieval/hybrid.py](src/ragbase/retrieval/hybrid.py) 同时走两路召回：向量路直接查 Chroma（各取 30），BM25 路用 `jieba` 分词 + `bm25s` 打分（各取 30），再用 RRF（`score = Σ 1/(60+rank)`，只看排名）融合取前 20 交给 Reranker。专有名词、缩写和公式（如 TOGAF、SPI）这类向量容易漏的内容，由 BM25 补召回。
 
 - BM25 索引在启动时从 Chroma 已有的片段文本现建，无需改动入库流程。
 - 分词结果缓存在 `.bm25_cache/`（已忽略）；缓存键包含全部片段内容的摘要和用户词典，入库 / 删除 / 章节标题变化后自动失效，旧缓存文件会被清掉。
 - BM25 索引、语料和书目录打包成不可变的“快照”，入库或删除文档后在后台建好新快照，再整体替换一个引用（原子切换），检索期间不会看到半成品索引。
-- 领域词典放在仓库根目录的 [bm25_userdict.txt](bm25_userdict.txt)（jieba 格式：`词 词频 词性`）。不要放进 `data/`，那里的 `.txt` 会被当作文档入库。修改后下次启动自动生效。
-- 召回模式用 `--mode` 切换：`uv run query.py --mode {vector,bm25,hybrid}`（默认 `hybrid`）。答案后的来源会标出召回路径，如 `[V3+B1]` 表示向量路第 3、BM25 路第 1。
+- 领域词典放在项目主目录（仓库根目录）的 [bm25_userdict.txt](bm25_userdict.txt)（jieba 格式：`词 词频 词性`）。不要放进 `data/`，那里的 `.txt` 会被当作文档入库。修改后下次启动自动生效。
+- 召回模式用 `--mode` 切换：`uv run ragbase ask --mode {vector,bm25,hybrid}`（默认 `hybrid`）。答案后的来源会标出召回路径，如 `[V3+B1]` 表示向量路第 3、BM25 路第 1。
 - 单元测试：`uv run python tests/test_hybrid.py`。
 
 ## 章节标题（PDF 书签）
 
-入库时读取 PDF 书签（目录），给每个片段加上 `heading_path`（如 `第11章 项目成本管理 > 11.3 挣值分析`），见 [document_toc.py](document_toc.py)：
+入库时读取 PDF 书签（目录），给每个片段加上 `heading_path`（如 `第11章 项目成本管理 > 11.3 挣值分析`），见 [src/ragbase/ingest/toc.py](src/ragbase/ingest/toc.py)：
 
 - 对第 p 页，路径 = 起始页不晚于该页的各层级“最近一条”书签标题，用 ` > ` 连接；标题会去首尾空白、压缩空白，纯数字 / 标点的标题（如考试大纲里的 `1`）直接丢弃，没有可用书签则该文件没有章节。非 PDF 暂无章节。
 - **近似**：书签只记录起始页，不记录页内位置，一节从页中间开始时，整页都归给这一节。
 - 向量化输入 = `heading_path + "\n" + 正文`，BM25 分词输入 = `heading_path + " " + 正文`；Chroma 里存的 document 仍是纯正文。**精排 Reranker 的输入只用正文**，这样按纯正文校准的拒答阈值仍然有效。
-- 展示：`/search` 的 `chunks`、`/ask` 的 `citations` 带 `heading_path`（没有为 `null`）；交给大模型的上下文写成 `[片段1]（第11章 … > 11.3 …）正文`；`query.py` 的来源标签带末级章节，如 `xxx.pdf:第12页「11.3 挣值分析」[V2+B1|0.93]`。
+- 展示：`/search` 的 `chunks`、`/ask` 的 `citations` 带 `heading_path`（没有为 `null`）；交给大模型的上下文写成 `[片段1]（第11章 … > 11.3 …）正文`；`ragbase ask` 的来源标签带末级章节，如 `xxx.pdf:第12页「11.3 挣值分析」[V2+B1|0.93]`。
 - `INGEST_PIPELINE_VERSION` 已升到 `3`、分词版本升到 `3`：下次增量入库会把所有文件视为已变化并重新索引（这才会给现有的 PDF 加上章节）。**旧索引（没有 `heading_path`）无需改动即可继续使用**，章节全部为 `null`。
 
 ## 低相关度拒答
@@ -50,11 +73,11 @@
 精排后，如果最相关片段的 `rerank_score` 低于阈值，直接回答“我没有在文档中找到相关内容。”，**不调用大模型**（省钱，也避免模型凭空编造）。
 
 - `rerank_score` 是 Reranker 给出的 P(相关)，范围 0~1（模型原始输出是 logit 差，经 sigmoid 转换）。每个返回片段的 metadata 里都有，命令行来源会显示成 `xxx.pdf:第12页[V2+B1|0.93]`。
-- 默认阈值是 [config.py](config.py) 的 `RERANK_MIN_SCORE`（也可用 `RAG_MIN_SCORE` 环境变量覆盖）；临时调整用 `--min-score`，`0` 表示不拒答：
+- 默认阈值是 [src/ragbase/config.py](src/ragbase/config.py) 的 `RERANK_MIN_SCORE`（也可用 `RAG_MIN_SCORE` 环境变量覆盖）；临时调整用 `--min-score`，`0` 表示不拒答：
 
 ```bash
-uv run query.py --min-score 0.3
-uv run evaluate.py --retrieval-only --min-score 0.3   # 同时统计会被拒答的题数
+uv run ragbase ask --min-score 0.3
+uv run ragbase eval --retrieval-only --min-score 0.3   # 同时统计会被拒答的题数
 ```
 
 - 重新校准（换了教材、Reranker 或召回方式后）：运行下面的脚本，不调用 LLM。它会对 30 道评测题和一组库外问题打印最相关片段的得分分布，以及各候选阈值的“误拒 / 漏拦”数，再把推荐值填回 `RERANK_MIN_SCORE`。需要拦截更多库外问题时可以调高阈值，代价是更容易误拒正常问题。
@@ -67,11 +90,11 @@ uv run python scripts/calibrate_rerank_threshold.py
 
 ## 抑制幻觉：片段过滤与“先摘录再回答”
 
-**1. 只把足够相关的片段交给大模型。** 通过拒答门槛后，只保留 `rerank_score >= CONTEXT_MIN_SCORE` 的片段（最相关的 top1 总是保留），其余不进入提示词。默认值 `0.95` 定义在 [config.py](config.py)（环境变量 `RAG_CONTEXT_MIN_SCORE`），旁边的注释记录了 30 道评测题的阈值实验。目前 Reranker 得分很饱和（库内题 Top5 的得分基本都 ≥ 0.96），所以该阈值对库内题几乎不裁剪，主要是兜底；调高会开始丢掉对比 / 多方面题需要的片段。临时调整：
+**1. 只把足够相关的片段交给大模型。** 通过拒答门槛后，只保留 `rerank_score >= CONTEXT_MIN_SCORE` 的片段（最相关的 top1 总是保留），其余不进入提示词。默认值 `0.95` 定义在 [src/ragbase/config.py](src/ragbase/config.py)（环境变量 `RAG_CONTEXT_MIN_SCORE`），旁边的注释记录了 30 道评测题的阈值实验。目前 Reranker 得分很饱和（库内题 Top5 的得分基本都 ≥ 0.96），所以该阈值对库内题几乎不裁剪，主要是兜底；调高会开始丢掉对比 / 多方面题需要的片段。临时调整：
 
 ```bash
-uv run query.py --context-min-score 0.99      # 0 表示不过滤
-uv run evaluate.py --retrieval-only --context-min-score 0.99
+uv run ragbase ask --context-min-score 0.99      # 0 表示不过滤
+uv run ragbase eval --retrieval-only --context-min-score 0.99
 ```
 
 `ask()` 返回 `AskResult`（`answer / evidence / docs / reranked / candidates / refused / top_score`），其中 `docs` 就是实际交给大模型的片段，`[片段N]` 与 `docs` 的顺序一一对应。
@@ -95,9 +118,10 @@ uv run evaluate.py --retrieval-only --context-min-score 0.99
 
 ```bash
 cd /Users/zc/MyProject/ragdemo
-uv venv --python 3.12
-uv pip sync requirements.lock
+uv sync            # 按 uv.lock 创建 .venv 并以可编辑模式安装 ragbase（Linux 自动用 CPU 版 torch，macOS 用 PyPI 版以支持 MPS）
 ```
+
+之后用 `uv run ragbase ...`（或直接 `.venv/bin/ragbase ...`）运行命令；`ragbase --help` 查看全部子命令。依赖写在 `pyproject.toml`，升级后用 `uv lock` 更新 `uv.lock`（`constraint-dependencies` 钉住了传递依赖的版本，要升级某个传递依赖时先改这里）。
 
 创建 `.env`：
 
@@ -124,25 +148,25 @@ CHROMA_TELEMETRY_DISABLED=true
 首次使用或需要彻底重建时：
 
 ```bash
-uv run ingest.py
+uv run ragbase ingest --full
 ```
 
 以后文档新增、修改或删除时：
 
 ```bash
-uv run ingest_incremental.py
+uv run ragbase ingest
 ```
 
 全量入库和增量入库使用相同的稳定片段 ID，并通过 `.ingest_meta.json` 记录文件状态（每个文件成功后立即写入，中途失败不会重做已完成的文件；失败的文件下次重试）。旧版索引首次执行增量命令时会迁移重建：先按 ID 分批清空旧片段，再逐文件写入（不删除 collection）。
 
-> **服务运行期间不要运行 `ingest.py`**：它会删除整个 `chroma_db/` 目录，而服务进程还持有该索引。服务在线时请用下面的 `POST /documents` / `POST /ingest` / `DELETE /documents/{name}`（或先停服务再跑命令行）。`ingest_incremental.py` 同样不要与服务同时运行（两个进程会同时写同一个库）。
+> **服务运行期间不要运行 `ragbase ingest --full`**：它会删除整个 `chroma_db/` 目录，而服务进程还持有该索引。服务在线时请用下面的 `POST /documents` / `POST /ingest` / `DELETE /documents/{name}`（或先停服务再跑命令行）。`ragbase ingest`（增量）同样不要与服务同时运行（两个进程会同时写同一个库）。
 
 ## 问答与评测
 
 启动交互式问答：
 
 ```bash
-uv run query.py
+uv run ragbase ask
 ```
 
 输入 `exit`、`quit` 或 `q` 退出。
@@ -150,7 +174,7 @@ uv run query.py
 运行 30 道内置评测题：
 
 ```bash
-uv run evaluate.py
+uv run ragbase eval
 ```
 
 评测包含三层指标：
@@ -162,20 +186,20 @@ uv run evaluate.py
 先用一道题冒烟测试：
 
 ```bash
-uv run evaluate.py --limit 1
+uv run ragbase eval --limit 1
 ```
 
 只运行词面指标和问答生成、跳过额外的评测模型调用：
 
 ```bash
-uv run evaluate.py --skip-ragas --skip-legacy-judge
+uv run ragbase eval --skip-ragas --skip-legacy-judge
 ```
 
 对比召回方式（`--retrieval-mode {vector,bm25,hybrid}`，默认 `hybrid`），结果写入 `eval_results.<mode>.json`。加上 `--retrieval-only` 则只跑召回 + 精排和词面指标，不调用任何 LLM，没有 API 费用（结果写入 `eval_results.<mode>.retrieval.json`）：
 
 ```bash
-uv run evaluate.py --retrieval-only --retrieval-mode vector
-uv run evaluate.py --retrieval-only --retrieval-mode hybrid
+uv run ragbase eval --retrieval-only --retrieval-mode vector
+uv run ragbase eval --retrieval-only --retrieval-mode hybrid
 ```
 
 结果逐题写入对应的结果文件，Ragas 调用缓存于 `.ragas_cache/`。评测会调用回答模型，因此会产生 API 费用。当前测试集的 `answer_keyword` 会作为参考答案；后续可以为题目增加更完整的 `reference` 字段以提高评测可信度。
@@ -184,14 +208,14 @@ uv run evaluate.py --retrieval-only --retrieval-mode hybrid
 
 ## 服务化运行
 
-同一份代码也可以作为 HTTP 服务运行（FastAPI，[api.py](api.py)），`query.py` / `evaluate.py` 仍可独立使用。
+同一份代码也可以作为 HTTP 服务运行（FastAPI，[src/ragbase/api/app.py](src/ragbase/api/app.py)），`ragbase ask` / `ragbase eval` 仍可独立使用。
 
 ```bash
-uv run uvicorn api:app --host 127.0.0.1 --port 8000   # 或：uv run api.py（读取 RAG_HOST / RAG_PORT）
+uv run ragbase serve --host 127.0.0.1 --port 8000   # 不带参数时读取 RAG_HOST / RAG_PORT；也可：uv run uvicorn ragbase.api.app:app
 ```
 
 - **必须单进程，不要加 `--workers`**：embedding / reranker / BM25 索引都加载在服务进程内，多 worker 会让每个进程各占一份显存，且 MPS 模型不能并发推理。并发请求由线程池接住，召回 + 精排在一把锁内串行，大模型生成在锁外并行（慢生成不会阻塞检索）。
-- 启动约 10 秒（加载两个本地模型和 BM25 索引）。索引不存在或为空时服务仍会启动，`/health` 报告 `not_ready`，`/search`、`/ask` 以及文档管理接口返回 503（“索引不存在或为空，请先运行 uv run ingest.py”）；用命令行建好索引后需重启服务（在线入库要求服务启动时索引已存在）。
+- 启动约 10 秒（加载两个本地模型和 BM25 索引）。索引不存在或为空时服务仍会启动，`/health` 报告 `not_ready`，`/search`、`/ask` 以及文档管理接口返回 503（“索引不存在或为空，请先运行 ragbase ingest --full”）；用命令行建好索引后需重启服务（在线入库要求服务启动时索引已存在）。
 - 每个响应带 `X-Request-ID`（请求头里带了就沿用，否则生成），每个请求输出一行访问日志（方法、路径、状态码、耗时；`/search`、`/ask` 另带 `refused` 和 `top_score`）。
 - 错误统一为 `{"error": "...", "detail": "..."}`：422 参数校验、400 请求了未构建的 BM25 模式 / 未知书名 / 非法上传、404 找不到文档或任务、409 已有入库任务在运行、413 上传文件过大、502 大模型调用失败（鉴权、限流、5xx 等，已按 `RAG_LLM_MAX_RETRIES` 重试过）、504 大模型响应超时（`error` 为 `llm_timeout`，单次请求超过 `RAG_LLM_TIMEOUT` 且重试用完）、503 索引 / 大模型未就绪、500 未处理异常（详情只写日志）。
 - 交互式文档：<http://127.0.0.1:8000/docs>。
@@ -253,7 +277,7 @@ curl -s -X POST http://127.0.0.1:8000/ask -H 'Content-Type: application/json' \
 
 `citations[n-1]` 对应回答中的 `[片段n]`（含 `heading_path`）；拒答时 `citations` 为空。
 
-**按书过滤**：`/search` 与 `/ask` 的 `sources` 是书名（文件名，取自 `GET /documents` 的 `name`）列表，只在这些书里检索；缺省或空列表表示全部；有未知书名返回 400 并列出可选项。服务端用检索器内存里的语料把书名解析成库里存的 `source` 原始值（旧索引存的是绝对路径，不会自己拼路径）；向量路用 Chroma 的 `where={"source": {"$in": [...]}}`，BM25 路用 bm25s 的 `weight_mask`，过滤后没有命中则判定拒答。命令行：`uv run query.py --source 书名.pdf`（可重复）。
+**按书过滤**：`/search` 与 `/ask` 的 `sources` 是书名（文件名，取自 `GET /documents` 的 `name`）列表，只在这些书里检索；缺省或空列表表示全部；有未知书名返回 400 并列出可选项。服务端用检索器内存里的语料把书名解析成库里存的 `source` 原始值（旧索引存的是绝对路径，不会自己拼路径）；向量路用 Chroma 的 `where={"source": {"$in": [...]}}`，BM25 路用 bm25s 的 `weight_mask`，过滤后没有命中则判定拒答。命令行：`uv run ragbase ask --source 书名.pdf`（可重复）。
 
 ```bash
 curl -s -X POST http://127.0.0.1:8000/search -H 'Content-Type: application/json' \
@@ -274,7 +298,7 @@ curl -s -X DELETE 'http://127.0.0.1:8000/documents/新教材.pdf'
 - **并发**：入库每 64 个片段为一批（向量化 + 写入）单独持有 `pipeline.lock`，批间释放，所以入库期间 `/search` 可以插进来（会比平时慢一点，本地模型同一时刻只服务一个调用）。同名修改的文件先 upsert 新片段、再删不再存在的旧片段，重建期间该文件仍可检索。任务结束后重建 BM25 快照并原子替换。删除文档期间也算“忙”，此时新任务 / 其他删除返回 409。
 - 旧版索引（片段无 `fid`、ID 是 UUID）第一次 `POST /ingest` 或上传时会迁移：按 ID 分批清空旧片段（不删除 collection）再逐文件重建，耗时与全量入库相当。`DELETE` 对旧片段按 `source` 的文件名匹配。
 
-**配置**（环境变量或 `.env`，环境变量优先；[config.py](config.py) 是唯一来源，`query.py` / `evaluate.py` 的默认值也取自这里，命令行参数仍可覆盖）：
+**配置**（环境变量或 `.env`，环境变量优先；[src/ragbase/config.py](src/ragbase/config.py) 是唯一来源，`ragbase ask` / `ragbase eval` 的默认值也取自这里，命令行参数仍可覆盖）：
 
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
@@ -285,8 +309,9 @@ curl -s -X DELETE 'http://127.0.0.1:8000/documents/新教材.pdf'
 | `RAG_RERANK_K` | `5` | 精排后保留的片段数 |
 | `RAG_MIN_SCORE` | `0.7` | 拒答阈值，0 表示不拒答 |
 | `RAG_CONTEXT_MIN_SCORE` | `0.95` | 交给大模型的片段最低精排得分，0 表示不过滤 |
-| `RAG_DATA_DIR` / `RAG_DB_DIR` | 仓库内 `data/` / `chroma_db/` | 文档目录 / Chroma 持久化目录（命令行脚本和服务共用） |
-| `RAG_META_FILE` / `RAG_CACHE_DIR` | 仓库内 `.ingest_meta.json` / `.bm25_cache/` | 入库元数据文件 / BM25 分词缓存目录 |
+| `RAG_HOME`（须为真正的环境变量） | 当前工作目录 | 项目主目录：下面各路径的默认位置、`.env`、`bm25_userdict.txt`、`eval_questions.json` 都在它下面 |
+| `RAG_DATA_DIR` / `RAG_DB_DIR` | 主目录下 `data/` / `chroma_db/` | 文档目录 / Chroma 持久化目录（命令行脚本和服务共用） |
+| `RAG_META_FILE` / `RAG_CACHE_DIR` | 主目录下 `.ingest_meta.json` / `.bm25_cache/` | 入库元数据文件 / BM25 分词缓存目录 |
 | `RAG_MAX_UPLOAD_MB` | `300` | `POST /documents` 单文件大小上限 |
 | `RAG_AGENT_MAX_TOOL_CALLS` | `4` | 对话 Agent 每轮用户消息最多调用几次工具 |
 | `RAG_AGENT_MAX_MODEL_CALLS` | `6` | 对话 Agent 每轮用户消息最多调用几次大模型（至少 2） |
@@ -294,9 +319,9 @@ curl -s -X DELETE 'http://127.0.0.1:8000/documents/新教材.pdf'
 | `RAG_CHAT_MAX_SESSIONS` | `200` | 内存中最多保留的会话数 |
 | `RAG_CHAT_SESSION_TTL` | `3600` | 会话空闲多少秒后过期 |
 | `RAG_LOG_LEVEL` | `INFO` | 日志级别 |
-| `RAG_HOST` / `RAG_PORT` | `127.0.0.1` / `8000` | `uv run api.py` 的监听地址 |
+| `RAG_HOST` / `RAG_PORT` | `127.0.0.1` / `8000` | `ragbase serve` 的监听地址 |
 
-**大模型配置**（`llm_protocol` 目前只实现 `openai`，即 OpenAI 兼容的 `/chat/completions`；新增协议只需在 [llm_factory.py](llm_factory.py) 里加一个分支）：
+**大模型配置**（`llm_protocol` 目前只实现 `openai`，即 OpenAI 兼容的 `/chat/completions`；新增协议只需在 [src/ragbase/llm/factory.py](src/ragbase/llm/factory.py) 里加一个分支）：
 
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
@@ -308,7 +333,7 @@ curl -s -X DELETE 'http://127.0.0.1:8000/documents/新教材.pdf'
 | `RAG_LLM_MAX_TOKENS` | 不限 | 单次回答的最大输出 token 数 |
 | `RAG_LLM_TIMEOUT` | `60` | 单次请求超时（秒） |
 | `RAG_LLM_MAX_RETRIES` | `2` | 超时 / 连接错误 / 429 / 5xx 的自动重试次数（指数退避），所以最坏等待约 `TIMEOUT × (RETRIES + 1)` 加退避间隔 |
-| `RAG_EVAL_LLM_MODEL` / `RAG_EVAL_LLM_BASE_URL` / `RAG_EVAL_LLM_API_KEY` | 沿用上面的回答模型 | 评测裁判（`evaluate.py` 的 Ragas 与中文裁判）单独用另一个模型 / 服务；设置了哪项就覆盖哪项，其余沿用 |
+| `RAG_EVAL_LLM_MODEL` / `RAG_EVAL_LLM_BASE_URL` / `RAG_EVAL_LLM_API_KEY` | 沿用上面的回答模型 | 评测裁判（`ragbase eval` 的 Ragas 与中文裁判）单独用另一个模型 / 服务；设置了哪项就覆盖哪项，其余沿用 |
 
 示例（任意 OpenAI 兼容服务商）：
 
@@ -326,9 +351,9 @@ RAG_EVAL_LLM_MODEL=gpt-4o
 - 三项（地址、密钥、模型）缺任何一项都算未配置：服务仍可启动，`/search` 可用，`/ask` 返回 503。
 - 模型回答超时：底层客户端先按 `RAG_LLM_MAX_RETRIES` 重试，仍超时则 `/ask` 返回 **504**（`llm_timeout`）；其他失败返回 502。完整异常只写日志，响应里不含密钥或上游地址。
 
-- 运行全部单元测试：`uv run python tests/run_all.py`（每个 `tests/test_*.py` 一个子进程，打印各自汇总行，任一失败则非零退出；可带文件名片段只跑部分，如 `run_all.py llm api`）。CI：`.github/workflows/tests.yml`（push / PR 到 main 时在 ubuntu 上用 CPU 版 torch 跑同一个脚本）。
+- 运行全部单元测试：`uv run python tests/run_all.py`（每个 `tests/test_*.py` 一个子进程，打印各自汇总行，任一失败则非零退出；可带文件名片段只跑部分，如 `run_all.py llm api`）。CI：`.github/workflows/tests.yml`（push / PR 到 main 时在 ubuntu 上 `uv sync --locked`，用 CPU 版 torch 跑同一个脚本）。
 - 单元测试（均不加载模型、不碰真实数据，网络只访问本机 127.0.0.1 的桩服务）：`uv run python tests/test_api.py`（假流水线 / 假入库，另有用临时 Chroma 的端到端用例）、`tests/test_ingest_service.py`（临时目录 + 假 embedding）、`tests/test_sources.py`（按书过滤、快照刷新、分词缓存）、`tests/test_toc.py`（用 fitz 生成带书签的 PDF）、`tests/test_config.py`、`tests/test_llm.py`（本机 OpenAI 兼容桩服务：参数透传、5xx 重试、超时 -> 504、`/ask` 端到端）、`tests/test_parser.py`（临时生成的 PDF / DOCX / GB18030 文本）。
-- 依赖：文件上传需要 `python-multipart`（已加入 `requirements.txt` / `requirements.lock`，旧环境请重新执行 `uv pip sync requirements.lock`）。
+- 依赖：文件上传需要 `python-multipart`（已列入 `pyproject.toml` 的依赖，旧环境请重新执行 `uv sync`）。
 
 ## 对话 Agent
 
@@ -341,7 +366,7 @@ RAG_EVAL_LLM_MODEL=gpt-4o
 会话历史：InMemorySaver，thread_id = session_id
 ```
 
-- 代码：[agent_tools.py](agent_tools.py)（工具与引用登记表）、[chat_agent.py](chat_agent.py)（Agent、会话、限制）、[chat.py](chat.py)（命令行）。
+- 代码：[src/ragbase/agent/tools.py](src/ragbase/agent/tools.py)（工具与引用登记表）、[src/ragbase/agent/service.py](src/ragbase/agent/service.py)（Agent、会话、限制）、[src/ragbase/cli.py](src/ragbase/cli.py)（命令行 `ragbase chat`）。
 - **多轮改写**不单独做一步：工具描述要求模型把 `query` 写成自包含的完整问题（补全代词 / 省略）；检索直接用它。
 - **引用**：一轮用户消息内模型可能多次检索，片段编号全轮唯一、同一 `chunk_id` 编号不变（登记表走 LangGraph 运行时上下文）；响应的 `citations` 只含回答里实际标注了 `[n]` 的片段（`n` 可能不连续，只对本轮有效，下一轮重新编号）。
 - **限制**：每轮工具调用上限（超出后工具被拒绝，模型据已有结果作答）、每轮模型调用上限（超出后直接结束并提示）；历史只保留最近 `RAG_CHAT_HISTORY_TURNS` 轮（整轮裁剪，不额外调用大模型做摘要）；同一会话的请求串行；失败 / 断开的那一轮会回滚。
@@ -366,7 +391,7 @@ curl -s http://127.0.0.1:8000/chat/sessions/demo
 curl -s -X DELETE http://127.0.0.1:8000/chat/sessions/demo
 ```
 
-命令行：`uv run chat.py [--source 书名.pdf]`（`/new` 新会话，`exit` 退出）。
+命令行：`uv run ragbase chat [--source 书名.pdf]`（`/new` 新会话，`exit` 退出）。
 
 局限：
 - 会话只存在服务进程内存里，重启即丢；超过 `RAG_CHAT_MAX_SESSIONS` 或空闲超过 `RAG_CHAT_SESSION_TTL` 的会话被淘汰（不持久化、不跨进程）。
@@ -379,15 +404,15 @@ curl -s -X DELETE http://127.0.0.1:8000/chat/sessions/demo
 `web/` 是前端工程（React + Vite + TypeScript + Tailwind CSS + shadcn/ui；路由 react-router，数据请求 TanStack Query，回答用 react-markdown 渲染），Stage 5 新增。需要 Node 22 与 pnpm。
 
 ```bash
-# 开发：后端在 8000 端口运行（uv run api.py），前端 dev server 把 API 请求代理过去
+# 开发：后端在 8000 端口运行（uv run ragbase serve），前端 dev server 把 API 请求代理过去
 cd web && pnpm install && pnpm dev          # http://localhost:5173，热更新
 
 # 生产：构建后由 FastAPI 在同一端口托管，不需要另起前端服务
 cd web && pnpm install && pnpm build        # 产物在 web/dist
-uv run api.py                               # 浏览器打开 http://127.0.0.1:8000/
+uv run ragbase serve                        # 浏览器打开 http://127.0.0.1:8000/
 ```
 
-- **托管方式**：`web/dist` 存在时，API 服务提供 `/assets/*`（带内容哈希，长缓存）和前端路由 `/`、`/library`、`/c/{session_id}`（返回 `index.html`）；这些路径不会遮住 `GET /documents`、`/chat/sessions`、`/health` 等 JSON 接口。目录是否存在在请求时检查，服务运行中重新 `pnpm build` 立即生效；未构建时 `GET /` 返回提示“前端未构建：cd web && pnpm install && pnpm build”。构建目录可用 `RAG_WEB_DIST` 改（相对路径按仓库根目录解析）。
+- **托管方式**：`web/dist` 存在时，API 服务提供 `/assets/*`（带内容哈希，长缓存）和前端路由 `/`、`/library`、`/c/{session_id}`（返回 `index.html`）；这些路径不会遮住 `GET /documents`、`/chat/sessions`、`/health` 等 JSON 接口。目录是否存在在请求时检查，服务运行中重新 `pnpm build` 立即生效；未构建时 `GET /` 返回提示“前端未构建：cd web && pnpm install && pnpm build”。构建目录可用 `RAG_WEB_DIST` 改（相对路径按项目主目录解析）。
 - **对话页**（`/`、`/c/:id`）：左侧会话列表（`GET /chat/sessions`，可删除）；中间流式回答（`POST /chat/stream`，可随时“停止”）；回答里的 `[n]` 变成可悬停预览的引用小标，点击在右侧“依据”面板定位原文（书名、章节、页码、片段、精排得分）；检索步骤显示为回答上方的淡色折叠行；输入框旁的“范围”可限定只在某几本书里检索。窄屏（<1024px）侧栏、（<1280px）依据面板改为抽屉。
 - **知识库页**（`/library`）：书目卡片（片段数、章节覆盖率、删除）、拖拽或点击上传（`.pdf` `.docx` `.md` `.markdown` `.txt`）、“重新扫描”，以及入库任务的实时进度（轮询 `GET /ingest/jobs/{id}`，刷新页面后仍会继续显示）。
 - **状态指示**（右上角）：绿色“就绪”（索引与 Agent 都可用）、琥珀色“仅检索”（大模型未配置）、红色“未就绪 / 离线”；点开看片段数、BM25 构建时间、设备、召回模式、大模型和 Agent 状态。每 15 秒轮询 `/health`。
@@ -413,15 +438,15 @@ uv run api.py                               # 浏览器打开 http://127.0.0.1:8
 
 切分参数直接定义在代码中，其余集中在配置里：
 
-- 切分大小与重叠：[rag_common.py](rag_common.py)
-- 召回数、精排数、阈值、设备、服务地址、前端构建目录：[config.py](config.py)（均可用 `RAG_*` 环境变量覆盖，见“服务化运行”）；`query.py` / `evaluate.py` 的命令行参数优先级更高
-- 本地模型与设备：[embed.py](embed.py)、[reranker.py](reranker.py)
+- 切分大小与重叠：[src/ragbase/ingest/splitter.py](src/ragbase/ingest/splitter.py)
+- 召回数、精排数、阈值、设备、服务地址、前端构建目录：[src/ragbase/config.py](src/ragbase/config.py)（均可用 `RAG_*` 环境变量覆盖，见“服务化运行”）；`ragbase ask` / `ragbase eval` 的命令行参数优先级更高
+- 本地模型与设备：[src/ragbase/models/embeddings.py](src/ragbase/models/embeddings.py)、[src/ragbase/models/reranker.py](src/ragbase/models/reranker.py)
 
 扫描版 PDF 或文本层质量较差的 PDF 需要另行增加 OCR；当前项目不会自动 OCR。
 
 ## 常见问题
 
 - `AuthenticationError`：检查 `.env` 中的 `RAG_LLM_API_KEY`、`RAG_LLM_MODEL` 和 `RAG_LLM_BASE_URL`（旧的 `ARK_*` 同样有效）。
-- 找不到向量库：先运行 `uv run ingest.py`。
+- 找不到向量库：先运行 `uv run ragbase ingest`（或 `--full` 全量重建）；也请确认当前目录（或 `RAG_HOME`）是项目主目录。
 - MPS 不可用：设置环境变量 `RAG_DEVICE=cpu`（默认 `auto` 会自动回落到 CUDA / CPU）。
-- 依赖环境异常：重新执行 `uv pip sync requirements.lock`。
+- 依赖环境异常：重新执行 `uv sync`。

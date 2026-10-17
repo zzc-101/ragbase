@@ -14,13 +14,11 @@ from ragas.metrics.collections import (
     Faithfulness,
 )
 
-from config import Settings
-from embed import Qwen3Embeddings
-from llm_factory import create_ragas_llm
+from ragbase.config import Settings, ragas_cache_dir
+from ragbase.models.embeddings import Qwen3Embeddings
+from ragbase.llm.factory import create_ragas_llm
 
 
-BASE_DIR = Path(__file__).parent
-RAGAS_CACHE_DIR = BASE_DIR / ".ragas_cache"
 POINT_SPLITTER = re.compile(r"[，,；;。！？!?、：:]")
 NORMALIZE_PATTERN = re.compile(r"[^0-9a-z\u4e00-\u9fff]+")
 LEXICAL_HIT_THRESHOLD = 0.35
@@ -131,7 +129,7 @@ class RagasEvaluator:
     """用配置的评测模型（eval_llm_*，缺省沿用回答模型；OpenAI 兼容协议）运行 Ragas 0.4 指标。"""
 
     def __init__(self, settings: Settings, embeddings: Qwen3Embeddings):
-        cache = DiskCacheBackend(cache_dir=str(RAGAS_CACHE_DIR))
+        cache = DiskCacheBackend(cache_dir=str(ragas_cache_dir()))
         llm = create_ragas_llm(settings, cache=cache)
         if llm is None:
             raise ValueError("评测大模型未配置：请设置 RAG_LLM_API_KEY / RAG_LLM_MODEL / RAG_LLM_BASE_URL")

@@ -1,22 +1,19 @@
-"""ingest_service 的单元测试：临时数据目录 + 临时 Chroma + 确定性假 embedding（不加载模型、不访问网络、不碰真实数据）。
+"""ragbase.ingest.service 的单元测试：临时数据目录 + 临时 Chroma + 确定性假 embedding（不加载模型、不访问网络、不碰真实数据）。
 
 运行：uv run python tests/test_ingest_service.py
 """
 import hashlib
 import logging
-import sys
 import tempfile
 import threading
 from contextlib import contextmanager
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
 import chromadb
 import pymupdf
 
-from ingest_service import delete_document, plan_changes, run_ingest
-from rag_common import COLLECTION, file_id, load_ingest_meta, save_ingest_meta
+from ragbase.ingest.service import delete_document, plan_changes, run_ingest
+from ragbase.ingest.common import COLLECTION, file_id, load_ingest_meta, save_ingest_meta
 
 
 def _vector(text: str) -> list[float]:
@@ -263,11 +260,11 @@ def test_failed_file_is_reported_and_retried_without_blocking_others():
         (data_dir / "bad.docx").write_bytes(b"this is not a docx")
         (data_dir / "old.doc").write_bytes(b"legacy")
         events = []
-        logging.getLogger("ingest_service").disabled = True  # 预期内的失败，别在测试输出里刷堆栈
+        logging.getLogger("ragbase.ingest.service").disabled = True  # 预期内的失败，别在测试输出里刷堆栈
         try:
             result = run_ingest(data_dir, collection, _Embedder(), meta_path, progress=lambda e, **i: events.append((e, i)))
         finally:
-            logging.getLogger("ingest_service").disabled = False
+            logging.getLogger("ragbase.ingest.service").disabled = False
         assert list(result.failed_files) == ["bad.docx"] and result.skipped_files == ["old.doc"]
         assert set(_by_name(collection)) == {"good.md"}
         assert [info["name"] for info in load_ingest_meta(meta_path).values()] == ["good.md"]  # 失败文件不记入元数据

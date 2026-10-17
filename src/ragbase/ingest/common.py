@@ -4,20 +4,15 @@ import json
 from dataclasses import asdict
 from pathlib import Path
 
-from dotenv import load_dotenv
+from ragbase.config import get_settings, load_env
+from ragbase.ingest.cleaner import clean_documents
+from ragbase.ingest.parser import load_document
+from ragbase.ingest.splitter import split_documents
+from ragbase.ingest.toc import pdf_page_headings
 
-from document_cleaner import clean_documents
-from document_parser import load_document
-from document_splitter import split_documents
-from document_toc import pdf_page_headings
+load_env()  # 载入项目主目录（RAG_HOME，默认当前目录）下的 .env
 
-load_dotenv()
-
-BASE_DIR = Path(__file__).parent
-DATA_DIR = BASE_DIR / "data"
-DB_DIR = str(BASE_DIR / "chroma_db")
 COLLECTION = "rag"
-META_FILE = BASE_DIR / ".ingest_meta.json"  # 记录文件指纹，用于增量更新
 INGEST_PIPELINE_VERSION = "3"  # 解析/清洗/切分/章节标题规则变化时递增（3：PDF 片段加 heading_path）
 
 
@@ -53,15 +48,17 @@ def build_ingest_meta(paths: list[Path]) -> dict:
     }
 
 
-def load_ingest_meta(meta_path: Path = META_FILE) -> dict:
-    """读取上次成功入库时保存的文件元数据。"""
+def load_ingest_meta(meta_path: Path | None = None) -> dict:
+    """读取上次成功入库时保存的文件元数据（默认路径取配置里的 meta_file，记录文件指纹，用于增量更新）。"""
+    meta_path = meta_path or get_settings().meta_file
     if not meta_path.exists():
         return {}
     return json.loads(meta_path.read_text(encoding="utf-8"))
 
 
-def save_ingest_meta(meta: dict, meta_path: Path = META_FILE) -> None:
+def save_ingest_meta(meta: dict, meta_path: Path | None = None) -> None:
     """原子写入文件元数据，避免中断时留下半截 JSON。"""
+    meta_path = meta_path or get_settings().meta_file
     temp_file = meta_path.with_suffix(".tmp")
     temp_file.write_text(
         json.dumps(meta, ensure_ascii=False, indent=2),
@@ -86,14 +83,15 @@ def bm25_input(text: str, metadata: dict) -> str:
     return with_heading(text, metadata, " ")
 
 
-def collection_count(db_dir: str | Path = DB_DIR, name: str = COLLECTION) -> int | None:
-    """返回集合片段数；索引目录或集合不存在时返回 None（不加载任何模型）。"""
+def collection_count(db_dir: str | Path | None = None, name: str = COLLECTION) -> int | None:
+    """返回集合片段数；索引目录或集合不存在时返回 None（不加载任何模型）。db_dir 缺省取配置里的 db_dir。"""
+    db_dir = db_dir or get_settings().db_dir
     if not Path(db_dir).exists():  # PersistentClient 会自动建目录，所以先判断
         return None
     import chromadb
 
     try:
-        return chromadb.PersistentClient(path=db_dir).get_collection(name).count()
+        return chromadb.PersistentClient(path=str(db_dir)).get_collection(name).count()
     except Exception:
         return None
 

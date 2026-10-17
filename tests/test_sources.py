@@ -3,16 +3,13 @@
 
 运行：uv run python tests/test_sources.py
 """
-import sys
 import tempfile
 import threading
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
 import chromadb
 
-from hybrid_retriever import HybridRetriever, UnknownSourceError
+from ragbase.retrieval.hybrid import HybridRetriever, UnknownSourceError
 
 # 旧版索引风格：source 是绝对路径，没有 heading_path / fid
 LEGACY = [

@@ -24,13 +24,12 @@ import jieba
 import numpy as np
 from langchain_core.documents import Document
 
-from rag_common import BASE_DIR, bm25_input
+from ragbase.config import get_settings, userdict_file
+from ragbase.ingest.common import bm25_input
 
 logger = logging.getLogger(__name__)
 
 TOKENIZER_VERSION = "3"  # 分词规则（停用词、过滤逻辑、分词输入含章节路径等）变化时递增，使缓存失效
-USERDICT_FILE = BASE_DIR / "bm25_userdict.txt"  # 放仓库根目录：data/*.txt 会被当文档入库
-CACHE_DIR = BASE_DIR / ".bm25_cache"
 RRF_K = 60
 
 MODES = ("vector", "bm25", "hybrid")
@@ -52,8 +51,9 @@ def _get_tokenizer() -> jieba.Tokenizer:
     global _tokenizer
     if _tokenizer is None:
         _tokenizer = jieba.Tokenizer()
-        if USERDICT_FILE.exists():
-            _tokenizer.load_userdict(str(USERDICT_FILE))
+        userdict = userdict_file()  # 项目主目录（RAG_HOME）下的 bm25_userdict.txt；放在 data/ 下会被当文档入库
+        if userdict.exists():
+            _tokenizer.load_userdict(str(userdict))
     return _tokenizer
 
 
@@ -109,7 +109,7 @@ def _cache_key(ids: list[str], texts: list[str]) -> str:
         digest.update(b"\0")
         digest.update(text.encode("utf-8"))
         digest.update(b"\1")
-    raw = f"{TOKENIZER_VERSION}|{len(ids)}|{digest.hexdigest()}|{_file_digest(USERDICT_FILE)}"
+    raw = f"{TOKENIZER_VERSION}|{len(ids)}|{digest.hexdigest()}|{_file_digest(userdict_file())}"
     return hashlib.md5(raw.encode()).hexdigest()[:16]
 
 
@@ -120,7 +120,7 @@ def tokenize_corpus(
 
     写入新缓存时清掉目录里所有旧的 tokens-*.json 和残留的 .tmp，所以缓存目录里始终最多一份有效缓存。
     """
-    cache_dir = Path(cache_dir or CACHE_DIR)
+    cache_dir = Path(cache_dir or get_settings().cache_dir)  # 缺省为配置里的 cache_dir（.bm25_cache/）
     cache_file = cache_dir / f"tokens-{_cache_key(ids, texts)}.json"
     if cache_file.exists():
         try:

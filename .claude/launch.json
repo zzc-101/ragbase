@@ -3,8 +3,8 @@
   "configurations": [
     {
       "name": "rag-service",
-      "runtimeExecutable": ".venv/bin/python",
-      "runtimeArgs": ["api.py"],
+      "runtimeExecutable": ".venv/bin/ragbase",
+      "runtimeArgs": ["serve"],
       "port": 8000
     }
   ]

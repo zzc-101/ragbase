@@ -7,15 +7,12 @@
 """
 import json
 import logging
-import sys
 import tempfile
 import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import httpx
 from fastapi.testclient import TestClient
@@ -25,11 +22,11 @@ from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, Too
 from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
 from pydantic import PrivateAttr
 
-import api
-from agent_tools import NOT_FOUND_MESSAGE, format_fragment
-from chat_agent import MODEL_LIMIT_MESSAGE, SessionRegistry, build_chat_service
-from config import Settings
-from rag_pipeline import GenerationError, RAGPipeline
+from ragbase.api import app as api
+from ragbase.agent.tools import NOT_FOUND_MESSAGE, format_fragment
+from ragbase.agent.service import MODEL_LIMIT_MESSAGE, SessionRegistry, build_chat_service
+from ragbase.config import Settings
+from ragbase.retrieval.pipeline import GenerationError, RAGPipeline
 
 logging.disable(logging.CRITICAL)  # 失败路径会 logger.exception，测试输出里不需要这些堆栈
 

@@ -2,16 +2,11 @@
 
 运行：uv run python tests/test_refusal.py
 """
-import sys
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
 from langchain_core.documents import Document
 
-from query import source_label
-from reranker import _sigmoid
-from rag_pipeline import (
+from ragbase.retrieval.labels import source_label
+from ragbase.models.reranker import _sigmoid
+from ragbase.retrieval.pipeline import (
     ANSWER_SYSTEM_PROMPT,
     NO_ANSWER,
     RERANK_MIN_SCORE,

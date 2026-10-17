@@ -62,7 +62,7 @@ class IngestJob:
 
 
 def progress_handler(job: IngestJob):
-    """把 ingest_service 的进度事件映射到任务状态字段。"""
+    """把 ingest.service 的进度事件映射到任务状态字段。"""
 
     def on_progress(event: str, **info) -> None:
         if event == "plan":

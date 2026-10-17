@@ -19,9 +19,9 @@ from dataclasses import dataclass, field
 from langchain.tools import ToolRuntime, tool
 from langchain_core.documents import Document
 
-from config import Settings
-from hybrid_retriever import UnknownSourceError
-from rag_pipeline import RAGPipeline, retrieve_and_rerank, select_context_docs, should_refuse
+from ragbase.config import Settings
+from ragbase.retrieval.hybrid import UnknownSourceError
+from ragbase.retrieval.pipeline import RAGPipeline, retrieve_and_rerank, select_context_docs, should_refuse
 
 logger = logging.getLogger(__name__)
 

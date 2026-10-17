@@ -7,7 +7,7 @@ import math
 
 from sentence_transformers import CrossEncoder
 
-from config import HALF_PRECISION_DEVICES, get_settings, resolve_device
+from ragbase.config import HALF_PRECISION_DEVICES, get_settings, resolve_device
 
 CACHE_SIZE = 128  # 进程内缓存的 (问题, 候选集) 条数上限
 

@@ -2,14 +2,9 @@
 
 运行：uv run python tests/test_context.py
 """
-import sys
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
 from langchain_core.documents import Document
 
-from rag_pipeline import (
+from ragbase.retrieval.pipeline import (
     ANSWER_SYSTEM_PROMPT,
     CONTEXT_MIN_SCORE,
     NO_ANSWER,

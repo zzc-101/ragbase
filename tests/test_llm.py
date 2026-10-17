@@ -8,21 +8,17 @@
 import json
 import logging
 import re
-import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from fastapi.testclient import TestClient
 from langchain_core.documents import Document
 
-import api
-from config import Settings
-from llm_factory import create_chat_model
-from rag_pipeline import GenerationError, RAGPipeline, ask, build_answer_chain
+from ragbase.api import app as api
+from ragbase.config import Settings
+from ragbase.llm.factory import create_chat_model
+from ragbase.retrieval.pipeline import GenerationError, RAGPipeline, ask, build_answer_chain
 
 REPLY = "【依据】\n- [片段1] “挣值分析用于衡量项目绩效”\n【回答】\n挣值分析可以衡量项目的进度与成本绩效 [片段1]"
 SECRET = "sk-stub-SECRET-123"
@@ -122,7 +118,7 @@ class _Reranker:
 
 
 def _pipeline(settings: Settings) -> RAGPipeline:
-    """假检索 + 假精排 + 真实的回答链（经 llm_factory 指向桩服务）。"""
+    """假检索 + 假精排 + 真实的回答链（经 llm.factory 指向桩服务）。"""
     return RAGPipeline(
         retriever=_Retriever(), reranker=_Reranker(), embeddings=None, device="cpu",
         answer_chain=build_answer_chain(create_chat_model(settings)),
@@ -177,7 +173,7 @@ def test_factory_eval_purpose_uses_override_model():
 
 
 def test_ragas_llm_uses_eval_model_and_client_limits():
-    from llm_factory import create_ragas_llm
+    from ragbase.llm.factory import create_ragas_llm
 
     settings = Settings(_env_file=None, llm_model="main", llm_api_key=SECRET, llm_base_url="http://127.0.0.1:9/v1",
                         eval_llm_model="judge", llm_timeout=7, llm_max_retries=1)

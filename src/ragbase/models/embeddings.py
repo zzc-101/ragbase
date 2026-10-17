@@ -12,7 +12,7 @@ from functools import lru_cache
 from langchain_core.embeddings import Embeddings
 from sentence_transformers import SentenceTransformer
 
-from config import HALF_PRECISION_DEVICES, get_settings, resolve_device
+from ragbase.config import HALF_PRECISION_DEVICES, get_settings, resolve_device
 
 
 class Qwen3Embeddings(Embeddings):

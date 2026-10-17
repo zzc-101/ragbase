@@ -93,7 +93,7 @@ export function LibraryPage() {
         {documents.isError && (
           <div className="rounded-xl border border-dashed px-6 py-10 text-center text-sm text-muted-foreground">
             {documents.error instanceof ApiError && documents.error.status === 503
-              ? '索引不存在或为空：请先运行 uv run ingest_incremental.py 建立索引，再重启服务。'
+              ? '索引不存在或为空：请先运行 ragbase ingest 建立索引，再重启服务。'
               : documents.error instanceof Error
                 ? documents.error.message
                 : '加载失败'}

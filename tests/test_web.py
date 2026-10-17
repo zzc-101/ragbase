@@ -11,13 +11,12 @@ import tempfile
 from contextlib import contextmanager
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from fastapi.testclient import TestClient
 
-import api
-from chat_agent import TITLE_MAX_CHARS
+from ragbase.api import app as api
+from ragbase.agent.service import TITLE_MAX_CHARS
 from test_agent import ScriptedModel, _pipeline, _settings, build_chat_service, say
 
 logging.disable(logging.CRITICAL)
