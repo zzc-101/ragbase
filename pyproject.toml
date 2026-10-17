@@ -35,6 +35,9 @@ ragbase = "ragbase.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/ragbase"]
+# 前端构建产物由 scripts/build_web.sh 复制到 src/ragbase/web/dist（已在 .gitignore 里，所以要用 artifacts 显式带上）；
+# 目录不存在（没构建过前端）时这条规则什么也不匹配，wheel 照常构建、只是不含界面。
+artifacts = ["src/ragbase/web/dist/**"]
 
 # ---- uv ----------------------------------------------------------------------------------------
 [tool.uv]

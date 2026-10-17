@@ -1,4 +1,4 @@
-"""Reranker：封装 Qwen3-Reranker-0.6B（Cross-Encoder）。
+"""Reranker：封装 Qwen3-Reranker（默认 0.6B，可用 RAG_RERANKER_MODEL 更换；Cross-Encoder）。
 
 用法：对初步召回的候选片段做精排，把最相关的排前面。
 Cross-Encoder 把 query 和每个 document 拼一起送进模型，输出相关性分数。
@@ -15,12 +15,14 @@ CACHE_SIZE = 128  # 进程内缓存的 (问题, 候选集) 条数上限
 class Qwen3Reranker:
     def __init__(
         self,
-        model_name: str = "Qwen/Qwen3-Reranker-0.6B",
+        model_name: str | None = None,
         device: str | None = None,
         batch_size: int = 8,
     ):
-        # device 为空时按配置（RAG_DEVICE，默认 auto：mps > cuda > cpu）解析
-        device = resolve_device(device or get_settings().device)
+        # model_name / device 为空时按配置解析（RAG_RERANKER_MODEL，默认 Qwen/Qwen3-Reranker-0.6B；RAG_DEVICE，默认 auto：mps > cuda > cpu）
+        settings = get_settings()
+        model_name = model_name or settings.reranker_model
+        device = resolve_device(device or settings.device)
         self.device = device
         model_kwargs = {"torch_dtype": "float16"} if device in HALF_PRECISION_DEVICES else None
         load_kwargs = {

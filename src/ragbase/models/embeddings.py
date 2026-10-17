@@ -1,4 +1,4 @@
-"""自定义 embedding：封装 Qwen3-Embedding-0.6B。
+"""自定义 embedding：封装 Qwen3-Embedding（默认 Qwen3-Embedding-0.6B，可用 RAG_EMBEDDING_MODEL 换成别的 Qwen3 系列仓库）。
 
 Qwen3 是 instruction-aware 模型，查询和文档需要不同的编码方式：
 - 查询（query）：加 query prompt（prompt_name="query"）
@@ -16,9 +16,11 @@ from ragbase.config import HALF_PRECISION_DEVICES, get_settings, resolve_device
 
 
 class Qwen3Embeddings(Embeddings):
-    def __init__(self, model_name: str = "Qwen/Qwen3-Embedding-0.6B", device: str | None = None):
-        # device 为空时按配置（RAG_DEVICE，默认 auto：mps > cuda > cpu）解析
-        device = resolve_device(device or get_settings().device)
+    def __init__(self, model_name: str | None = None, device: str | None = None):
+        # model_name / device 为空时按配置解析（RAG_EMBEDDING_MODEL，默认 Qwen/Qwen3-Embedding-0.6B；RAG_DEVICE，默认 auto：mps > cuda > cpu）
+        settings = get_settings()
+        model_name = model_name or settings.embedding_model
+        device = resolve_device(device or settings.device)
         self.device = device
         # mps / cuda 上用 fp16 半精度，省显存、加速；CPU 保持默认精度
         model_kwargs = {

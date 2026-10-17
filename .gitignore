@@ -1,6 +1,9 @@
 .env
+.env.*
+!.env.example
 chroma_db/
 qdrant_db/
+ragbase-home/
 __pycache__/
 *.pyc
 .venv/
@@ -20,3 +23,9 @@ eval_results.*.json
 # Web 前端
 web/node_modules/
 web/dist/
+
+# 随包分发的前端副本（scripts/build_web.sh 生成）
+src/ragbase/web/
+
+# ragbase init --force 的备份（.env.bak 已被上面的 .env.* 覆盖）
+bm25_userdict.txt.bak

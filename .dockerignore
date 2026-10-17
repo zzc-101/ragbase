@@ -1,0 +1,29 @@
+# 运行时数据、密钥与本地环境不进构建上下文
+.git
+.github
+.claude
+.venv
+.env
+.env.*
+!.env.example
+.DS_Store
+data
+chroma_db
+qdrant_db
+ragbase-home
+.ingest_meta.json
+.bm25_cache
+.ragas_cache
+eval_results*.json
+*.bak
+**/__pycache__
+**/*.pyc
+
+# 前端：镜像里由 node 阶段重新构建
+web/node_modules
+web/dist
+src/ragbase/web
+
+# 测试 / 文档类大文件
+tests
+RAG知识库-设计方案.md

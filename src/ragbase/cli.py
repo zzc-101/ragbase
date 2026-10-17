@@ -1,4 +1,4 @@
-"""ragbase 命令行入口：serve / ingest / ask / chat / eval / migrate-store 六个子命令。
+"""ragbase 命令行入口：init / models / doctor / serve / ingest / ask / chat / eval / migrate-store 子命令。
 
 - 子命令的重型依赖（torch、chromadb、qdrant-client、ragas 等）都在各自的处理函数里才导入，所以 `ragbase --help` 很快。
 - 数据、索引、.env 等默认位置都在项目主目录下：环境变量 RAG_HOME，未设置则为当前工作目录（见 ragbase.config）。
@@ -16,9 +16,103 @@ INDEX_MISSING_HINT = "错误：索引不存在或为空，请先运行：ragbase
 MODEL_LOADING_HINT = "加载本地 embedding 与 reranker 模型..."
 
 
+# ---------------------------------------------------------------- init / models / doctor（开箱即用）
+
+def _cmd_init(args) -> None:
+    from pathlib import Path
+
+    from ragbase.config import project_home
+    from ragbase.scaffold import generate_api_key, init_home
+
+    home = Path(args.dir).expanduser().resolve() if args.dir else project_home()
+    api_key = generate_api_key() if args.api_key else None
+    actions = init_home(home, force=args.force, api_key=api_key)
+
+    labels = {"created": "创建", "skipped": "跳过", "overwritten": "覆盖"}
+    print(f"项目主目录：{home}")
+    for action in actions:
+        note = f"（{action.note}）" if action.note else ""
+        print(f"  [{labels[action.status]}] {action.path.relative_to(home)}{note}")
+    env_status = next(a.status for a in actions if a.path.name == ".env")
+    if api_key:
+        if env_status == "skipped":
+            print("提示：.env 已存在，没有写入新密钥；要重新生成请加 --force（旧 .env 会备份为 .env.bak），或自己在 .env 里设置 RAG_API_KEY。")
+        else:
+            print("已生成随机接口密钥并写入 .env 的 RAG_API_KEY；Web 界面弹窗里输入它（grep RAG_API_KEY .env 可查看）。")
+
+    in_home = home == Path.cwd().resolve()
+    print("\n下一步：")
+    step = 1
+    if not in_home:
+        print(f"  {step}. 进入该目录（或设置环境变量 RAG_HOME）：cd {home}   # 或 export RAG_HOME={home}")
+        step += 1
+    print(f"  {step}. 编辑 .env，填入大模型配置 RAG_LLM_BASE_URL / RAG_LLM_API_KEY / RAG_LLM_MODEL（任意 OpenAI 兼容服务）")
+    if not api_key:
+        print("     对外开放服务（RAG_HOST=0.0.0.0 / Docker）前，务必同时设置 RAG_API_KEY（可用 ragbase init --api-key --force 生成）")
+    print(f"  {step + 1}. 下载本地模型：ragbase models download   （国内网络：HF_ENDPOINT=https://hf-mirror.com ragbase models download）")
+    print(f"  {step + 2}. 把文档放进 data/，然后建立索引：ragbase ingest")
+    print(f"  {step + 3}. 体检：ragbase doctor；启动：ragbase serve   （浏览器打开 http://127.0.0.1:8000/）")
+
+
+def _cmd_models_download(args) -> None:
+    from ragbase.models.download import ensure_models
+
+    settings = get_settings()
+    print("检查本地模型缓存（已缓存的会跳过，不联网）...")
+    results = ensure_models(settings)
+    failed = [spec for spec, status in results if status.startswith("failed")]
+    downloaded = sum(status == "downloaded" for _, status in results)
+    cached = sum(status == "cached" for _, status in results)
+    print(f"\n汇总：{cached} 个已缓存，{downloaded} 个新下载，{len(failed)} 个失败")
+    if failed:
+        print("下载失败：" + "、".join(spec.repo_id for spec in failed))
+        print("排查：1) 检查网络；2) 国内网络设置镜像后重试：HF_ENDPOINT=https://hf-mirror.com ragbase models download；"
+              "3) 可重复运行，已下好的文件不会重下（断点续传）")
+        raise SystemExit(1)
+    print("模型就绪。")
+
+
+def _cmd_doctor(args) -> None:
+    from ragbase.doctor import run_doctor
+
+    code = run_doctor(get_settings(), check_llm_call=args.check_llm)
+    if code:
+        raise SystemExit(code)
+
+
 # ---------------------------------------------------------------- serve（原 python api.py）
 
+def _ensure_models_for_serve(settings, download: bool) -> None:
+    """启动服务前确认本地模型已缓存：缺失时给出明确提示后退出，而不是在加载模型时抛出一长串 traceback。
+
+    --download-models：缺什么就先下载什么（Docker 首次启动用）。没有该参数时：索引为空的服务本来就不加载模型，直接放行；
+    索引非空而模型缺失才拦下。
+    """
+    from ragbase.models.download import ensure_models, missing_models
+
+    if download:
+        results = ensure_models(settings)
+        if any(status.startswith("failed") for _, status in results):
+            print("错误：模型下载失败，无法启动。国内网络可设置 HF_ENDPOINT=https://hf-mirror.com 后重试。")
+            raise SystemExit(1)
+        return
+    missing = missing_models(settings)
+    if not missing:
+        return
+    from ragbase.ingest.common import collection_count
+
+    if not collection_count(settings):
+        return  # 索引为空：服务不加载模型也能启动（只是还不能问答），先让用户看到界面
+    print("错误：本地模型尚未下载，服务无法加载：")
+    for spec in missing:
+        print(f"  - {spec.role}：{spec.repo_id}")
+    print("请先运行：ragbase models download   （国内网络：HF_ENDPOINT=https://hf-mirror.com ragbase models download）")
+    print("或者让 serve 自动下载：ragbase serve --download-models")
+    raise SystemExit(1)
+
+
 def _cmd_serve(args) -> None:
+    _ensure_models_for_serve(get_settings(), args.download_models)
     from ragbase.api.app import serve
 
     serve(host=args.host, port=args.port)
@@ -36,7 +130,7 @@ class LazyEmbedder:
         if self._embeddings is None:
             from ragbase.models.embeddings import Qwen3Embeddings
 
-            print("加载本地 embedding 模型 Qwen3-Embedding-0.6B...")
+            print(f"加载本地 embedding 模型 {get_settings().embedding_model}...")
             self._embeddings = Qwen3Embeddings()
         return self._embeddings.embed_documents(texts)
 
@@ -99,8 +193,8 @@ def _ingest_full() -> None:
         # 避免重建中断后留下与半成品索引不匹配的旧元数据
         meta_file.unlink(missing_ok=True)
 
-        # 本地 embedding：Qwen3-Embedding-0.6B（2025年，100+语言含中文+代码）
-        print("加载本地 embedding 模型 Qwen3-Embedding-0.6B...")
+        # 本地 embedding：默认 Qwen3-Embedding-0.6B（2025年，100+语言含中文+代码），可用 RAG_EMBEDDING_MODEL 更换
+        print(f"加载本地 embedding 模型 {settings.embedding_model}...")
         from ragbase.models.embeddings import Qwen3Embeddings
 
         embeddings = Qwen3Embeddings()
@@ -315,11 +409,46 @@ def build_parser() -> argparse.ArgumentParser:
         description="ragbase：本地 RAG 知识库（项目主目录由环境变量 RAG_HOME 指定，默认当前目录）",
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
-    sub = parser.add_subparsers(dest="command", metavar="{serve,ingest,ask,chat,eval,migrate-store}", required=True)
+    sub = parser.add_subparsers(dest="command", metavar="{init,models,doctor,serve,ingest,ask,chat,eval,migrate-store}", required=True)
+
+    init = sub.add_parser(
+        "init",
+        help="初始化项目主目录（data/、.env、bm25_userdict.txt）",
+        description="在项目主目录生成 data/（含 README.txt）、.env（取自内置模板，全是注释掉的示例）和默认 bm25_userdict.txt。默认绝不覆盖已有文件。",
+    )
+    init.add_argument("dir", nargs="?", default=None, help="项目主目录（默认：环境变量 RAG_HOME，未设置则为当前目录）")
+    init.add_argument("--force", action="store_true", help="覆盖已有文件（旧文件先备份为 <名字>.bak）")
+    init.add_argument("--api-key", action="store_true", help="生成一把随机接口密钥写入新 .env 的 RAG_API_KEY（对外开放服务时用）")
+    init.set_defaults(func=_cmd_init)
+
+    models = sub.add_parser("models", help="管理本地模型（embedding + reranker）", description="管理本地模型。缓存位置跟随 HF_HOME，镜像用 HF_ENDPOINT。")
+    models_sub = models.add_subparsers(dest="models_command", metavar="{download}", required=True)
+    download = models_sub.add_parser(
+        "download",
+        help="下载 embedding 与 reranker 权重到 Hugging Face 缓存",
+        description=(
+            f"下载 {settings.embedding_model}（RAG_EMBEDDING_MODEL）与 {settings.reranker_model}（RAG_RERANKER_MODEL）到 Hugging Face 缓存"
+            "（HF_HOME，默认 ~/.cache/huggingface）；已缓存的跳过。国内网络：HF_ENDPOINT=https://hf-mirror.com ragbase models download"
+        ),
+    )
+    download.set_defaults(func=_cmd_models_download)
+
+    doctor = sub.add_parser(
+        "doctor",
+        help="环境自检（Python、路径、设备、模型、向量库、大模型配置、鉴权、Web 资源）",
+        description="一屏环境自检，给出 ✓ / ! / ✗ 和修复提示；有 ✗ 时退出码非零。默认不调用大模型、不加载模型。",
+    )
+    doctor.add_argument("--check-llm", action="store_true", help="额外发一次最小的大模型请求，验证地址 / 密钥 / 模型名（会产生极少量 API 调用）")
+    doctor.set_defaults(func=_cmd_doctor)
 
     serve = sub.add_parser("serve", help="启动 HTTP 服务（含 Web 界面）", description="启动 HTTP 服务（单进程，不要多 worker）")
     serve.add_argument("--host", default=None, help=f"监听地址（默认 {settings.host}，可由 RAG_HOST 设置）")
     serve.add_argument("--port", type=int, default=None, help=f"监听端口（默认 {settings.port}，可由 RAG_PORT 设置）")
+    serve.add_argument(
+        "--download-models",
+        action="store_true",
+        help="启动前自动下载缺失的本地模型（默认不下载：模型缺失时提示先运行 ragbase models download）",
+    )
     serve.set_defaults(func=_cmd_serve)
 
     ingest = sub.add_parser(

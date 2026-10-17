@@ -2,6 +2,112 @@
 
 面向中文 PDF、Word、Markdown 和文本资料的本地 RAG 知识库：混合检索 + 精排、命令行问答 / 对话 Agent、HTTP 服务与 Web 界面、评测。命令行入口为 `ragbase`。
 
+## 快速开始
+
+你需要准备三样东西：
+
+1. **一个 OpenAI 兼容的大模型服务**（OpenAI、DeepSeek、通义、火山方舟、本地 Ollama / vLLM 等都行）：地址 `RAG_LLM_BASE_URL`、密钥 `RAG_LLM_API_KEY`、模型名 `RAG_LLM_MODEL`。不配也能启动和检索，只是不能问答 / 对话。
+2. **约 2.2 GB 磁盘放本地模型**（Qwen3-Embedding-0.6B 与 Qwen3-Reranker-0.6B 各约 1.1 GB，首次运行下载一次），外加 Python 依赖（含 PyTorch）数 GB。
+3. **你的资料**：PDF / `.docx` / Markdown / 纯文本。
+
+三条路径任选其一，最终效果一样：浏览器打开 <http://127.0.0.1:8000/>。
+
+### 路径 A：Docker Compose（CPU 版，不用装 Python / Node）
+
+```bash
+cp .env.example .env              # 编辑 .env：填 RAG_LLM_*；对外开放服务必须设置 RAG_API_KEY（见下方“安全提示”）
+mkdir -p ragbase-home/data        # 项目主目录（挂载为容器内 /data）；把文档放进 ragbase-home/data/
+docker compose run --rm ragbase models download   # 首次：下载模型到 ragbase-models 卷（约 2.2 GB，之后复用）
+docker compose run --rm ragbase ingest            # 建立索引
+docker compose up -d --build                      # 启动，浏览器打开 http://127.0.0.1:8000/
+docker compose run --rm ragbase doctor            # 随时体检
+```
+
+- 国内网络下载模型慢或不通：`HF_ENDPOINT=https://hf-mirror.com docker compose run --rm ragbase models download`（也可以把 `HF_ENDPOINT=https://hf-mirror.com` 写进 `.env`，compose 会自动读取）。
+- 镜像是 **CPU 版**（`RAG_DEVICE=cpu`），不含模型权重；`docker compose up` 的启动命令带 `--download-models`，模型缺失时会自动下载，所以第 3 步也可以省略（但下载期间服务还没起来）。
+- 新增文档：服务在线时到 Web 界面“知识库”页上传（在线增量入库；前提是启动时索引非空）；或者 `docker compose stop ragbase` → 把文件放进 `ragbase-home/data/` → `docker compose run --rm ragbase ingest` → `docker compose up -d`（`ingest` 不要与运行中的服务同时跑）。
+- 端口 / 监听：默认只绑定 `127.0.0.1:8000`。要让局域网访问，设置 `RAGBASE_BIND=0.0.0.0`（可选 `RAGBASE_PORT`）——**务必同时设置 `RAG_API_KEY`**。
+- Linux 上 `ragbase-home` 要由你自己先 `mkdir`（容器里是 uid 1000 的非 root 用户）；不想管权限可在 `docker-compose.yml` 里改用命名卷。
+- 可选 Qdrant 服务端做向量库：在 `.env` 加 `RAG_VECTOR_STORE=qdrant` 与 `RAG_QDRANT_URL=http://qdrant:6333`，用 `docker compose --profile qdrant up -d` 启动；已有 Chroma 索引可 `docker compose run --rm ragbase migrate-store --to qdrant` 迁移。
+- 注意：Docker 相关文件在没有 Docker daemon 的环境里只做过 `docker compose config` 静态校验，镜像是否能成功构建 / 运行请以你本机为准。
+
+### 路径 B：`scripts/start.sh`（克隆仓库后一键，macOS / Linux）
+
+```bash
+git clone <本仓库地址> ragbase && cd ragbase
+scripts/start.sh                  # 国内网络：HF_ENDPOINT=https://hf-mirror.com scripts/start.sh
+```
+
+脚本依次：检查 `uv`（没有会打印安装命令）→ `uv sync --locked` → 构建 Web 界面（`web/dist` 不存在且装了 `pnpm` 时）→ 没有 `.env` 就运行 `ragbase init` → `ragbase models download` → `ragbase doctor` → `ragbase serve`。可重复运行，已完成的步骤会跳过。额外参数会传给 `ragbase serve`（如 `scripts/start.sh --host 0.0.0.0 --port 8080`）；`--no-serve` 只做准备、不启动。首次运行后请编辑 `.env` 填入大模型配置，把文档放进 `data/`，另开终端运行 `uv run ragbase ingest`。
+
+### 路径 C：手动
+
+```bash
+uv sync                           # 需要 Python >= 3.12 和 uv（https://docs.astral.sh/uv/）
+uv run ragbase init               # 生成 data/、.env、bm25_userdict.txt（不会覆盖已有文件）
+$EDITOR .env                      # 填 RAG_LLM_BASE_URL / RAG_LLM_API_KEY / RAG_LLM_MODEL
+uv run ragbase models download    # 下载 embedding + reranker（已缓存则跳过）
+cp ~/你的资料/*.pdf data/          # 放文档
+uv run ragbase ingest             # 建立索引（首次会向量化全部文档，耗时与资料量有关）
+uv run ragbase serve              # http://127.0.0.1:8000/
+```
+
+Web 界面需要前端构建产物：仓库里运行 `scripts/build_web.sh`（Node 22 + pnpm）；没有构建时 API 仍可用，页面会提示“前端未构建”。
+
+### 体检：`ragbase doctor`
+
+一屏检查 Python 版本、目录是否可写、`.env`、计算设备、模型是否已缓存、向量库是否可访问及片段数、是否需要 `ragbase ingest`、大模型是否配置（只显示协议 / 模型 / 地址，不显示密钥）、接口鉴权、Web 资源，每项给出 `✓`（正常）/ `!`（警告）/ `✗`（必须修复）和修复提示；有 `✗` 时退出码非零。默认**不调用大模型**；加 `--check-llm` 才会发一次最小请求验证地址 / 密钥 / 模型名。
+
+### 国内网络：Hugging Face 镜像
+
+模型从 Hugging Face 下载。访问慢或不通时设置镜像端点（`models download` 和 `serve --download-models` 都遵循它）：
+
+```bash
+HF_ENDPOINT=https://hf-mirror.com uv run ragbase models download
+# 或写进 .env：HF_ENDPOINT=https://hf-mirror.com
+```
+
+模型缓存位置跟随 `HF_HOME`（默认 `~/.cache/huggingface`）；已缓存的模型会跳过，下载中断后重跑可续传。`ragbase serve` 在**索引非空而模型缺失**时会提示先运行 `ragbase models download`（而不是抛一长串报错）；加 `ragbase serve --download-models` 则缺什么先下什么。
+
+### 换模型
+
+默认模型可通过 `RAG_EMBEDDING_MODEL`（默认 `Qwen/Qwen3-Embedding-0.6B`）和 `RAG_RERANKER_MODEL`（默认 `Qwen/Qwen3-Reranker-0.6B`）更换，`ragbase models download` / `doctor` 会跟着用新名字。
+
+- **更换 embedding 模型会改变向量维度，必须重新入库**：`ragbase ingest --full`（旧索引与新向量不兼容）。
+- **更换 reranker 后得分分布会变，需要重新校准 `RAG_MIN_SCORE`**（拒答阈值，默认 0.7 是按 Qwen3-Reranker-0.6B 校准的），可用 `scripts/calibrate_rerank_threshold.py`；`RAG_CONTEXT_MIN_SCORE` 同理。
+- 目前代码按 Qwen3 系列的用法编写（查询 prompt、yes/no logit 打分）；换成别家模型不保证可用。
+
+### 硬件与速度
+
+| 设备 | 说明 |
+| --- | --- |
+| Apple Silicon（MPS） | 自动选择，模型用 fp16；开发和日常使用的主要环境，服务启动约 10 秒 |
+| NVIDIA GPU（CUDA） | 自动选择，fp16（代码支持，本次改动未在 CUDA 机器上实测） |
+| 纯 CPU | 可以运行（Docker 镜像就是 CPU 版），但精排和批量向量化明显更慢（每个问题的精排要对约 20 个候选片段逐一打分）；首次建索引的大 PDF 会很久。`doctor` 会对此给出警告 |
+
+用 `RAG_DEVICE=auto|mps|cuda|cpu` 指定设备。CPU 的具体耗时取决于机器，这里不给数字。
+
+### 数据放在哪里（项目主目录 `RAG_HOME`）
+
+`RAG_HOME` 环境变量指定项目主目录，未设置则为**当前工作目录**；`ragbase init [DIR]` 在这里生成初始文件。Docker 里它是 `/data`（挂载自 `./ragbase-home`）。
+
+```text
+<RAG_HOME>/
+  .env                  配置（RAG_* 变量；含密钥，别提交）
+  data/                 你的文档（不递归子目录）
+  chroma_db/            向量索引（RAG_VECTOR_STORE=chroma 时）
+  qdrant_db/            向量索引（qdrant 本地模式时）
+  .ingest_meta.json     增量入库的文件指纹
+  .bm25_cache/          BM25 分词缓存
+  bm25_userdict.txt     领域词典（jieba 格式）
+  web/dist/             前端构建产物（没有则回退到包内自带的副本）
+~/.cache/huggingface/   本地模型缓存（HF_HOME；Docker 里是 /models 卷）
+```
+
+### 安全提示
+
+服务一旦监听 `0.0.0.0`（Docker 里默认如此）或暴露到公网，**必须设置 `RAG_API_KEY`**，否则任何能访问端口的人都能查询你的知识库、消耗你的大模型额度、上传 / 删除文档。生成密钥：`ragbase init --api-key`（新建 `.env` 时自动写入）或 `openssl rand -hex 32`。细节与 HTTPS 建议见“接口鉴权”。
+
 ## 架构
 
 ```text
@@ -30,17 +136,21 @@
 ```text
 pyproject.toml / uv.lock       依赖与锁文件（uv 管理）；命令行入口 ragbase = ragbase.cli:main
 src/ragbase/
-  cli.py  __main__.py          命令行：serve / ingest / ask / chat / eval / migrate-store（python -m ragbase 等价）
+  cli.py  __main__.py          命令行：init / models / doctor / serve / ingest / ask / chat / eval / migrate-store（python -m ragbase 等价）
+  scaffold.py  doctor.py       ragbase init（生成 .env 等）、ragbase doctor（环境自检）
+  resources/                   随包分发的模板：env.example（.env 模板）、bm25_userdict.txt、data_readme.txt
+  web/dist/                    （可选，已 gitignore）随包分发的前端构建产物，scripts/build_web.sh 生成
   config.py  logging_setup.py  集中配置（RAG_* 环境变量 / .env）；日志
   llm/factory.py               大模型工厂（OpenAI 兼容协议）
-  models/embeddings.py reranker.py   本地 Qwen3 embedding / reranker
+  models/                      embeddings / reranker（本地 Qwen3）、download（缓存检查与下载）
   ingest/                      parser / cleaner / splitter / toc / common / service / jobs
   vectorstores/                向量库抽象（base）、chroma、qdrant、factory（按 RAG_VECTOR_STORE 创建）、migrate（后端间迁移）
   retrieval/                   hybrid（向量 + BM25 + RRF）、pipeline（召回 -> 精排 -> 拒答 -> 生成）、labels（来源标签）
   agent/                       tools（检索工具与引用登记）、service（对话 Agent 与会话）
   api/                         app（FastAPI 应用，ragbase.api.app:app）、schemas、auth（API Key 鉴权）
   evaluation/                  runner（评测流程）、metrics（Ragas 与词面指标）
-scripts/                       一次性脚本（如拒答阈值校准）
+scripts/                       start.sh（一键启动）、build_web.sh（构建前端并复制进包）、拒答阈值校准
+Dockerfile / docker-compose.yml  CPU 镜像与 Compose 部署（.env.example 是配置模板）
 tests/                         断言脚本式单元测试（tests/run_all.py 一次运行全部）
 web/                           前端工程（React + Vite）
 data/ chroma_db/ qdrant_db/ ...  运行时数据，默认都在项目主目录下（见下）
@@ -124,7 +234,7 @@ uv sync            # 按 uv.lock 创建 .venv 并以可编辑模式安装 ragbas
 
 之后用 `uv run ragbase ...`（或直接 `.venv/bin/ragbase ...`）运行命令；`ragbase --help` 查看全部子命令。依赖写在 `pyproject.toml`，升级后用 `uv lock` 更新 `uv.lock`（`constraint-dependencies` 钉住了传递依赖的版本，要升级某个传递依赖时先改这里）。
 
-创建 `.env`：
+创建 `.env`：运行 `uv run ragbase init` 会按模板 [.env.example](.env.example)（全部配置项分组、带中文注释，示例都已注释掉）生成，也可手动 `cp .env.example .env`。最少只需要大模型这三项：
 
 ```dotenv
 RAG_LLM_API_KEY=你的 API Key
@@ -525,3 +635,6 @@ uv run ragbase serve                        # 浏览器打开 http://127.0.0.1:8
 - 找不到向量库：先运行 `uv run ragbase ingest`（或 `--full` 全量重建）；也请确认当前目录（或 `RAG_HOME`）是项目主目录。
 - MPS 不可用：设置环境变量 `RAG_DEVICE=cpu`（默认 `auto` 会自动回落到 CUDA / CPU）。
 - 依赖环境异常：重新执行 `uv sync`。
+- 不知道哪里没配好：运行 `ragbase doctor`，按 `✗` / `!` 项的提示修复。
+- `ragbase serve` 提示“本地模型尚未下载”：运行 `ragbase models download`（国内网络加 `HF_ENDPOINT=https://hf-mirror.com`）。
+- 模型下载很慢 / 超时：见“快速开始 -> 国内网络”；也可以在能访问 Hugging Face 的机器上下载后，把整个 `HF_HOME` 目录（或 Docker 的 `ragbase-models` 卷）拷过来。

@@ -43,6 +43,23 @@ def ragas_cache_dir() -> Path:
     return project_home() / ".ragas_cache"
 
 
+def packaged_web_dist() -> Path:
+    """随包分发的前端构建产物位置（scripts/build_web.sh 复制到这里；wheel / Docker 镜像里带着它）。"""
+    return Path(__file__).resolve().parent / "web" / "dist"
+
+
+def default_web_dist() -> Path:
+    """前端目录的默认值：优先主目录下的 web/dist（仓库里 pnpm build 的产物），没有就退到随包的前端副本，都没有仍指向前者（便于提示）。
+
+    只在创建 Settings 时判断一次；显式设置 RAG_WEB_DIST 则原样使用，不走这里。
+    """
+    home_dist = project_home() / "web" / "dist"
+    if (home_dist / "index.html").is_file():
+        return home_dist
+    packaged = packaged_web_dist()
+    return packaged if (packaged / "index.html").is_file() else home_dist
+
+
 def load_env() -> None:
     """把主目录下的 .env 载入 os.environ（不覆盖已有的环境变量）；文件不存在时什么也不做。"""
     load_dotenv(env_file())
@@ -65,6 +82,11 @@ RERANK_MIN_SCORE = 0.7
 # 取满足“要点召回不低于未过滤值 0.01”的最高候选 0.95：库内题零损失，只在片段得分明显偏低时才裁剪。
 # 注意得分已饱和，提高阈值会开始裁掉对比 / 多方面题需要的片段，别盲目调高。
 CONTEXT_MIN_SCORE = 0.95
+
+# 本地模型的 Hugging Face 仓库名；RAG_EMBEDDING_MODEL / RAG_RERANKER_MODEL 可改。
+# 换 embedding 模型会改变向量维度，必须 ragbase ingest --full 重建索引；换 reranker 需要重新校准 RAG_MIN_SCORE。
+DEFAULT_EMBEDDING_MODEL = "Qwen/Qwen3-Embedding-0.6B"
+DEFAULT_RERANKER_MODEL = "Qwen/Qwen3-Reranker-0.6B"
 
 DEFAULT_COLLECTION = "rag"  # 向量库里的集合名（Chroma collection / Qdrant collection）；RAG_COLLECTION 可改
 VECTOR_STORES = ("chroma", "qdrant")
@@ -102,6 +124,9 @@ class Settings(BaseSettings):
         populate_by_name=True,
     )
 
+    # 本地模型（Hugging Face 仓库名）：换 embedding 需重建索引，换 reranker 需重新校准 min_score
+    embedding_model: str = Field(DEFAULT_EMBEDDING_MODEL, min_length=1)
+    reranker_model: str = Field(DEFAULT_RERANKER_MODEL, min_length=1)
     # 本地模型设备：auto -> mps（Apple Silicon）> cuda > cpu
     device: Literal["auto", "mps", "cuda", "cpu"] = "auto"
     # 默认召回方式；API 可按请求覆盖
@@ -125,7 +150,7 @@ class Settings(BaseSettings):
     db_dir: Path = Field(default_factory=lambda: project_home() / "chroma_db")  # Chroma 持久化目录（RAG_VECTOR_STORE=chroma 时用）
     meta_file: Path = Field(default_factory=lambda: project_home() / ".ingest_meta.json")  # 增量入库的文件指纹
     cache_dir: Path = Field(default_factory=lambda: project_home() / ".bm25_cache")  # BM25 分词缓存
-    web_dist: Path = Field(default_factory=lambda: project_home() / "web" / "dist")  # 前端构建产物（pnpm build）；相对路径按主目录解析，目录存在时由 API 服务托管
+    web_dist: Path = Field(default_factory=default_web_dist)  # 前端构建产物：默认 <主目录>/web/dist，没有则用随包的副本；相对路径按主目录解析，目录存在时由 API 服务托管
     max_upload_mb: int = Field(300, ge=1)  # POST /documents 的单文件大小上限（最大的教材 PDF 约 235 MB）
 
     # 向量库后端：chroma（默认，本地目录 db_dir）或 qdrant（本地嵌入式目录 qdrant_path，或服务端 qdrant_url）
@@ -167,6 +192,14 @@ class Settings(BaseSettings):
     @classmethod
     def _resolve_web_dist(cls, value: Path) -> Path:
         return value if value.is_absolute() else project_home() / value
+
+    @field_validator("embedding_model", "reranker_model")
+    @classmethod
+    def _strip_model_name(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("模型名不能为空")
+        return value
 
     @field_validator("log_level")
     @classmethod

@@ -1,0 +1,48 @@
+# ragbase（CPU）一键部署：
+#   1) cp .env.example .env     编辑：RAG_LLM_*（大模型）和 RAG_API_KEY（对外开放必须设置）
+#   2) mkdir -p ragbase-home/data   把文档放进 ragbase-home/data/
+#   3) docker compose run --rm ragbase models download    下载模型到 models 卷（国内网络：HF_ENDPOINT=https://hf-mirror.com docker compose run ...）
+#   4) docker compose run --rm ragbase ingest             建立索引
+#   5) docker compose up -d                               浏览器打开 http://127.0.0.1:8000/
+# 之后新增文档：放进 ragbase-home/data/ 后再运行第 4 步（或在 Web 界面“知识库”页上传）。
+#
+# 可选：Qdrant 服务端做向量库（默认用 Chroma，不需要它）
+#   在 .env 里加：RAG_VECTOR_STORE=qdrant 和 RAG_QDRANT_URL=http://qdrant:6333
+#   然后：docker compose --profile qdrant up -d；已有 Chroma 索引可迁移：docker compose run --rm ragbase migrate-store --to qdrant
+#
+# 容器里 RAG_HOME=/data：/data/data 是文档，/data/chroma_db 是索引，/data/.env 也会被读取（与 env_file 二选一即可）。
+
+services:
+  ragbase:
+    build: .
+    image: ragbase:local
+    # 默认只绑定本机回环地址。要让局域网 / 公网访问，设置 RAGBASE_BIND=0.0.0.0，并且务必在 .env 里设置 RAG_API_KEY，
+    # 再放到 HTTPS 反向代理后面（密钥是明文 Bearer 令牌）。
+    ports:
+      - "${RAGBASE_BIND:-127.0.0.1}:${RAGBASE_PORT:-8000}:8000"
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      # 模型下载端点：国内网络用 HF_ENDPOINT=https://hf-mirror.com（shell 里或项目 .env 里设置）
+      HF_ENDPOINT: ${HF_ENDPOINT:-https://huggingface.co}
+    volumes:
+      # RAG_HOME：文档、索引、缓存都在这里。用绑定目录是为了能直接往 ragbase-home/data/ 放文件；
+      # Linux 上请先自己 mkdir -p ragbase-home/data（否则 Docker 会以 root 创建，容器内的非 root 用户 uid 1000 写不进去）。
+      # 不想管目录权限可改成命名卷：- ragbase-home:/data（并在底部 volumes 里声明 ragbase-home）
+      - ./ragbase-home:/data
+      - ragbase-models:/models
+    # --download-models：模型缺失时启动前自动下载（第 3 步已下载则直接跳过）。首次启动索引仍为空时，服务可启动但不能问答，先完成第 4 步
+    command: ["serve", "--host", "0.0.0.0", "--port", "8000", "--download-models"]
+    restart: unless-stopped
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    profiles: ["qdrant"]
+    volumes:
+      - qdrant-storage:/qdrant/storage
+    restart: unless-stopped
+
+volumes:
+  ragbase-models:
+  qdrant-storage:
