@@ -4,10 +4,8 @@ import math
 import re
 from pathlib import Path
 
-from openai import AsyncOpenAI
 from ragas.cache import DiskCacheBackend
 from ragas.embeddings import BaseRagasEmbedding
-from ragas.llms import llm_factory
 from ragas.metrics.collections import (
     AnswerRelevancy,
     ContextPrecisionWithReference,
@@ -16,7 +14,9 @@ from ragas.metrics.collections import (
     Faithfulness,
 )
 
+from config import Settings
 from embed import Qwen3Embeddings
+from llm_factory import create_ragas_llm
 
 
 BASE_DIR = Path(__file__).parent
@@ -128,24 +128,13 @@ def lexical_retrieval_metrics(documents, reference: str) -> dict[str, float]:
 
 
 class RagasEvaluator:
-    """使用方舟 OpenAI-compatible 接口运行 Ragas 0.4 指标。"""
+    """用配置的评测模型（eval_llm_*，缺省沿用回答模型；OpenAI 兼容协议）运行 Ragas 0.4 指标。"""
 
-    def __init__(
-        self,
-        model: str,
-        api_key: str,
-        base_url: str,
-        embeddings: Qwen3Embeddings,
-    ):
-        client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+    def __init__(self, settings: Settings, embeddings: Qwen3Embeddings):
         cache = DiskCacheBackend(cache_dir=str(RAGAS_CACHE_DIR))
-        llm = llm_factory(
-            model=model,
-            provider="openai",
-            client=client,
-            cache=cache,
-            temperature=0,
-        )
+        llm = create_ragas_llm(settings, cache=cache)
+        if llm is None:
+            raise ValueError("评测大模型未配置：请设置 RAG_LLM_API_KEY / RAG_LLM_MODEL / RAG_LLM_BASE_URL")
         ragas_embeddings = QwenRagasEmbeddings(embeddings)
         self.metrics = {
             "faithfulness": Faithfulness(llm=llm),

@@ -92,6 +92,8 @@ class HealthResponse(BaseModel):
     device: str
     mode: Mode
     llm_configured: bool
+    llm_protocol: str = Field(description="大模型协议（RAG_LLM_PROTOCOL），目前只有 openai")
+    llm_model: str | None = Field(description="回答模型名（RAG_LLM_MODEL）；未配置为 null")
 
 
 class DocumentInfo(BaseModel):

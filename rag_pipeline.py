@@ -6,13 +6,15 @@ import time
 from dataclasses import dataclass, field
 
 import chromadb
+import httpx
+from langchain_core.language_models import BaseChatModel
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_openai import ChatOpenAI
 
 from config import CONTEXT_MIN_SCORE, RERANK_MIN_SCORE, Settings, get_settings, resolve_device
 from embed import Qwen3Embeddings
 from hybrid_retriever import HybridRetriever
+from llm_factory import create_chat_model
 from rag_common import COLLECTION
 from reranker import Qwen3Reranker
 
@@ -53,7 +55,27 @@ ANSWER_HEADING = re.compile(
 
 
 class GenerationError(RuntimeError):
-    """调用大模型生成回答失败（网络、鉴权、限流等）；原始异常在 __cause__ 里。"""
+    """调用大模型生成回答失败（网络、鉴权、限流等）；原始异常在 __cause__ 里。
+
+    timeout 为 True 表示是响应超时（API 层据此返回 504 而不是 502）。
+    """
+
+    def __init__(self, message: str, timeout: bool = False):
+        super().__init__(message)
+        self.timeout = timeout
+
+
+def is_timeout_error(exc: BaseException | None) -> bool:
+    """沿异常链判断是否超时：内置 TimeoutError、httpx 的超时异常、openai 的 APITimeoutError（按类名，避免依赖具体 SDK）。"""
+    seen = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        if isinstance(exc, (TimeoutError, httpx.TimeoutException)):
+            return True
+        if any(cls.__name__ == "APITimeoutError" for cls in type(exc).__mro__):
+            return True
+        exc = exc.__cause__ or exc.__context__
+    return False
 
 
 @dataclass
@@ -87,7 +109,7 @@ def build_pipeline(
     device: str | None = None,
     build_bm25: bool | None = None,
     settings: Settings | None = None,
-) -> tuple[RAGPipeline, ChatOpenAI | None]:
+) -> tuple[RAGPipeline, BaseChatModel | None]:
     """从本地缓存加载模型，并构建检索、精排和生成组件。
 
     未显式传入的参数取自 settings（默认 get_settings()）：召回数、每路召回数、默认模式、设备、回答模型。
@@ -119,16 +141,11 @@ def build_pipeline(
         cache_dir=settings.cache_dir,
     )
 
-    llm = None
-    if settings.llm_configured:
-        llm = ChatOpenAI(
-            model=settings.chat_model,
-            api_key=settings.chat_api_key,
-            base_url=settings.base_url,
-            temperature=0,
+    llm = create_chat_model(settings)  # 协议不支持时在这里（服务启动阶段）抛 ValueError
+    if llm is None:
+        logger.warning(
+            "大模型未配置（RAG_LLM_MODEL / RAG_LLM_API_KEY / RAG_LLM_BASE_URL，旧的 ARK_* 变量同样有效），只能检索不能生成回答"
         )
-    else:
-        logger.warning("大模型未配置（ARK_CHAT_MODEL / ARK_CHAT_API_KEY / ARK_BASE_URL），只能检索不能生成回答")
     return RAGPipeline(
         retriever=retriever,
         reranker=reranker,
@@ -287,6 +304,8 @@ def ask(
             "input": question,
         })
     except Exception as exc:
+        if is_timeout_error(exc):
+            raise GenerationError(f"大模型响应超时：{type(exc).__name__}", timeout=True) from exc
         raise GenerationError(f"大模型调用失败：{type(exc).__name__}") from exc
     evidence, answer = split_evidence_answer(raw)
     return AskResult(answer, evidence, docs, reranked, candidates, False, top_score)

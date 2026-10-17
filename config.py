@@ -1,14 +1,15 @@
 """集中配置：环境变量 / .env -> Settings，命令行脚本与 API 服务共用，保证默认值只有一个来源。
 
-- 自有配置统一加 RAG_ 前缀（如 RAG_DEVICE、RAG_PORT）；大模型沿用已有的 ARK_* 变量名。
+- 自有配置统一加 RAG_ 前缀（如 RAG_DEVICE、RAG_PORT）；大模型用 RAG_LLM_*，旧的 ARK_* 变量名仍然兼容（RAG_LLM_* 优先）。
 - API Key 用 SecretStr 保存，repr / 日志里只会显示掩码；读取明文请用 get_secret_value()。
 - 本模块不 import torch 等重型依赖（resolve_device 里才懒加载），可在任何脚本里放心导入。
 """
+from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field, SecretStr, field_validator
+from pydantic import AliasChoices, Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 BASE_DIR = Path(__file__).parent
@@ -33,6 +34,27 @@ RERANK_MIN_SCORE = 0.7
 CONTEXT_MIN_SCORE = 0.95
 
 HALF_PRECISION_DEVICES = ("mps", "cuda")  # 只有这些设备上用 fp16；CPU 上半精度又慢又不稳
+
+LlmPurpose = Literal["answer", "eval"]  # answer: 生成回答；eval: 评测裁判 / ragas（可单独指定模型）
+
+
+@dataclass(frozen=True)
+class LLMConfig:
+    """某个用途下实际生效的大模型参数（已合并 eval_llm_* 覆盖项）；api_key 是 SecretStr，repr 只显示掩码。"""
+
+    protocol: str
+    model: str | None
+    base_url: str | None
+    api_key: SecretStr | None
+    temperature: float
+    max_tokens: int | None
+    timeout: float
+    max_retries: int
+
+    @property
+    def configured(self) -> bool:
+        """模型名、地址、密钥三项是否齐全。"""
+        return bool(self.model and self.base_url and self.api_key)
 
 
 class Settings(BaseSettings):
@@ -64,10 +86,22 @@ class Settings(BaseSettings):
     cache_dir: Path = BASE_DIR / ".bm25_cache"  # BM25 分词缓存
     max_upload_mb: int = Field(300, ge=1)  # POST /documents 的单文件大小上限（最大的教材 PDF 约 235 MB）
 
-    # 回答模型（火山方舟，OpenAI 兼容接口），沿用原有 ARK_* 变量名
-    chat_model: str | None = Field(None, validation_alias="ARK_CHAT_MODEL")
-    chat_api_key: SecretStr | None = Field(None, validation_alias="ARK_CHAT_API_KEY")
-    base_url: str | None = Field(None, validation_alias="ARK_BASE_URL")
+    # 大模型（默认 OpenAI 兼容协议）：RAG_LLM_*，未设置时回退到旧的 ARK_* 变量名（方舟，同为 OpenAI 兼容）。
+    # 注意：validation_alias 会绕过 env_prefix，所以两个名字都要写全；环境变量里先出现的别名优先，
+    # 但“环境变量里的 ARK_*”仍高于“.env 里的 RAG_LLM_*”（pydantic-settings 按来源分层，环境变量整体优先于 .env）。
+    llm_protocol: Literal["openai"] = "openai"  # 新增协议（如 anthropic）：这里加字面量 + llm_factory 加一个分支
+    llm_base_url: str | None = Field(None, validation_alias=AliasChoices("RAG_LLM_BASE_URL", "ARK_BASE_URL"))
+    llm_api_key: SecretStr | None = Field(None, validation_alias=AliasChoices("RAG_LLM_API_KEY", "ARK_CHAT_API_KEY"))
+    llm_model: str | None = Field(None, validation_alias=AliasChoices("RAG_LLM_MODEL", "ARK_CHAT_MODEL"))
+    llm_temperature: float = Field(0, ge=0, le=2)
+    llm_max_tokens: int | None = Field(None, ge=1)  # None 表示不限制，用服务端默认
+    llm_timeout: float = Field(60, gt=0)  # 单次请求超时（秒）
+    llm_max_retries: int = Field(2, ge=0)  # 超时 / 连接错误 / 429 / 5xx 的自动重试次数（指数退避）
+
+    # 评测裁判（evaluate.py 的 ragas 与中文裁判）可单独指定模型；留空则沿用上面的回答模型配置
+    eval_llm_base_url: str | None = None
+    eval_llm_api_key: SecretStr | None = None
+    eval_llm_model: str | None = None
 
     @field_validator("log_level")
     @classmethod
@@ -77,20 +111,34 @@ class Settings(BaseSettings):
             raise ValueError(f"log_level 无效：{value!r}")
         return value
 
-    @field_validator("chat_model", "base_url", mode="before")
+    @field_validator("llm_model", "llm_base_url", "eval_llm_model", "eval_llm_base_url", mode="before")
     @classmethod
     def _blank_to_none(cls, value):
         return (value.strip() or None) if isinstance(value, str) else value
 
-    @field_validator("chat_api_key", mode="before")
+    @field_validator("llm_api_key", "eval_llm_api_key", mode="before")
     @classmethod
     def _blank_secret_to_none(cls, value):
         return (value.strip() or None) if isinstance(value, str) else value
 
+    def llm_config(self, purpose: LlmPurpose = "answer") -> LLMConfig:
+        """某用途下生效的大模型参数；eval 的模型 / 地址 / 密钥单独设置了就用它，没设置的沿用回答模型。"""
+        override = purpose == "eval"
+        return LLMConfig(
+            protocol=self.llm_protocol,
+            model=(self.eval_llm_model if override else None) or self.llm_model,
+            base_url=(self.eval_llm_base_url if override else None) or self.llm_base_url,
+            api_key=(self.eval_llm_api_key if override else None) or self.llm_api_key,
+            temperature=self.llm_temperature,
+            max_tokens=self.llm_max_tokens,
+            timeout=self.llm_timeout,
+            max_retries=self.llm_max_retries,
+        )
+
     @property
     def llm_configured(self) -> bool:
         """回答模型三项配置是否齐全（只返回布尔值，不暴露密钥）。"""
-        return bool(self.chat_model and self.base_url and self.chat_api_key)
+        return self.llm_config("answer").configured
 
 
 @lru_cache

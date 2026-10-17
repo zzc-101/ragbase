@@ -139,7 +139,7 @@ def _pipeline(scores=((0, 0.99), (1, 0.96), (2, 0.5)), chain=True, retriever=Non
 
 def _settings(**overrides):
     values = dict(
-        device="cpu", log_level="WARNING", chat_api_key="sk-test-FAKE-KEY",
+        device="cpu", log_level="WARNING", llm_api_key="sk-test-FAKE-KEY", llm_model="test-model",
         data_dir=SCRATCH / "default-data", db_dir=SCRATCH / "default-chroma",
         meta_file=SCRATCH / "default-meta.json", cache_dir=SCRATCH / "default-cache",
     )
@@ -178,6 +178,7 @@ def test_health_ok():
         "status": "ok", "chunk_count": 6408, "bm25_ready": True,
         "bm25_built_at": "2025-10-09T08:53:20+00:00", "bm25_chunk_count": 6408,
         "device": "cpu", "mode": "hybrid", "llm_configured": True,
+        "llm_protocol": "openai", "llm_model": "test-model",
     }, body
 
 
@@ -342,6 +343,20 @@ def test_ask_llm_exception_returns_502_without_leaking():
     assert len(pipeline.answer_chain.calls) == 1
 
 
+def test_ask_llm_timeout_returns_504_without_leaking():
+    import httpx
+
+    pipeline = _pipeline(error=httpx.ReadTimeout("read timed out sk-ULTRA-SECRET-999"))
+    with _client(pipeline) as client:
+        response = client.post("/ask", json={"query": "q"})
+        # 超时之外的失败仍是 502
+        pipeline.answer_chain.error = ConnectionError("连接被拒绝")
+        other = client.post("/ask", json={"query": "q"})
+    body = _assert_error(response, 504, "llm_timeout")
+    assert "超时" in body["detail"] and "sk-ULTRA" not in response.text and "ReadTimeout" not in response.text
+    _assert_error(other, 502, "llm_error")
+
+
 def test_request_id_echoed_and_generated():
     with _client(_pipeline()) as client:
         echoed = client.get("/health", headers={"X-Request-ID": "req-abc_123"})
@@ -433,12 +448,12 @@ def test_concurrent_retrieval_is_serialized_but_llm_runs_outside_lock():
 
 def test_settings_repr_hides_secret():
     secret = "sk-test-VERY-SECRET-VALUE"
-    saved = os.environ.get("ARK_CHAT_API_KEY")
-    os.environ["ARK_CHAT_API_KEY"] = secret
+    saved = os.environ.get("RAG_LLM_API_KEY")
+    os.environ["RAG_LLM_API_KEY"] = secret
     get_settings.cache_clear()
     try:
         settings = get_settings()
-        real_key = settings.chat_api_key.get_secret_value()
+        real_key = settings.llm_api_key.get_secret_value()
         assert real_key == secret  # 环境变量优先于 .env
         for text in (repr(settings), str(settings), settings.model_dump_json(), str(settings.model_dump())):
             assert secret not in text, text
@@ -446,11 +461,11 @@ def test_settings_repr_hides_secret():
         assert settings.llm_configured in (True, False)
     finally:
         if saved is None:
-            os.environ.pop("ARK_CHAT_API_KEY", None)
+            os.environ.pop("RAG_LLM_API_KEY", None)
         else:
-            os.environ["ARK_CHAT_API_KEY"] = saved
+            os.environ["RAG_LLM_API_KEY"] = saved
         get_settings.cache_clear()
-    health_settings = _settings(chat_api_key=secret, chat_model="m", base_url="http://x")
+    health_settings = _settings(llm_api_key=secret, llm_model="m", llm_base_url="http://x")
     with _client(_pipeline(), settings=health_settings) as client:
         assert secret not in client.get("/health").text
 

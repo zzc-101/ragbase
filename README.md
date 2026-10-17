@@ -102,11 +102,13 @@ uv pip sync requirements.lock
 创建 `.env`：
 
 ```dotenv
-ARK_CHAT_API_KEY=你的方舟 API Key
-ARK_CHAT_MODEL=你的推理接入点 ID
-ARK_BASE_URL=https://ark.cn-beijing.volces.com/api/v3
+RAG_LLM_API_KEY=你的 API Key
+RAG_LLM_MODEL=模型名（方舟填推理接入点 ID）
+RAG_LLM_BASE_URL=https://ark.cn-beijing.volces.com/api/v3
 CHROMA_TELEMETRY_DISABLED=true
 ```
+
+大模型走 OpenAI 兼容协议，可换成任意兼容的服务商，详见“服务化运行”里的“大模型配置”。旧的 `ARK_CHAT_API_KEY` / `ARK_CHAT_MODEL` / `ARK_BASE_URL` 仍然有效。
 
 ## 建立索引
 
@@ -191,12 +193,12 @@ uv run uvicorn api:app --host 127.0.0.1 --port 8000   # 或：uv run api.py（�
 - **必须单进程，不要加 `--workers`**：embedding / reranker / BM25 索引都加载在服务进程内，多 worker 会让每个进程各占一份显存，且 MPS 模型不能并发推理。并发请求由线程池接住，召回 + 精排在一把锁内串行，大模型生成在锁外并行（慢生成不会阻塞检索）。
 - 启动约 10 秒（加载两个本地模型和 BM25 索引）。索引不存在或为空时服务仍会启动，`/health` 报告 `not_ready`，`/search`、`/ask` 以及文档管理接口返回 503（“索引不存在或为空，请先运行 uv run ingest.py”）；用命令行建好索引后需重启服务（在线入库要求服务启动时索引已存在）。
 - 每个响应带 `X-Request-ID`（请求头里带了就沿用，否则生成），每个请求输出一行访问日志（方法、路径、状态码、耗时；`/search`、`/ask` 另带 `refused` 和 `top_score`）。
-- 错误统一为 `{"error": "...", "detail": "..."}`：422 参数校验、400 请求了未构建的 BM25 模式 / 未知书名 / 非法上传、404 找不到文档或任务、409 已有入库任务在运行、413 上传文件过大、502 大模型调用失败、503 索引 / 大模型未就绪、500 未处理异常（详情只写日志）。
+- 错误统一为 `{"error": "...", "detail": "..."}`：422 参数校验、400 请求了未构建的 BM25 模式 / 未知书名 / 非法上传、404 找不到文档或任务、409 已有入库任务在运行、413 上传文件过大、502 大模型调用失败（鉴权、限流、5xx 等，已按 `RAG_LLM_MAX_RETRIES` 重试过）、504 大模型响应超时（`error` 为 `llm_timeout`，单次请求超过 `RAG_LLM_TIMEOUT` 且重试用完）、503 索引 / 大模型未就绪、500 未处理异常（详情只写日志）。
 - 交互式文档：<http://127.0.0.1:8000/docs>。
 
 | 接口 | 说明 |
 | --- | --- |
-| `GET /health` | `status`（`ok` / `not_ready`）、`chunk_count`、`bm25_ready`、`bm25_built_at`（当前 BM25 索引的构建时间，UTC）、`bm25_chunk_count`（BM25 覆盖的片段数，与 `chunk_count` 不同说明刷新未完成）、`device`、`mode`、`llm_configured` |
+| `GET /health` | `status`（`ok` / `not_ready`）、`chunk_count`、`bm25_ready`、`bm25_built_at`（当前 BM25 索引的构建时间，UTC）、`bm25_chunk_count`（BM25 覆盖的片段数，与 `chunk_count` 不同说明刷新未完成）、`device`、`mode`、`llm_configured`、`llm_protocol`、`llm_model`（模型名，不含密钥） |
 | `POST /search` | 召回 + 精排，不调用大模型 |
 | `POST /ask` | 召回 + 精排 + 大模型回答；得分过低时拒答且不调用大模型 |
 | `GET /documents` | 已入库的文档：`name`、`chunk_count`、`heading_chunks`、`has_headings`（按 `source` 的文件名汇总，旧版索引同样可用） |
@@ -288,13 +290,39 @@ curl -s -X DELETE 'http://127.0.0.1:8000/documents/新教材.pdf'
 | `RAG_MAX_UPLOAD_MB` | `300` | `POST /documents` 单文件大小上限 |
 | `RAG_LOG_LEVEL` | `INFO` | 日志级别 |
 | `RAG_HOST` / `RAG_PORT` | `127.0.0.1` / `8000` | `uv run api.py` 的监听地址 |
-| `ARK_CHAT_API_KEY` | 无 | 方舟 API Key（以 `SecretStr` 保存，不会出现在日志 / `repr` 中） |
-| `ARK_CHAT_MODEL` | 无 | 推理接入点 ID |
-| `ARK_BASE_URL` | 无 | 方舟地址，如 `https://ark.cn-beijing.volces.com/api/v3` |
 
-未配置 `ARK_*` 时服务仍可启动，`/search` 可用，`/ask` 返回 503。
+**大模型配置**（`llm_protocol` 目前只实现 `openai`，即 OpenAI 兼容的 `/chat/completions`；新增协议只需在 [llm_factory.py](llm_factory.py) 里加一个分支）：
 
-- 单元测试（均不加载模型、不访问网络、不碰真实数据）：`uv run python tests/test_api.py`（假流水线 / 假入库，另有用临时 Chroma 的端到端用例）、`tests/test_ingest_service.py`（临时目录 + 假 embedding）、`tests/test_sources.py`（按书过滤、快照刷新、分词缓存）、`tests/test_toc.py`（用 fitz 生成带书签的 PDF）、`tests/test_config.py`。
+| 变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `RAG_LLM_PROTOCOL` | `openai` | 协议；不支持的值会在启动时报错 |
+| `RAG_LLM_BASE_URL` | 无 | 接口地址，如 `https://api.openai.com/v1`（兼容旧名 `ARK_BASE_URL`） |
+| `RAG_LLM_API_KEY` | 无 | API Key（以 `SecretStr` 保存，不会出现在日志 / `repr` 中；兼容旧名 `ARK_CHAT_API_KEY`） |
+| `RAG_LLM_MODEL` | 无 | 模型名（兼容旧名 `ARK_CHAT_MODEL`，方舟填推理接入点 ID） |
+| `RAG_LLM_TEMPERATURE` | `0` | 采样温度 |
+| `RAG_LLM_MAX_TOKENS` | 不限 | 单次回答的最大输出 token 数 |
+| `RAG_LLM_TIMEOUT` | `60` | 单次请求超时（秒） |
+| `RAG_LLM_MAX_RETRIES` | `2` | 超时 / 连接错误 / 429 / 5xx 的自动重试次数（指数退避），所以最坏等待约 `TIMEOUT × (RETRIES + 1)` 加退避间隔 |
+| `RAG_EVAL_LLM_MODEL` / `RAG_EVAL_LLM_BASE_URL` / `RAG_EVAL_LLM_API_KEY` | 沿用上面的回答模型 | 评测裁判（`evaluate.py` 的 Ragas 与中文裁判）单独用另一个模型 / 服务；设置了哪项就覆盖哪项，其余沿用 |
+
+示例（任意 OpenAI 兼容服务商）：
+
+```dotenv
+# OpenAI
+RAG_LLM_BASE_URL=https://api.openai.com/v1
+RAG_LLM_API_KEY=sk-...
+RAG_LLM_MODEL=gpt-4o-mini
+# 本地 Ollama / vLLM 等：RAG_LLM_BASE_URL=http://127.0.0.1:11434/v1，RAG_LLM_API_KEY 随便填一个非空值
+# 评测用更强的模型当裁判（可选，只设模型名就沿用上面的地址和密钥）
+RAG_EVAL_LLM_MODEL=gpt-4o
+```
+
+- 优先级：`RAG_LLM_*` > 旧的 `ARK_*`。注意 pydantic-settings 的来源顺序是“环境变量 > `.env`”，所以**shell 环境变量里的 `ARK_*` 会压过 `.env` 里的 `RAG_LLM_*`**（同一来源内才是 `RAG_LLM_*` 优先）；迁移时请把旧变量改名，不要两套混用。
+- 三项（地址、密钥、模型）缺任何一项都算未配置：服务仍可启动，`/search` 可用，`/ask` 返回 503。
+- 模型回答超时：底层客户端先按 `RAG_LLM_MAX_RETRIES` 重试，仍超时则 `/ask` 返回 **504**（`llm_timeout`）；其他失败返回 502。完整异常只写日志，响应里不含密钥或上游地址。
+
+- 运行全部单元测试：`uv run python tests/run_all.py`（每个 `tests/test_*.py` 一个子进程，打印各自汇总行，任一失败则非零退出；可带文件名片段只跑部分，如 `run_all.py llm api`）。CI：`.github/workflows/tests.yml`（push / PR 到 main 时在 ubuntu 上用 CPU 版 torch 跑同一个脚本）。
+- 单元测试（均不加载模型、不碰真实数据，网络只访问本机 127.0.0.1 的桩服务）：`uv run python tests/test_api.py`（假流水线 / 假入库，另有用临时 Chroma 的端到端用例）、`tests/test_ingest_service.py`（临时目录 + 假 embedding）、`tests/test_sources.py`（按书过滤、快照刷新、分词缓存）、`tests/test_toc.py`（用 fitz 生成带书签的 PDF）、`tests/test_config.py`、`tests/test_llm.py`（本机 OpenAI 兼容桩服务：参数透传、5xx 重试、超时 -> 504、`/ask` 端到端）、`tests/test_parser.py`（临时生成的 PDF / DOCX / GB18030 文本）。
 - 依赖：文件上传需要 `python-multipart`（已加入 `requirements.txt` / `requirements.lock`，旧环境请重新执行 `uv pip sync requirements.lock`）。
 
 ## 性能设计
@@ -317,7 +345,7 @@ curl -s -X DELETE 'http://127.0.0.1:8000/documents/新教材.pdf'
 
 ## 常见问题
 
-- `AuthenticationError`：检查 `.env` 中的方舟 API Key、模型接入点和地址。
+- `AuthenticationError`：检查 `.env` 中的 `RAG_LLM_API_KEY`、`RAG_LLM_MODEL` 和 `RAG_LLM_BASE_URL`（旧的 `ARK_*` 同样有效）。
 - 找不到向量库：先运行 `uv run ingest.py`。
 - MPS 不可用：设置环境变量 `RAG_DEVICE=cpu`（默认 `auto` 会自动回落到 CUDA / CPU）。
 - 依赖环境异常：重新执行 `uv pip sync requirements.lock`。

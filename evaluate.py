@@ -15,6 +15,7 @@ from evaluation_metrics import (
     lexical_retrieval_metrics,
     mean_scores,
 )
+from llm_factory import create_chat_model
 from rag_pipeline import (
     ask,
     build_pipeline,
@@ -299,11 +300,10 @@ def print_summary(results, mode: str):
 def main():
     args = parse_args()
     settings = get_settings()
-    api_key = settings.chat_api_key.get_secret_value() if settings.chat_api_key else None
-    model = settings.chat_model
-    base_url = settings.base_url
     if not args.retrieval_only and not settings.llm_configured:
-        raise SystemExit("错误：请在 .env 中配置 ARK_CHAT_API_KEY、ARK_CHAT_MODEL 和 ARK_BASE_URL")
+        raise SystemExit(
+            "错误：请在 .env 中配置 RAG_LLM_API_KEY、RAG_LLM_MODEL 和 RAG_LLM_BASE_URL（旧的 ARK_* 变量同样有效）"
+        )
 
     questions = load_eval_questions(args.start_id, args.limit)
     if not questions:
@@ -313,15 +313,12 @@ def main():
     result_file = result_path(mode, args.retrieval_only)
     print(f"加载 {len(questions)} 道测试题，开始评估（召回模式：{mode}）...")
     print("加载本地 embedding 与 reranker 模型...")
-    pipeline, llm = build_pipeline(mode=mode)
+    pipeline, _ = build_pipeline(mode=mode)
+    # 中文裁判与 ragas 用评测模型（eval_llm_*，缺省沿用回答模型）；回答仍由 pipeline 里的回答模型生成
+    judge_llm = None if args.retrieval_only else create_chat_model(settings, "eval")
     ragas_evaluator = None
     if not args.skip_ragas and not args.retrieval_only:
-        ragas_evaluator = RagasEvaluator(
-            model=model,
-            api_key=api_key,
-            base_url=base_url,
-            embeddings=pipeline.embeddings,
-        )
+        ragas_evaluator = RagasEvaluator(settings, embeddings=pipeline.embeddings)
 
     results = []
     with asyncio.Runner() as runner:
@@ -360,7 +357,7 @@ def main():
             else:
                 ragas_result, legacy_judge = runner.run(evaluate_quality(
                     ragas_evaluator=ragas_evaluator,
-                    llm=llm,
+                    llm=judge_llm,
                     question=prompt,
                     answer=answer,
                     docs=docs,

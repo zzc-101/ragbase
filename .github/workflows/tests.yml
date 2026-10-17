@@ -1,0 +1,51 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# 同一分支 / PR 上有新提交时取消还在跑的旧任务，省分钟数（私有仓库按分钟计费）
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    # 私有仓库 macOS 分钟数贵 10 倍，用 Linux；锁文件在 macOS 上生成，但依赖在 Linux 上同样可解析（见下方 torch 说明）
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      PYTHON_VERSION: "3.12"
+      RAG_DEVICE: cpu               # 测试不加载模型，但保证即使解析 auto 也不去探测 GPU
+      HF_HUB_OFFLINE: "1"           # 测试不需要、也不允许联网下载模型
+      TOKENIZERS_PARALLELISM: "false"
+      PYTHONUNBUFFERED: "1"
+      # PyPI 上的 Linux torch 会连带装 ~19 个 CUDA 包（nvidia-*、triton，数 GB）。
+      # 额外加 PyTorch 官方 CPU 源并取各源里的最高版本：torch==2.13.0 会解析成 2.13.0+cpu（本地版本号更高），
+      # 其余包版本都由锁文件钉死，所以不会因为多了一个源而变版本。
+      UV_EXTRA_INDEX_URL: https://download.pytorch.org/whl/cpu
+      UV_INDEX_STRATEGY: unsafe-best-match
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 uv（缓存下载的 wheel）
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: requirements.lock
+
+      - name: 安装依赖（CPU 版 torch）
+        run: |
+          uv venv .venv
+          uv pip install --python .venv/bin/python -r requirements.lock
+          uv pip check --python .venv/bin/python
+
+      - name: 运行全部测试
+        # 测试只用本地桩 / 假流水线：不需要模型、.env、真实文档或外网（只访问 127.0.0.1 的 LLM 桩服务）
+        run: .venv/bin/python tests/run_all.py

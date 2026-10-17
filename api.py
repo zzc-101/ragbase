@@ -51,8 +51,11 @@ from rag_pipeline import GenerationError, RAGPipeline, ask, build_pipeline, retr
 logger = logging.getLogger(__name__)
 
 INDEX_MISSING_MESSAGE = "索引不存在或为空，请先运行 uv run ingest.py"
-LLM_MISSING_MESSAGE = "大模型未配置：请在 .env 中设置 ARK_CHAT_API_KEY、ARK_CHAT_MODEL 和 ARK_BASE_URL"
+LLM_MISSING_MESSAGE = (
+    "大模型未配置：请在 .env 中设置 RAG_LLM_API_KEY、RAG_LLM_MODEL 和 RAG_LLM_BASE_URL（旧的 ARK_* 变量同样有效）"
+)
 LLM_FAILED_MESSAGE = "大模型调用失败，请稍后重试"
+LLM_TIMEOUT_MESSAGE = "大模型响应超时，请稍后重试"
 INTERNAL_ERROR_MESSAGE = "服务内部错误"
 INGEST_UNAVAILABLE_MESSAGE = "索引不存在或为空，服务无法在线入库：请先运行 uv run ingest_incremental.py 建立索引，再重启服务"
 UPLOAD_CHUNK_BYTES = 1024 * 1024  # 上传流式写盘的块大小
@@ -66,6 +69,7 @@ ERROR_CODES = {
     413: "payload_too_large",
     422: "validation_error",
     502: "llm_error",
+    504: "llm_timeout",
     503: "service_unavailable",
 }
 _VALID_REQUEST_ID = re.compile(r"[A-Za-z0-9._-]{1,64}")  # 只接受安全字符，避免日志注入
@@ -242,7 +246,7 @@ def create_app(pipeline_factory=None, settings: Settings | None = None, ingest_f
     async def validation_exception_handler(request: Request, exc: RequestValidationError):
         return _error_response(422, _validation_detail(exc))
 
-    error_models = {code: {"model": ErrorResponse} for code in (400, 404, 409, 413, 422, 502, 503)}
+    error_models = {code: {"model": ErrorResponse} for code in (400, 404, 409, 413, 422, 502, 503, 504)}
 
     @app.get("/health", response_model=HealthResponse)
     def health(request: Request):
@@ -261,6 +265,8 @@ def create_app(pipeline_factory=None, settings: Settings | None = None, ingest_f
             llm_configured=(
                 pipeline.answer_chain is not None if pipeline is not None else settings.llm_configured
             ),
+            llm_protocol=settings.llm_protocol,
+            llm_model=settings.llm_model,  # 模型名不是密钥
         )
 
     @app.post(
@@ -316,6 +322,8 @@ def create_app(pipeline_factory=None, settings: Settings | None = None, ingest_f
             )
         except GenerationError as exc:
             logger.exception("大模型调用失败")  # 完整异常只进日志，响应里只给固定提示
+            if exc.timeout:  # 超时（已按 RAG_LLM_MAX_RETRIES 重试过）单独用 504，便于客户端区分
+                raise HTTPException(status_code=504, detail=LLM_TIMEOUT_MESSAGE) from exc
             raise HTTPException(status_code=502, detail=LLM_FAILED_MESSAGE) from exc
         request.state.log_extra = (
             f" refused={result.refused} top_score={_score_text(result.top_score)}" + _sources_log(sources)

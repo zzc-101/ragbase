@@ -71,8 +71,8 @@ def source_label(metadata: dict) -> str:
 def main():
     args = parse_args()
     settings = get_settings()
-    if not settings.chat_api_key:
-        print("错误：请先在 .env 文件里填写 ARK_CHAT_API_KEY")
+    if not settings.llm_configured:
+        print("错误：请先在 .env 里配置 RAG_LLM_API_KEY、RAG_LLM_MODEL 和 RAG_LLM_BASE_URL（旧的 ARK_* 变量同样有效）")
         return
     if not collection_count(settings.db_dir):
         print("错误：索引不存在或为空，请先运行：uv run ingest.py")
