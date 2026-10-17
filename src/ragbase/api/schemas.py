@@ -147,6 +147,14 @@ class HealthResponse(BaseModel):
     llm_protocol: str = Field(description="大模型协议（RAG_LLM_PROTOCOL），目前只有 openai")
     llm_model: str | None = Field(description="回答模型名（RAG_LLM_MODEL）；未配置为 null")
     agent_ready: bool = Field(description="对话 Agent（/chat）是否就绪；大模型未配置或索引缺失时为 false")
+    auth_required: bool = Field(False, description="是否启用了接口鉴权（设置了 RAG_API_KEY）")
+
+
+class LivenessResponse(BaseModel):
+    """启用鉴权后，没有有效密钥的 /health 只返回这两个字段（存活探针 + 让前端知道需要密钥）。"""
+
+    status: Literal["ok", "not_ready"]
+    auth_required: Literal[True] = True
 
 
 class DocumentInfo(BaseModel):

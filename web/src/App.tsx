@@ -1,5 +1,6 @@
 import { Navigate, Route, Routes } from 'react-router'
 import { AppShell } from '@/components/AppShell'
+import { AuthDialog } from '@/components/AuthDialog'
 import { Toaster } from '@/components/ui/sonner'
 import { TooltipProvider } from '@/components/ui/tooltip'
 import { ChatProvider } from '@/hooks/useChat'
@@ -19,6 +20,7 @@ export default function App() {
           </Route>
         </Routes>
       </ChatProvider>
+      <AuthDialog />
       <Toaster position="top-center" />
     </TooltipProvider>
   )

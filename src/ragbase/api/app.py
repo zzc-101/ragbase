@@ -13,6 +13,9 @@
 入库任务在后台线程里跑（同一时刻只有一个），每个批次单独持有 pipeline.lock，批间释放，/search 可以插进来；
 任务结束后重建 BM25 快照并原子替换。命令行 ragbase ingest --full（会清空整个向量库）不能和服务同时运行；本地 Qdrant 目录同一时刻也只允许一个进程打开。
 
+接口鉴权：设置 RAG_API_KEY 后，除前端页面 / 静态资源、/docs、/openapi.json 和精简版 /health 外，所有接口都要带
+Authorization: Bearer <key>（或 X-API-Key）；默认拒绝 + 显式公开白名单，见 ragbase/api/auth.py。RAG_CORS_ORIGINS 配置跨域来源。
+
 Web 界面：web/ 目录是前端工程，pnpm build 后产物在 web/dist（RAG_WEB_DIST 可改），本服务在同一端口托管它：
 /assets/* 是静态资源，/、/library、/c/{session_id} 返回 index.html（前端路由）；API 路由不受影响。
 """
@@ -29,9 +32,18 @@ from pathlib import Path
 import uvicorn
 from fastapi import FastAPI, File, HTTPException, Path as PathParam, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from ragbase.api.auth import (
+    NO_AUTH_EXPOSED_WARNING,
+    UNAUTHORIZED_DETAIL,
+    is_authenticated,
+    is_health,
+    is_loopback_host,
+    is_public,
+)
 from ragbase.api.schemas import (
     SESSION_ID_PATTERN,
     AskRequest,
@@ -43,6 +55,7 @@ from ragbase.api.schemas import (
     DocumentsResponse,
     ErrorResponse,
     HealthResponse,
+    LivenessResponse,
     JobResponse,
     SearchRequest,
     SearchResponse,
@@ -78,6 +91,7 @@ UPLOAD_SLACK_BYTES = 64 * 1024  # Content-Length 比文件上限多出的 multip
 
 ERROR_CODES = {
     400: "bad_request",
+    401: "unauthorized",
     404: "not_found",
     405: "method_not_allowed",
     409: "conflict",
@@ -213,6 +227,7 @@ def create_app(pipeline_factory=None, settings: Settings | None = None, ingest_f
     chat_factory = chat_factory or default_chat_factory
     setup_logging(settings.log_level)
     max_upload_bytes = settings.max_upload_mb * 1024 * 1024
+    api_key = settings.api_key  # None = 鉴权关闭
     jobs = IngestJobManager()
 
     @asynccontextmanager
@@ -254,9 +269,19 @@ def create_app(pipeline_factory=None, settings: Settings | None = None, ingest_f
                 return _error_response(413, f"文件超过大小上限 {settings.max_upload_mb} MB")
         return None
 
+    def _check_auth(request: Request):
+        """接口鉴权（默认拒绝）：公开白名单之外的请求必须带有效密钥，否则 401；放在读请求体之前，所以未鉴权的上传 / 流式请求不会被处理。
+        /health 总是放行，但把 request.state.authenticated 交给路由决定返回精简还是完整内容。不记录请求头里的任何值。"""
+        request.state.authenticated = is_authenticated(request.headers, api_key)
+        if request.state.authenticated or is_public(request.method, request.url.path) or is_health(
+            request.method, request.url.path
+        ):
+            return None
+        return _error_response(401, UNAUTHORIZED_DETAIL, headers={"WWW-Authenticate": "Bearer"})
+
     @app.middleware("http")
     async def request_context(request: Request, call_next):
-        """请求 ID（沿用或生成 X-Request-ID 并回写）+ 每个请求一行访问日志 + 兜底未处理异常。"""
+        """请求 ID（沿用或生成 X-Request-ID 并回写）+ 接口鉴权 + 每个请求一行访问日志 + 兜底未处理异常。"""
         incoming = request.headers.get("X-Request-ID", "")
         request_id = incoming if _VALID_REQUEST_ID.fullmatch(incoming) else uuid.uuid4().hex
         token = request_id_var.set(request_id)
@@ -264,7 +289,7 @@ def create_app(pipeline_factory=None, settings: Settings | None = None, ingest_f
         start = time.perf_counter()
         try:
             try:
-                response = _reject_oversized_upload(request) or await call_next(request)
+                response = _check_auth(request) or _reject_oversized_upload(request) or await call_next(request)
             except Exception:
                 logger.exception("未处理的异常：%s %s", request.method, request.url.path)
                 response = _error_response(500, INTERNAL_ERROR_MESSAGE)
@@ -289,12 +314,25 @@ def create_app(pipeline_factory=None, settings: Settings | None = None, ingest_f
     async def validation_exception_handler(request: Request, exc: RequestValidationError):
         return _error_response(422, _validation_detail(exc))
 
-    error_models = {code: {"model": ErrorResponse} for code in (400, 404, 409, 413, 422, 502, 503, 504)}
+    error_models = {code: {"model": ErrorResponse} for code in (400, 401, 404, 409, 413, 422, 502, 503, 504)}
 
-    @app.get("/health", response_model=HealthResponse)
+    if settings.cors_origins:  # 最后添加 = 最外层：预检请求不经过鉴权，401 等响应也带 CORS 头
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=settings.cors_origins,
+            allow_methods=["*"],
+            allow_headers=["Authorization", "X-API-Key", "Content-Type"],
+            expose_headers=["X-Request-ID"],
+            allow_credentials=False,  # 密钥走请求头，不依赖 cookie
+        )
+
+    @app.get("/health", response_model=HealthResponse | LivenessResponse)
     def health(request: Request):
-        """服务状态：索引 / 模型都就绪才是 ok；索引缺失时服务仍可启动，这里报告 not_ready。"""
+        """服务状态：索引 / 模型都就绪才是 ok；索引缺失时服务仍可启动，这里报告 not_ready。
+        启用鉴权后，没有有效密钥只返回 {status, auth_required}（存活探针用），有效密钥才返回完整内容。"""
         pipeline = request.app.state.pipeline
+        if not request.state.authenticated:
+            return LivenessResponse(status="ok" if pipeline is not None else "not_ready", auth_required=True)
         count = collection_count(settings)
         retriever = pipeline.retriever if pipeline is not None else None
         return HealthResponse(
@@ -312,6 +350,7 @@ def create_app(pipeline_factory=None, settings: Settings | None = None, ingest_f
             llm_protocol=settings.llm_protocol,
             llm_model=settings.llm_model,  # 模型名不是密钥
             agent_ready=request.app.state.chat is not None,
+            auth_required=api_key is not None,
         )
 
     @app.post(
@@ -621,9 +660,12 @@ app = create_app()
 def serve(host: str | None = None, port: int | None = None) -> None:
     """用 uvicorn 在当前进程里启动服务（ragbase serve）；host / port 缺省取配置（RAG_HOST / RAG_PORT）。"""
     runtime = get_settings()
+    host = host or runtime.host
+    if runtime.api_key is None and not is_loopback_host(host):
+        logger.warning(NO_AUTH_EXPOSED_WARNING)
     uvicorn.run(
         app,
-        host=host or runtime.host,
+        host=host,
         port=port or runtime.port,
         log_level=runtime.log_level.lower(),
         access_log=False,  # 访问日志由上面的中间件统一输出（带请求 ID），避免重复

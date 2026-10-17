@@ -1,5 +1,7 @@
 /** 后端 API 的类型化客户端。类型与 src/ragbase/api/schemas.py 一一对应；所有路径都在根上（无 /api 前缀）。 */
 
+import { getApiKey, reportHealth, reportUnauthorized } from './auth'
+
 // ---------------------------------------------------------------- 类型
 export interface Scores {
   vec_rank: number | null
@@ -35,6 +37,8 @@ export interface Health {
   llm_protocol: string
   llm_model: string | null
   agent_ready: boolean
+  /** 后端是否启用了接口鉴权（RAG_API_KEY） */
+  auth_required: boolean
 }
 
 export interface DocumentInfo {
@@ -106,6 +110,7 @@ export class ApiError extends Error {
 /** 给聊天区展示的友好文案（错误码来自 HTTP 错误体或 SSE error 事件）；其余情况用后端 detail。 */
 export function describeErrorCode(code: string, detail: string, status = 0): string {
   if (code === 'network') return '网络连接失败，请检查服务是否在运行'
+  if (status === 401 || code === 'unauthorized') return '访问密钥无效或已更换，请在弹出的窗口里重新输入密钥后重试'
   if (status === 503 || code === 'service_unavailable') return '大模型未配置或服务未就绪'
   if (status === 504 || code === 'llm_timeout') return '大模型响应超时，请稍后重试'
   if (status === 502 || code === 'llm_error') return '大模型调用失败，请稍后重试'
@@ -136,14 +141,25 @@ export function networkError(): ApiError {
   return new ApiError(0, 'network', '无法连接服务')
 }
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
+/** 所有 API 请求（含 SSE）的唯一出口：自动带上 Authorization: Bearer <密钥>，401 时清掉失效密钥并重新弹出输入框。
+ * 新增接口请走 request() / apiFetch()，不要直接用 fetch。 */
+export async function apiFetch(path: string, init: RequestInit = {}): Promise<Response> {
+  const key = getApiKey()
+  const headers = new Headers(init.headers)
+  if (key) headers.set('Authorization', `Bearer ${key}`)
   let response: Response
   try {
-    response = await fetch(path, init)
+    response = await fetch(path, { ...init, headers })
   } catch (error) {
     if (error instanceof DOMException && error.name === 'AbortError') throw error
     throw networkError()
   }
+  if (response.status === 401) reportUnauthorized(key)
+  return response
+}
+
+async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const response = await apiFetch(path, init)
   if (!response.ok) throw await errorFromResponse(response)
   return (await response.json()) as T
 }
@@ -157,7 +173,18 @@ function jsonInit(method: string, body?: unknown): RequestInit {
 }
 
 // ---------------------------------------------------------------- 接口
-export const getHealth = () => request<Health>('/health')
+/** 启用鉴权后，没有有效密钥时 /health 只返回 {status, auth_required}：此时上报给鉴权 store（弹出输入框）并抛 401。 */
+export async function getHealth(): Promise<Health> {
+  const sentKey = getApiKey()
+  const response = await apiFetch('/health')
+  if (!response.ok) throw await errorFromResponse(response)
+  const body = (await response.json()) as Partial<Health> & { auth_required?: boolean }
+  const authRequired = Boolean(body.auth_required)
+  const full = 'chunk_count' in body
+  reportHealth({ authRequired, full }, sentKey)
+  if (authRequired && !full) throw new ApiError(401, 'unauthorized', '需要访问密钥')
+  return body as Health
+}
 
 export const getDocuments = () => request<{ documents: DocumentInfo[] }>('/documents').then((r) => r.documents)
 
@@ -172,7 +199,9 @@ export const getJob = (id: string) => request<Job>(`/ingest/jobs/${encodeURIComp
 export function uploadDocument(file: File, onProgress?: (fraction: number) => void): Promise<UploadResult> {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest()
+    const key = getApiKey()
     xhr.open('POST', '/documents')
+    if (key) xhr.setRequestHeader('Authorization', `Bearer ${key}`)
     xhr.responseType = 'json'
     xhr.upload.onprogress = (event) => {
       if (event.lengthComputable) onProgress?.(event.loaded / event.total)
@@ -184,6 +213,7 @@ export function uploadDocument(file: File, onProgress?: (fraction: number) => vo
         resolve(body as unknown as UploadResult)
         return
       }
+      if (xhr.status === 401) reportUnauthorized(key)
       const code = typeof body?.error === 'string' ? body.error : 'http_error'
       const detail = typeof body?.detail === 'string' ? body.detail : `上传失败（${xhr.status}）`
       reject(new ApiError(xhr.status, code, detail))
@@ -204,13 +234,7 @@ export const deleteSession = (id: string) =>
 
 /** 发起流式对话，返回原始 Response（调用方交给 lib/sse.ts 解析）；HTTP 错误（503 / 400 / 422…）在这里抛出。 */
 export async function openChatStream(body: ChatRequest, signal: AbortSignal): Promise<Response> {
-  let response: Response
-  try {
-    response = await fetch('/chat/stream', { ...jsonInit('POST', body), signal })
-  } catch (error) {
-    if (error instanceof DOMException && error.name === 'AbortError') throw error
-    throw networkError()
-  }
+  const response = await apiFetch('/chat/stream', { ...jsonInit('POST', body), signal })
   if (!response.ok) throw await errorFromResponse(response)
   if (!response.body) throw new ApiError(0, 'network', '浏览器不支持流式响应')
   return response

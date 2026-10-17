@@ -8,11 +8,11 @@ import os
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal
 
 from dotenv import load_dotenv
 from pydantic import AliasChoices, Field, SecretStr, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
 def project_home() -> Path:
@@ -114,6 +114,11 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     host: str = "127.0.0.1"
     port: int = Field(8000, ge=1, le=65535)
+    # 接口鉴权：设置后所有 API 请求都要带这把共享密钥（Authorization: Bearer <key> 或 X-API-Key）；留空 = 不鉴权（本机使用）
+    api_key: SecretStr | None = None
+    # 允许跨域访问的前端来源，逗号分隔（如 https://app.example.com,http://localhost:5173）；留空 = 不加 CORS 中间件
+    # NoDecode：环境变量按普通字符串交给下面的 validator 切分，而不是当 JSON 解析
+    cors_origins: Annotated[list[str], NoDecode] = Field(default_factory=list)
 
     # 数据与索引位置（默认都在项目主目录 RAG_HOME 下，即运行目录里的 data/、chroma_db/ 等；测试里指向临时目录）
     data_dir: Path = Field(default_factory=lambda: project_home() / "data")  # 文档目录：POST /documents 上传到这里，POST /ingest 扫描这里
@@ -186,7 +191,14 @@ class Settings(BaseSettings):
     def _blank_to_none(cls, value):
         return (value.strip() or None) if isinstance(value, str) else value
 
-    @field_validator("llm_api_key", "eval_llm_api_key", "qdrant_api_key", mode="before")
+    @field_validator("cors_origins", mode="before")
+    @classmethod
+    def _split_cors_origins(cls, value):
+        if isinstance(value, str):
+            value = value.split(",")
+        return [item.strip().rstrip("/") for item in value if isinstance(item, str) and item.strip()]
+
+    @field_validator("api_key", "llm_api_key", "eval_llm_api_key", "qdrant_api_key", mode="before")
     @classmethod
     def _blank_secret_to_none(cls, value):
         return (value.strip() or None) if isinstance(value, str) else value

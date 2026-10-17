@@ -38,7 +38,7 @@ src/ragbase/
   vectorstores/                向量库抽象（base）、chroma、qdrant、factory（按 RAG_VECTOR_STORE 创建）、migrate（后端间迁移）
   retrieval/                   hybrid（向量 + BM25 + RRF）、pipeline（召回 -> 精排 -> 拒答 -> 生成）、labels（来源标签）
   agent/                       tools（检索工具与引用登记）、service（对话 Agent 与会话）
-  api/                         app（FastAPI 应用，ragbase.api.app:app）、schemas
+  api/                         app（FastAPI 应用，ragbase.api.app:app）、schemas、auth（API Key 鉴权）
   evaluation/                  runner（评测流程）、metrics（Ragas 与词面指标）
 scripts/                       一次性脚本（如拒答阈值校准）
 tests/                         断言脚本式单元测试（tests/run_all.py 一次运行全部）
@@ -351,6 +351,8 @@ curl -s -X DELETE 'http://127.0.0.1:8000/documents/新教材.pdf'
 | `RAG_CHAT_SESSION_TTL` | `3600` | 会话空闲多少秒后过期 |
 | `RAG_LOG_LEVEL` | `INFO` | 日志级别 |
 | `RAG_HOST` / `RAG_PORT` | `127.0.0.1` / `8000` | `ragbase serve` 的监听地址 |
+| `RAG_API_KEY` | 无（不鉴权） | 接口共享密钥；设置后所有 API 请求都要带它，见“接口鉴权” |
+| `RAG_CORS_ORIGINS` | 无（不加 CORS） | 允许跨域的前端来源，逗号分隔，见“接口鉴权” |
 
 **大模型配置**（`llm_protocol` 目前只实现 `openai`，即 OpenAI 兼容的 `/chat/completions`；新增协议只需在 [src/ragbase/llm/factory.py](src/ragbase/llm/factory.py) 里加一个分支）：
 
@@ -429,6 +431,48 @@ curl -s -X DELETE http://127.0.0.1:8000/chat/sessions/demo
 - **尚未用真实大模型验证**：单元测试用脚本化的假模型；豆包 / 其他 OpenAI 兼容服务需支持 `tools` / `tool_calls`，这是假设，未验证。
 - 流式 `token` 是模型每次生成的文本增量；若模型在调用工具前先说了一句话，这句话也会出现在 token 流里，以 `done.answer` 为准。
 - 单元测试：`uv run python tests/test_agent.py`（假检索 + 假模型，不调用真实大模型）。
+
+## 接口鉴权
+
+本产品**没有用户体系**，只有一把静态共享密钥：设置 `RAG_API_KEY` 后，所有 API 请求都必须带上它；不设置（或留空）则不鉴权，行为与之前完全一致，适合本机使用。
+
+```bash
+# .env 或环境变量
+RAG_API_KEY=换成一串足够长的随机字符串     # 如：openssl rand -hex 32
+uv run ragbase serve --host 0.0.0.0        # 对外暴露时务必设置密钥（否则启动日志会警告）
+```
+
+请求头两种写法等价（同时带时任一匹配即可）：
+
+```bash
+curl -H "Authorization: Bearer $RAG_API_KEY" -X POST localhost:8000/search -H 'Content-Type: application/json' -d '{"query":"挣值分析"}'
+curl -H "X-API-Key: $RAG_API_KEY" localhost:8000/documents
+curl -N -H "Authorization: Bearer $RAG_API_KEY" -X POST localhost:8000/chat/stream -H 'Content-Type: application/json' -d '{"message":"你好"}'
+```
+
+缺少或错误的密钥返回 `401`，响应头带 `WWW-Authenticate: Bearer`，响应体是统一错误格式 `{"error":"unauthorized","detail":"..."}`；`/chat/stream` 在开始流式前就被拒绝，大文件上传在读取请求体前就被拒绝。
+
+**无需密钥的路径**（只限 GET / HEAD）：
+
+| 路径 | 说明 |
+| --- | --- |
+| `/`、`/library`、`/c/{id}`、`/assets/*` | 前端页面与静态资源（里面没有数据，数据都走受保护的接口） |
+| `/docs`、`/redoc`、`/openapi.json` | 交互文档与接口描述（不含密钥） |
+| `/health` | 没有有效密钥时只返回 `{"status": "...", "auth_required": true}`（存活探针 / 让前端知道要输入密钥）；带有效密钥返回完整内容；未启用鉴权时返回完整内容和 `"auth_required": false` |
+
+其余一切（`/search`、`/ask`、`/chat*`、`/documents*`、`/ingest*`，以及以后新增的任何路由）默认都需要密钥：鉴权是“默认拒绝 + 显式公开白名单”（[src/ragbase/api/auth.py](src/ragbase/api/auth.py)），不会因为忘了给新路由加依赖而裸奔。命令行（`ragbase ask` / `ingest` 等）在进程内直接运行，不经过 HTTP，不需要密钥。
+
+**Web 界面**：打开页面时若服务要求密钥，会弹出“需要访问密钥”对话框；密钥通过 `/health` 校验后保存在浏览器 localStorage（`ragbase.apiKey`），之后每个请求（含流式对话和上传）自动带上。任何请求返回 401（如密钥被更换）都会清掉本地密钥并重新弹出对话框，输入框里未发送的文字不受影响；右上角状态指示的弹层里有“更换密钥”。
+
+**CORS**：默认不加 CORS 中间件（前端与 API 同源托管，不需要）。前端部署在别的域名时设置 `RAG_CORS_ORIGINS=https://app.example.com,http://localhost:5173`（逗号分隔），服务会允许这些来源携带 `Authorization` / `X-API-Key` / `Content-Type` 头访问，并暴露 `X-Request-ID`；预检请求不需要密钥。
+
+安全说明：
+- 密钥是明文共享的 Bearer 令牌：对外暴露时务必放在 HTTPS 反向代理（nginx / Caddy 等）后面，否则密钥会在网络上明文传输。
+- 比较使用常量时间算法；服务不会把密钥或请求头里的值写进日志或错误响应。注意反向代理自己的访问日志不要记录 `Authorization` 头。
+- 密钥保存在浏览器 localStorage，同源页面里的脚本可读取——不要在同一域名下托管不可信的页面。
+- 轮换密钥：修改环境变量 / `.env` 里的 `RAG_API_KEY` 后重启服务（会话在内存里，重启会丢失）；旧密钥立即失效，浏览器端下次请求收到 401 后会提示重新输入。
+- 没有限流、没有按人区分的审计：它只解决“别让没拿到密钥的人用你的服务”，不是完整的用户权限系统。
+- 单元测试：`uv run python tests/test_auth.py`。
 
 ## Web 界面
 

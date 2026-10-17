@@ -177,6 +177,7 @@ def test_health_ok():
         "device": "cpu", "mode": "hybrid", "llm_configured": True, "vector_store": "chroma",
         "llm_protocol": "openai", "llm_model": "test-model",
         "agent_ready": False,  # 测试配置没有 base_url -> 大模型未配齐 -> 对话 Agent 未启用
+        "auth_required": False,  # 未设置 RAG_API_KEY
     }, body
 
 

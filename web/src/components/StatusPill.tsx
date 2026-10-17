@@ -1,5 +1,8 @@
+import { Button } from '@/components/ui/button'
 import { useHealth } from '@/hooks/queries'
-import type { Health } from '@/lib/api'
+import { useAuth } from '@/hooks/useAuth'
+import { ApiError, type Health } from '@/lib/api'
+import { replaceKey } from '@/lib/auth'
 import { relativeTime } from '@/lib/time'
 import { cn } from '@/lib/utils'
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
@@ -14,7 +17,8 @@ const DOT: Record<Tone, string> = {
   idle: 'bg-muted-foreground/50',
 }
 
-function summarize(health: Health | undefined, offline: boolean): { tone: Tone; label: string } {
+function summarize(health: Health | undefined, offline: boolean, locked: boolean): { tone: Tone; label: string } {
+  if (locked) return { tone: 'warn', label: '需要密钥' }
   if (offline) return { tone: 'bad', label: '离线' }
   if (!health) return { tone: 'idle', label: '检测中' }
   if (health.status === 'ok' && health.agent_ready) return { tone: 'ok', label: '就绪' }
@@ -32,8 +36,10 @@ function Row({ label, children }: { label: string; children: React.ReactNode }) 
 }
 
 export function StatusPill() {
-  const { data, isError } = useHealth()
-  const { tone, label } = summarize(data, isError)
+  const { data, isError, error } = useHealth()
+  const auth = useAuth()
+  const locked = error instanceof ApiError && error.status === 401 // 启用了鉴权但没有有效密钥
+  const { tone, label } = summarize(data, isError, locked)
   const health = isError ? undefined : data
 
   return (
@@ -70,8 +76,20 @@ export function StatusPill() {
           </dl>
         ) : (
           <p className="text-muted-foreground">
-            {isError ? '无法连接后端服务。请确认已启动：uv run ragbase serve（默认端口 8000）。' : '正在检测服务状态…'}
+            {locked
+              ? '服务启用了访问保护，请输入访问密钥后查看状态。'
+              : isError
+                ? '无法连接后端服务。请确认已启动：uv run ragbase serve（默认端口 8000）。'
+                : '正在检测服务状态…'}
           </p>
+        )}
+        {auth.required && !locked && (
+          <div className="mt-3 flex items-center justify-between gap-3 border-t border-border/70 pt-3">
+            <span className="text-xs text-muted-foreground">已通过密钥认证</span>
+            <Button type="button" variant="outline" size="xs" onClick={replaceKey}>
+              更换密钥
+            </Button>
+          </div>
         )}
         {health && health.status === 'ok' && !health.agent_ready && (
           <p className="mt-2 text-xs text-muted-foreground">大模型未配置，只能检索，暂不能对话。</p>
