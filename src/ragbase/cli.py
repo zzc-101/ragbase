@@ -84,7 +84,7 @@ def _cmd_doctor(args) -> None:
         raise SystemExit(code)
 
 
-# ---------------------------------------------------------------- serve（原 python api.py）
+# ---------------------------------------------------------------- serve
 
 def _ensure_models_for_serve(settings, download: bool) -> None:
     """启动服务前确认本地模型已缓存：缺失时给出明确提示后退出，而不是在加载模型时抛出一长串 traceback。
@@ -149,7 +149,7 @@ def _cmd_serve(args) -> None:
     serve(host=args.host, port=args.port)
 
 
-# ---------------------------------------------------------------- ingest（原 ingest_incremental.py / ingest.py）
+# ---------------------------------------------------------------- ingest
 
 class LazyEmbedder:
     """第一次真正需要向量化时才创建 embedding（本地模型加载较慢；云端只是建客户端），没有变化时不必等。"""
@@ -306,7 +306,7 @@ def _cmd_migrate_store(args) -> None:
     print(f"现在把 RAG_VECTOR_STORE={target_name} 写进 .env 并重启服务即可使用新的向量库。")
 
 
-# ---------------------------------------------------------------- ask（原 query.py）
+# ---------------------------------------------------------------- ask
 
 def _cmd_ask(args) -> None:
     from ragbase.ingest.common import collection_count
@@ -375,7 +375,7 @@ def _cmd_ask(args) -> None:
                 print(f"[片段{number}] {source_label(doc.metadata)}")
 
 
-# ---------------------------------------------------------------- chat（原 chat.py）
+# ---------------------------------------------------------------- chat
 
 def _args_text(args: dict) -> str:
     return ", ".join(f"{key}={json.dumps(value, ensure_ascii=False)}" for key, value in args.items())
@@ -462,7 +462,7 @@ def _cmd_chat(args) -> None:
             run_turn(service, session_id, message[:2000], sources)  # 与 POST /chat 的 message 上限一致
 
 
-# ---------------------------------------------------------------- eval（原 evaluate.py）
+# ---------------------------------------------------------------- eval
 
 def _cmd_eval(args) -> None:
     from ragbase.evaluation.runner import run

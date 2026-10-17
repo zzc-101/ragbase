@@ -8,6 +8,10 @@ __pycache__/
 *.pyc
 .venv/
 .ingest_meta.json
+.ingest_meta.tmp
+# 索引的 embedding 签名（ragbase ingest 生成，与索引一一对应）
+.index_info.json
+.index_info.tmp
 .DS_Store
 .ragas_cache/
 .bm25_cache/
@@ -19,6 +23,7 @@ data/*
 # 评估结果
 eval_results.json
 eval_results.*.json
+eval_results*.tmp
 
 # Web 前端
 web/node_modules/

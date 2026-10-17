@@ -12,6 +12,9 @@ chroma_db
 qdrant_db
 ragbase-home
 .ingest_meta.json
+.ingest_meta.tmp
+.index_info.json
+.index_info.tmp
 .bm25_cache
 .ragas_cache
 eval_results*.json
@@ -24,6 +27,7 @@ web/node_modules
 web/dist
 src/ragbase/web
 
-# 测试 / 文档类大文件
+# 测试 / 文档类大文件（docs/ 不进镜像；README.md 要保留：pyproject.toml 的 readme 引用它）
 tests
+docs
 RAG知识库-设计方案.md

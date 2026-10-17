@@ -207,8 +207,10 @@ class Settings(BaseSettings):
     qdrant_api_key: SecretStr | None = None  # Qdrant 服务端的 API Key（可选）
 
     # 大模型（默认 OpenAI 兼容协议）：RAG_LLM_*，未设置时回退到旧的 ARK_* 变量名（方舟，同为 OpenAI 兼容）。
-    # 注意：validation_alias 会绕过 env_prefix，所以两个名字都要写全；环境变量里先出现的别名优先，
-    # 但“环境变量里的 ARK_*”仍高于“.env 里的 RAG_LLM_*”（pydantic-settings 按来源分层，环境变量整体优先于 .env）。
+    # 注意：validation_alias 会绕过 env_prefix，所以两个名字都要写全；AliasChoices 里靠前的别名优先。
+    # pydantic-settings 按来源分层（环境变量整体优先于 .env），所以直接构造 Settings() 时 shell 里的 ARK_* 会压过 .env 里的 RAG_LLM_*；
+    # 但命令行入口和 ragbase.ingest.common 会先 load_env()，把 .env 灌进 os.environ（不覆盖已有变量），
+    # 此时两套名字都在环境变量这一层，RAG_LLM_* 总是优先于 ARK_*（见 docs/configuration.md“优先级”）。
     llm_protocol: Literal["openai"] = "openai"  # 新增协议（如 anthropic）：这里加字面量 + llm.factory 加一个分支
     llm_base_url: str | None = Field(None, validation_alias=AliasChoices("RAG_LLM_BASE_URL", "ARK_BASE_URL"))
     llm_api_key: SecretStr | None = Field(None, validation_alias=AliasChoices("RAG_LLM_API_KEY", "ARK_CHAT_API_KEY"))
@@ -257,7 +259,7 @@ class Settings(BaseSettings):
     def _blank_api_url_to_none(cls, value):
         return (value.strip() or None) if isinstance(value, str) else value
 
-    @field_validator("embedding_dimensions", "embedding_timeout", "embedding_max_retries", "reranker_timeout", "reranker_max_retries", "index_info_file", mode="before")
+    @field_validator("embedding_dimensions", "embedding_timeout", "embedding_max_retries", "reranker_timeout", "reranker_max_retries", "index_info_file", "llm_max_tokens", mode="before")
     @classmethod
     def _blank_number_to_none(cls, value):
         return (value.strip() or None) if isinstance(value, str) else value

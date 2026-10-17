@@ -172,7 +172,7 @@ def check_device(settings: Settings) -> list[Check]:
         return [Check(FAIL, f"无法探测计算设备：{type(exc).__name__}: {exc}", "重新安装依赖：uv sync --locked")]
     source = f"RAG_DEVICE={settings.device}" if settings.device != "auto" else "自动选择"
     if device == "cpu":
-        return [Check(WARN, f"计算设备：cpu（{source}）", "纯 CPU 可以运行，但精排（rerank）较慢，每个问题可能多等数秒；有 Apple Silicon（MPS）或 NVIDIA GPU（CUDA）会快很多，也可改用云端 embedding / reranker（见 README“模型配置”）")]
+        return [Check(WARN, f"计算设备：cpu（{source}）", "纯 CPU 可以运行，但精排（rerank）较慢，每个问题可能多等数秒；有 Apple Silicon（MPS）或 NVIDIA GPU（CUDA）会快很多，也可改用云端 embedding / reranker（见 docs/models.md）")]
     return [Check(OK, f"计算设备：{device}（{source}）")]
 
 
