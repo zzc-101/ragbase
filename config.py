@@ -98,6 +98,13 @@ class Settings(BaseSettings):
     llm_timeout: float = Field(60, gt=0)  # 单次请求超时（秒）
     llm_max_retries: int = Field(2, ge=0)  # 超时 / 连接错误 / 429 / 5xx 的自动重试次数（指数退避）
 
+    # 对话 Agent（POST /chat）：会话只存在进程内存里，重启即丢
+    agent_max_tool_calls: int = Field(4, ge=1)  # 每轮用户消息最多调用几次工具（超出后工具被拒绝，模型只能据已有结果作答）
+    agent_max_model_calls: int = Field(6, ge=2)  # 每轮用户消息最多调用几次大模型（超出后直接结束并返回提示）
+    chat_history_turns: int = Field(10, ge=1)  # 每个会话保留最近几轮对话（一轮 = 一条用户消息及其全部回复 / 工具消息）
+    chat_max_sessions: int = Field(200, ge=1)  # 内存中最多保留的会话数，超出时淘汰最久未使用的空闲会话
+    chat_session_ttl: float = Field(3600, gt=0)  # 会话空闲多少秒后过期（秒）
+
     # 评测裁判（evaluate.py 的 ragas 与中文裁判）可单独指定模型；留空则沿用上面的回答模型配置
     eval_llm_base_url: str | None = None
     eval_llm_api_key: SecretStr | None = None

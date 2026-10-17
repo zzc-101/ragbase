@@ -139,7 +139,7 @@ def _pipeline(scores=((0, 0.99), (1, 0.96), (2, 0.5)), chain=True, retriever=Non
 
 def _settings(**overrides):
     values = dict(
-        device="cpu", log_level="WARNING", llm_api_key="sk-test-FAKE-KEY", llm_model="test-model",
+        device="cpu", log_level="WARNING", llm_api_key="sk-test-FAKE-KEY", llm_model="test-model", llm_base_url=None,  # None：不受环境变量影响
         data_dir=SCRATCH / "default-data", db_dir=SCRATCH / "default-chroma",
         meta_file=SCRATCH / "default-meta.json", cache_dir=SCRATCH / "default-cache",
     )
@@ -179,6 +179,7 @@ def test_health_ok():
         "bm25_built_at": "2025-10-09T08:53:20+00:00", "bm25_chunk_count": 6408,
         "device": "cpu", "mode": "hybrid", "llm_configured": True,
         "llm_protocol": "openai", "llm_model": "test-model",
+        "agent_ready": False,  # 测试配置没有 base_url -> 大模型未配齐 -> 对话 Agent 未启用
     }, body
 
 

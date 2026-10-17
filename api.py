@@ -6,10 +6,14 @@
 多 worker 会让每个进程各占一份模型显存，且 MPS 模型本身不能并发推理——
 并发请求由线程池接住，召回 + 精排在 pipeline.lock 内串行，大模型生成在锁外并行。
 
+对话 Agent（POST /chat、POST /chat/stream、GET|DELETE /chat/sessions/{id}）见 chat_agent.py：模型按需调用知识库检索工具，
+历史按会话保存在进程内存里；检索仍走 pipeline.lock，同会话的请求串行。
+
 文档管理（POST /documents、POST /ingest、DELETE /documents/{name}）也在本进程内完成：
 入库任务在后台线程里跑（同一时刻只有一个），每个批次单独持有 pipeline.lock，批间释放，/search 可以插进来；
 任务结束后重建 BM25 快照并原子替换。命令行 ingest.py（会删除整个 chroma_db）不能和服务同时运行。
 """
+import json
 import logging
 import os
 import re
@@ -20,14 +24,17 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import uvicorn
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, HTTPException, Path as PathParam, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from api_schemas import (
+    SESSION_ID_PATTERN,
     AskRequest,
     AskResponse,
+    ChatRequest,
+    ChatResponse,
     DeleteResponse,
     DocumentInfo,
     DocumentsResponse,
@@ -36,10 +43,13 @@ from api_schemas import (
     JobResponse,
     SearchRequest,
     SearchResponse,
+    SessionDeleteResponse,
+    SessionResponse,
     UploadResponse,
     to_chunk,
     to_citation,
 )
+from chat_agent import ChatService, build_chat_service
 from config import Settings, get_settings
 from document_parser import LEGACY_EXTS, SUPPORTED_EXTS, sanitize_filename
 from ingest_jobs import IngestJobManager, JobRunningError, progress_handler
@@ -79,6 +89,11 @@ def default_pipeline_factory(settings: Settings) -> RAGPipeline:
     """真实流水线：加载本地模型；BM25 索引始终构建，以便按请求切换召回模式。"""
     pipeline, _ = build_pipeline(settings=settings, build_bm25=True)
     return pipeline
+
+
+def default_chat_factory(pipeline: RAGPipeline, settings: Settings) -> ChatService | None:
+    """真实对话 Agent：大模型未配置时为 None（/chat 返回 503）。"""
+    return build_chat_service(pipeline, settings)
 
 
 def default_ingest_fn(pipeline: RAGPipeline, settings: Settings, progress):
@@ -123,6 +138,17 @@ def _check_mode(pipeline: RAGPipeline, mode: str | None, settings: Settings) -> 
     effective = mode or settings.mode
     if effective != "vector" and not _bm25_ready(pipeline):
         raise HTTPException(status_code=400, detail=f"服务未构建 BM25 索引，不支持 mode={effective}")
+
+
+def _generation_http_error(exc: GenerationError) -> HTTPException:
+    """大模型失败 -> 与 /ask 相同的状态码：超时 504，其余 502（完整异常只进日志，响应里只给固定提示）。"""
+    if exc.timeout:
+        return HTTPException(status_code=504, detail=LLM_TIMEOUT_MESSAGE)
+    return HTTPException(status_code=502, detail=LLM_FAILED_MESSAGE)
+
+
+def _sse(event: str, data: dict) -> str:
+    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
 def _score_text(score: float | None) -> str:
@@ -173,12 +199,13 @@ def _save_upload(upload: UploadFile, directory: Path, max_bytes: int, limit_mb: 
     return temporary
 
 
-def create_app(pipeline_factory=None, settings: Settings | None = None, ingest_fn=None) -> FastAPI:
-    """应用工厂。pipeline_factory(settings) -> RAGPipeline、ingest_fn(pipeline, settings, progress) -> IngestResult，
-    测试里可注入假实现避免加载模型 / 真实入库。"""
+def create_app(pipeline_factory=None, settings: Settings | None = None, ingest_fn=None, chat_factory=None) -> FastAPI:
+    """应用工厂。pipeline_factory(settings) -> RAGPipeline、ingest_fn(pipeline, settings, progress) -> IngestResult、
+    chat_factory(pipeline, settings) -> ChatService | None，测试里可注入假实现避免加载模型 / 真实入库 / 调用大模型。"""
     settings = settings or get_settings()
     pipeline_factory = pipeline_factory or default_pipeline_factory
     ingest_fn = ingest_fn or default_ingest_fn
+    chat_factory = chat_factory or default_chat_factory
     setup_logging(settings.log_level)
     max_upload_bytes = settings.max_upload_mb * 1024 * 1024
     jobs = IngestJobManager()
@@ -186,6 +213,7 @@ def create_app(pipeline_factory=None, settings: Settings | None = None, ingest_f
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         app.state.pipeline = None
+        app.state.chat = None
         count = collection_count(str(settings.db_dir))
         if settings.data_dir.is_dir():
             for leftover in settings.data_dir.glob(".upload-*.tmp"):  # 上次上传中途崩溃留下的临时文件
@@ -196,11 +224,15 @@ def create_app(pipeline_factory=None, settings: Settings | None = None, ingest_f
             start = time.perf_counter()
             app.state.pipeline = pipeline_factory(settings)
             logger.info("流水线就绪：%d 个片段，启动加载用时 %.1fs", count, time.perf_counter() - start)
+            app.state.chat = chat_factory(app.state.pipeline, settings)
+            if app.state.chat is None:
+                logger.warning("大模型未配置，对话 Agent 未启用（/chat 返回 503）")
         yield
 
     app = FastAPI(title="RAG 服务", version="0.1.0", lifespan=lifespan)
     app.state.settings = settings
     app.state.pipeline = None
+    app.state.chat = None
     app.state.jobs = jobs
 
     def _reject_oversized_upload(request: Request):
@@ -267,6 +299,7 @@ def create_app(pipeline_factory=None, settings: Settings | None = None, ingest_f
             ),
             llm_protocol=settings.llm_protocol,
             llm_model=settings.llm_model,  # 模型名不是密钥
+            agent_ready=request.app.state.chat is not None,
         )
 
     @app.post(
@@ -336,6 +369,83 @@ def create_app(pipeline_factory=None, settings: Settings | None = None, ingest_f
             citations=[to_citation(n, doc) for n, doc in enumerate(result.docs, 1)],
             took_ms=round((time.perf_counter() - start) * 1000, 1),
         )
+
+    def _get_chat(request: Request) -> ChatService:
+        _get_pipeline(request)  # 索引缺失 -> 503
+        service = request.app.state.chat
+        if service is None:
+            raise HTTPException(status_code=503, detail=LLM_MISSING_MESSAGE)
+        return service
+
+    @app.post("/chat", response_model=ChatResponse, responses=error_models)
+    def chat(body: ChatRequest, request: Request):
+        """多轮对话：Agent 按需调用知识库工具（检索 / 列书目）后回答；session_id 相同的请求共享历史，同会话的请求串行处理。"""
+        service = _get_chat(request)
+        sources = _check_sources(request.app.state.pipeline, body.sources)
+        session_id = body.session_id or uuid.uuid4().hex
+        start = time.perf_counter()
+        try:
+            result = service.chat(session_id, body.message, sources)
+        except GenerationError as exc:
+            logger.exception("对话模型调用失败")
+            raise _generation_http_error(exc) from exc
+        request.state.log_extra = f" session={session_id} tools={len(result.tool_calls)}" + _sources_log(sources)
+        return ChatResponse(
+            session_id=session_id,
+            answer=result.answer,
+            citations=[to_citation(n, doc) for n, doc in result.citations],
+            tool_calls=result.tool_calls,
+            took_ms=round((time.perf_counter() - start) * 1000, 1),
+        )
+
+    @app.post("/chat/stream", responses={**error_models, 200: {"content": {"text/event-stream": {}}}})
+    def chat_stream(body: ChatRequest, request: Request):
+        """同 /chat，但以 Server-Sent Events 流式返回。事件：session、tool_call、token、citations、done、error。
+
+        校验类错误（400 / 422 / 503）在开始流式之前以普通 JSON 返回；流式过程中的错误以 error 事件发出（data 同统一错误 JSON）。
+        """
+        service = _get_chat(request)
+        sources = _check_sources(request.app.state.pipeline, body.sources)
+        session_id = body.session_id or uuid.uuid4().hex
+        request.state.log_extra = f" session={session_id}" + _sources_log(sources)
+
+        def events():  # 同步生成器：Starlette 在线程池里迭代它，所以阻塞的 agent 流不会卡住事件循环
+            start = time.perf_counter()
+            try:
+                for event, data in service.stream(session_id, body.message, sources):
+                    if event == "citations":
+                        data = {"citations": [to_citation(n, doc).model_dump() for n, doc in data["citations"]]}
+                    elif event == "done":
+                        data = {**data, "took_ms": round((time.perf_counter() - start) * 1000, 1)}
+                    yield _sse(event, data)
+            except GenerationError as exc:
+                logger.exception("对话模型调用失败")
+                error = _generation_http_error(exc)
+                yield _sse("error", {"error": ERROR_CODES[error.status_code], "detail": error.detail})
+            except Exception:
+                logger.exception("对话流处理失败")
+                yield _sse("error", {"error": "internal_error", "detail": INTERNAL_ERROR_MESSAGE})
+
+        return StreamingResponse(
+            events(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    @app.get("/chat/sessions/{session_id}", response_model=SessionResponse, responses=error_models)
+    def get_chat_session(request: Request, session_id: str = PathParam(pattern=SESSION_ID_PATTERN)):
+        """会话的消息历史（用户 / 助手 / 工具；工具消息只给摘要）。会话不存在、已清空或已过期返回 404。"""
+        messages = _get_chat(request).history(session_id)
+        if messages is None:
+            raise HTTPException(status_code=404, detail=f"没有这个会话：{session_id}")
+        return SessionResponse(session_id=session_id, messages=messages)
+
+    @app.delete("/chat/sessions/{session_id}", response_model=SessionDeleteResponse, responses=error_models)
+    def delete_chat_session(request: Request, session_id: str = PathParam(pattern=SESSION_ID_PATTERN)):
+        """清空会话历史（等该会话正在处理的请求结束后执行）。"""
+        if not _get_chat(request).delete(session_id):
+            raise HTTPException(status_code=404, detail=f"没有这个会话：{session_id}")
+        return SessionDeleteResponse(session_id=session_id, deleted=True)
 
     def _ingest_runner(pipeline: RAGPipeline):
         """后台任务体：入库 -> 有变化则重建 BM25 快照（原子替换）-> 有文件失败则整体标记 failed。"""

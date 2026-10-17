@@ -1,11 +1,12 @@
 """API 的请求 / 响应模型。"""
 import os
-from typing import Literal
+from typing import Any, Literal
 
 from langchain_core.documents import Document
 from pydantic import BaseModel, ConfigDict, Field
 
 Mode = Literal["vector", "bm25", "hybrid"]
+SESSION_ID_PATTERN = r"^[A-Za-z0-9_-]{1,64}$"  # 会话 ID：只接受安全字符（会进日志 / URL）
 
 
 class Scores(BaseModel):
@@ -83,6 +84,44 @@ class AskResponse(BaseModel):
     took_ms: float
 
 
+class ChatRequest(SourcesField):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    session_id: str | None = Field(
+        None, pattern=SESSION_ID_PATTERN, description="会话 ID（字母 / 数字 / _ / -，最长 64）；不传则新建并在响应里返回"
+    )
+    message: str = Field(min_length=1, max_length=2000, description="用户消息（首尾空白会被去掉，不能为空）")
+
+
+class ToolCallInfo(BaseModel):
+    name: str = Field(description="工具名：search_knowledge / list_documents")
+    args: dict[str, Any] = Field(description="模型传给工具的参数")
+
+
+class ChatResponse(BaseModel):
+    session_id: str
+    answer: str
+    citations: list[Citation] = Field(description="回答里实际标注了 [n] 的片段；n 与回答中的 [n] 一致（可能不连续），只对本轮回答有效")
+    tool_calls: list[ToolCallInfo] = Field(description="本轮模型调用过的工具（按顺序）")
+    took_ms: float
+
+
+class SessionMessage(BaseModel):
+    role: Literal["user", "assistant", "tool"]
+    content: str = Field(description="工具消息只给前 80 字的摘要")
+    tool_calls: list[ToolCallInfo] | None = Field(None, description="助手消息发起的工具调用")
+
+
+class SessionResponse(BaseModel):
+    session_id: str
+    messages: list[SessionMessage]
+
+
+class SessionDeleteResponse(BaseModel):
+    session_id: str
+    deleted: bool
+
+
 class HealthResponse(BaseModel):
     status: Literal["ok", "not_ready"]
     chunk_count: int | None = Field(description="索引片段数，索引不存在为 null")
@@ -94,6 +133,7 @@ class HealthResponse(BaseModel):
     llm_configured: bool
     llm_protocol: str = Field(description="大模型协议（RAG_LLM_PROTOCOL），目前只有 openai")
     llm_model: str | None = Field(description="回答模型名（RAG_LLM_MODEL）；未配置为 null")
+    agent_ready: bool = Field(description="对话 Agent（/chat）是否就绪；大模型未配置或索引缺失时为 false")
 
 
 class DocumentInfo(BaseModel):

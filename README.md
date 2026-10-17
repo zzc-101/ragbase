@@ -198,7 +198,7 @@ uv run uvicorn api:app --host 127.0.0.1 --port 8000   # 或：uv run api.py（�
 
 | 接口 | 说明 |
 | --- | --- |
-| `GET /health` | `status`（`ok` / `not_ready`）、`chunk_count`、`bm25_ready`、`bm25_built_at`（当前 BM25 索引的构建时间，UTC）、`bm25_chunk_count`（BM25 覆盖的片段数，与 `chunk_count` 不同说明刷新未完成）、`device`、`mode`、`llm_configured`、`llm_protocol`、`llm_model`（模型名，不含密钥） |
+| `GET /health` | `status`（`ok` / `not_ready`）、`chunk_count`、`bm25_ready`、`bm25_built_at`（当前 BM25 索引的构建时间，UTC）、`bm25_chunk_count`（BM25 覆盖的片段数，与 `chunk_count` 不同说明刷新未完成）、`device`、`mode`、`llm_configured`、`llm_protocol`、`llm_model`（模型名，不含密钥）、`agent_ready`（对话 Agent 是否就绪） |
 | `POST /search` | 召回 + 精排，不调用大模型 |
 | `POST /ask` | 召回 + 精排 + 大模型回答；得分过低时拒答且不调用大模型 |
 | `GET /documents` | 已入库的文档：`name`、`chunk_count`、`heading_chunks`、`has_headings`（按 `source` 的文件名汇总，旧版索引同样可用） |
@@ -288,6 +288,11 @@ curl -s -X DELETE 'http://127.0.0.1:8000/documents/新教材.pdf'
 | `RAG_DATA_DIR` / `RAG_DB_DIR` | 仓库内 `data/` / `chroma_db/` | 文档目录 / Chroma 持久化目录（命令行脚本和服务共用） |
 | `RAG_META_FILE` / `RAG_CACHE_DIR` | 仓库内 `.ingest_meta.json` / `.bm25_cache/` | 入库元数据文件 / BM25 分词缓存目录 |
 | `RAG_MAX_UPLOAD_MB` | `300` | `POST /documents` 单文件大小上限 |
+| `RAG_AGENT_MAX_TOOL_CALLS` | `4` | 对话 Agent 每轮用户消息最多调用几次工具 |
+| `RAG_AGENT_MAX_MODEL_CALLS` | `6` | 对话 Agent 每轮用户消息最多调用几次大模型（至少 2） |
+| `RAG_CHAT_HISTORY_TURNS` | `10` | 每个会话保留最近几轮对话 |
+| `RAG_CHAT_MAX_SESSIONS` | `200` | 内存中最多保留的会话数 |
+| `RAG_CHAT_SESSION_TTL` | `3600` | 会话空闲多少秒后过期 |
 | `RAG_LOG_LEVEL` | `INFO` | 日志级别 |
 | `RAG_HOST` / `RAG_PORT` | `127.0.0.1` / `8000` | `uv run api.py` 的监听地址 |
 
@@ -324,6 +329,49 @@ RAG_EVAL_LLM_MODEL=gpt-4o
 - 运行全部单元测试：`uv run python tests/run_all.py`（每个 `tests/test_*.py` 一个子进程，打印各自汇总行，任一失败则非零退出；可带文件名片段只跑部分，如 `run_all.py llm api`）。CI：`.github/workflows/tests.yml`（push / PR 到 main 时在 ubuntu 上用 CPU 版 torch 跑同一个脚本）。
 - 单元测试（均不加载模型、不碰真实数据，网络只访问本机 127.0.0.1 的桩服务）：`uv run python tests/test_api.py`（假流水线 / 假入库，另有用临时 Chroma 的端到端用例）、`tests/test_ingest_service.py`（临时目录 + 假 embedding）、`tests/test_sources.py`（按书过滤、快照刷新、分词缓存）、`tests/test_toc.py`（用 fitz 生成带书签的 PDF）、`tests/test_config.py`、`tests/test_llm.py`（本机 OpenAI 兼容桩服务：参数透传、5xx 重试、超时 -> 504、`/ask` 端到端）、`tests/test_parser.py`（临时生成的 PDF / DOCX / GB18030 文本）。
 - 依赖：文件上传需要 `python-multipart`（已加入 `requirements.txt` / `requirements.lock`，旧环境请重新执行 `uv pip sync requirements.lock`）。
+
+## 对话 Agent
+
+在 `/ask`（单轮、固定流程）之外，新增多轮对话 Agent（Stage 4）：由大模型决定是否检索、检索什么，再带 `[n]` 引用作答。`/ask` 不受影响。
+
+```text
+用户消息 → Agent（create_agent，LangGraph）─┬→ search_knowledge(query, sources?) → 召回 + 精排 + 拒答 / 上下文过滤（同 /ask）
+                                           ├→ list_documents()                  → 书目与片段数
+                                           └→ 最终回答（[n] 引用）
+会话历史：InMemorySaver，thread_id = session_id
+```
+
+- 代码：[agent_tools.py](agent_tools.py)（工具与引用登记表）、[chat_agent.py](chat_agent.py)（Agent、会话、限制）、[chat.py](chat.py)（命令行）。
+- **多轮改写**不单独做一步：工具描述要求模型把 `query` 写成自包含的完整问题（补全代词 / 省略）；检索直接用它。
+- **引用**：一轮用户消息内模型可能多次检索，片段编号全轮唯一、同一 `chunk_id` 编号不变（登记表走 LangGraph 运行时上下文）；响应的 `citations` 只含回答里实际标注了 `[n]` 的片段（`n` 可能不连续，只对本轮有效，下一轮重新编号）。
+- **限制**：每轮工具调用上限（超出后工具被拒绝，模型据已有结果作答）、每轮模型调用上限（超出后直接结束并提示）；历史只保留最近 `RAG_CHAT_HISTORY_TURNS` 轮（整轮裁剪，不额外调用大模型做摘要）；同一会话的请求串行；失败 / 断开的那一轮会回滚。
+- 大模型未配置时 `agent_ready=false`，对话接口返回 503；大模型超时 / 失败沿用 504 / 502。
+
+| 接口 | 说明 |
+| --- | --- |
+| `POST /chat` | `{session_id?, message, sources?}` → `{session_id, answer, citations, tool_calls, took_ms}`；`session_id` 不传则新建（字母 / 数字 / `_` / `-`，最长 64）；`message` 1~2000 字；`sources` 作为检索的默认书目过滤（模型显式传了 `sources` 则以模型为准） |
+| `POST /chat/stream` | 同上，SSE 流式。事件：`session`、`tool_call`（`name` / `args`）、`token`（`text`）、`citations`、`done`（`answer` / `took_ms`）、`error`（统一错误 JSON） |
+| `GET /chat/sessions/{id}` | 消息历史（`role` + `content`，工具消息只给摘要）；不存在 / 已清空 / 已过期返回 404 |
+| `DELETE /chat/sessions/{id}` | 清空会话 |
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/chat -H 'Content-Type: application/json' \
+  -d '{"session_id": "demo", "message": "什么是挣值分析？"}'
+curl -s -X POST http://127.0.0.1:8000/chat -H 'Content-Type: application/json' \
+  -d '{"session_id": "demo", "message": "它的进度绩效指数怎么算？"}'        # 追问：同一个 session_id
+curl -N -X POST http://127.0.0.1:8000/chat/stream -H 'Content-Type: application/json' \
+  -d '{"session_id": "demo", "message": "再举个例子"}'                       # SSE：-N 关闭 curl 缓冲
+curl -s http://127.0.0.1:8000/chat/sessions/demo
+curl -s -X DELETE http://127.0.0.1:8000/chat/sessions/demo
+```
+
+命令行：`uv run chat.py [--source 书名.pdf]`（`/new` 新会话，`exit` 退出）。
+
+局限：
+- 会话只存在服务进程内存里，重启即丢；超过 `RAG_CHAT_MAX_SESSIONS` 或空闲超过 `RAG_CHAT_SESSION_TTL` 的会话被淘汰（不持久化、不跨进程）。
+- **尚未用真实大模型验证**：单元测试用脚本化的假模型；豆包 / 其他 OpenAI 兼容服务需支持 `tools` / `tool_calls`，这是假设，未验证。
+- 流式 `token` 是模型每次生成的文本增量；若模型在调用工具前先说了一句话，这句话也会出现在 token 流里，以 `done.answer` 为准。
+- 单元测试：`uv run python tests/test_agent.py`（假检索 + 假模型，不调用真实大模型）。
 
 ## 性能设计
 
