@@ -46,7 +46,7 @@ class _Retriever:
         self.bm25_chunk_count = 6408 if bm25_ready else None
         self.refreshes = 0
         self.fail_refresh = False
-        self.collection = None
+        self.store = None
 
     def catalog(self):
         return [
@@ -136,7 +136,7 @@ def _pipeline(scores=((0, 0.99), (1, 0.96), (2, 0.5)), chain=True, retriever=Non
 
 def _settings(**overrides):
     values = dict(
-        device="cpu", log_level="WARNING", llm_api_key="sk-test-FAKE-KEY", llm_model="test-model", llm_base_url=None,  # None：不受环境变量影响
+        device="cpu", log_level="WARNING", vector_store="chroma", llm_api_key="sk-test-FAKE-KEY", llm_model="test-model", llm_base_url=None,  # None：不受环境变量影响
         data_dir=SCRATCH / "default-data", db_dir=SCRATCH / "default-chroma",
         meta_file=SCRATCH / "default-meta.json", cache_dir=SCRATCH / "default-cache",
     )
@@ -174,10 +174,15 @@ def test_health_ok():
     assert body == {
         "status": "ok", "chunk_count": 6408, "bm25_ready": True,
         "bm25_built_at": "2025-10-09T08:53:20+00:00", "bm25_chunk_count": 6408,
-        "device": "cpu", "mode": "hybrid", "llm_configured": True,
+        "device": "cpu", "mode": "hybrid", "llm_configured": True, "vector_store": "chroma",
         "llm_protocol": "openai", "llm_model": "test-model",
         "agent_ready": False,  # 测试配置没有 base_url -> 大模型未配齐 -> 对话 Agent 未启用
     }, body
+
+
+def test_health_reports_configured_vector_store():
+    with _client(_pipeline(), settings=_settings(vector_store="qdrant")) as client:
+        assert client.get("/health").json()["vector_store"] == "qdrant"
 
 
 def test_health_without_llm_and_bm25():
@@ -712,13 +717,12 @@ class _AllReranker:
 
 
 def _real_pipeline(tmp, legacy_chunks=1):
-    """真实 HybridRetriever + 临时 Chroma + 假 embedding：用来端到端验证上传 / 过滤 / 删除。"""
-    import chromadb
-
+    """真实 HybridRetriever + 临时 ChromaStore + 假 embedding：用来端到端验证上传 / 过滤 / 删除。"""
     from ragbase.retrieval.hybrid import HybridRetriever
+    from ragbase.vectorstores.chroma import ChromaStore
 
     embeddings = _VectorEmbeddings()
-    collection = chromadb.PersistentClient(path=str(Path(tmp) / "chroma")).get_or_create_collection("rag")
+    collection = ChromaStore(Path(tmp) / "chroma", "rag")
     for index in range(legacy_chunks):  # 旧版索引风格：UUID 形式 ID，无 fid / 章节，source 为别处的绝对路径
         collection.upsert(
             ids=[f"00000000-0000-0000-0000-{index:012d}"],

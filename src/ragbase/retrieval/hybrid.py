@@ -1,13 +1,13 @@
 """混合检索：向量召回 + BM25 关键词召回，用 RRF（倒数排名融合）合并。
 
-- 向量路：直接查 Chroma collection，拿到片段 ID。
-- BM25 路：启动时从 Chroma 取出全部片段文本，用 jieba 分词后建 bm25s 索引。
+- 向量路：查向量库（ragbase.vectorstores，Chroma / Qdrant 通用），拿到片段 ID。
+- BM25 路：启动时从向量库取出全部片段文本，用 jieba 分词后建 bm25s 索引。
   分词输入 = 章节路径（heading_path，若有）+ 正文。分词结果缓存在 .bm25_cache/，
   缓存键包含全部片段的内容摘要：入库 / 删除 / 章节标题变化后自动失效，旧缓存文件会被清掉。
 - 索引快照：BM25 索引、语料和“书目录”打包成不可变的 _Snapshot，整体替换一个引用即可原子切换。
   入库完成后 refresh() 先建好新快照再替换，正在进行的检索始终看到完整的旧快照或新快照。
-- 按书过滤（sources）：向量路用 Chroma 的 where={"source": {"$in": [...]}}，BM25 路用 bm25s 的 weight_mask。
-- RRF 只看排名不看分数，所以不需要对余弦距离和 BM25 分数做归一化。
+- 按书过滤（sources）：向量路让向量库按 source 过滤，BM25 路用 bm25s 的 weight_mask。
+- RRF 只看排名不看分数，所以不需要对向量距离 / 相似度和 BM25 分数做归一化（也因此换向量库后端只要排序正确即可）。
 """
 import hashlib
 import json
@@ -26,6 +26,7 @@ from langchain_core.documents import Document
 
 from ragbase.config import get_settings, userdict_file
 from ragbase.ingest.common import bm25_input
+from ragbase.vectorstores.base import VectorStore
 
 logger = logging.getLogger(__name__)
 
@@ -167,13 +168,17 @@ class _Snapshot:
     catalog: tuple[dict, ...]  # 每本书的统计：name / chunk_count / heading_chunks / has_headings
 
 
-def _build_snapshot(collection, with_bm25: bool, cache_dir: Path | None) -> _Snapshot:
-    """从 Chroma 取全部片段，建语料、书目录，并按需分词（或读缓存）建 BM25 索引。"""
+def _build_snapshot(store: VectorStore, with_bm25: bool, cache_dir: Path | None) -> _Snapshot:
+    """从向量库取全部片段，建语料、书目录，并按需分词（或读缓存）建 BM25 索引。
+
+    片段按 ID 排序：不同后端遍历顺序不同（Chroma 按写入顺序，Qdrant 按点 ID），排序后语料顺序、
+    BM25 同分时的先后和分词缓存键都与后端无关，换后端（含 migrate-store 迁移）后缓存仍然有效。
+    """
     start = time.perf_counter()
-    data = collection.get(include=["documents", "metadatas"])
-    ids = list(data["ids"])
-    documents = list(data["documents"])
-    metadatas = [metadata or {} for metadata in data["metadatas"]]
+    records = sorted(store.iter_all(), key=lambda record: record.id)
+    ids = [record.id for record in records]
+    documents = [record.text for record in records]
+    metadatas = [record.metadata or {} for record in records]
     corpus = {doc_id: (text, metadata) for doc_id, text, metadata in zip(ids, documents, metadatas)}
 
     source_values: dict[str, dict[str, None]] = {}
@@ -238,7 +243,7 @@ class HybridRetriever:
 
     def __init__(
         self,
-        collection,
+        store: VectorStore,
         embeddings,
         mode: str = "hybrid",
         per_route_k: int = 30,
@@ -248,7 +253,7 @@ class HybridRetriever:
     ):
         if mode not in MODES:
             raise ValueError(f"mode 必须是 {MODES} 之一，收到 {mode!r}")
-        self.collection = collection
+        self.store = store
         self.embeddings = embeddings
         self.mode = mode
         self.per_route_k = per_route_k
@@ -260,7 +265,7 @@ class HybridRetriever:
             build_bm25 = mode != "vector"
         self._with_bm25 = build_bm25
         if build_bm25:
-            self._snapshot = _build_snapshot(collection, True, cache_dir)
+            self._snapshot = _build_snapshot(store, True, cache_dir)
 
     @property
     def bm25_ready(self) -> bool:
@@ -288,9 +293,9 @@ class HybridRetriever:
         return self._snapshot.cache_hit if self._snapshot is not None else None
 
     def refresh(self) -> None:
-        """重新读取 Chroma 并建新快照，建好后原子替换；失败时保留旧快照并抛出异常。"""
+        """重新读取向量库并建新快照，建好后原子替换；失败时保留旧快照并抛出异常。"""
         with self._build_lock:
-            new_snapshot = _build_snapshot(self.collection, self._with_bm25, self.cache_dir)
+            new_snapshot = _build_snapshot(self.store, self._with_bm25, self.cache_dir)
             self._snapshot = new_snapshot  # 单个引用赋值：读者要么看到旧快照，要么看到新快照
 
     def _catalog_snapshot(self) -> _Snapshot:
@@ -299,7 +304,7 @@ class HybridRetriever:
         if snapshot is None:
             with self._build_lock:
                 if self._snapshot is None:
-                    self._snapshot = _build_snapshot(self.collection, self._with_bm25, self.cache_dir)
+                    self._snapshot = _build_snapshot(self.store, self._with_bm25, self.cache_dir)
                 snapshot = self._snapshot
         return snapshot
 
@@ -322,19 +327,8 @@ class HybridRetriever:
         return list(values)
 
     def _vector_route(self, question: str, k: int, allowed: list[str] | None) -> list[tuple[str, str, dict]]:
-        options = {} if allowed is None else {"where": {"source": {"$in": allowed}}}
-        result = self.collection.query(
-            query_embeddings=[self.embeddings.embed_query(question)],
-            n_results=k,
-            include=["documents", "metadatas", "distances"],
-            **options,
-        )
-        return [
-            (doc_id, text, metadata or {})
-            for doc_id, text, metadata in zip(
-                result["ids"][0], result["documents"][0], result["metadatas"][0]
-            )
-        ]
+        hits = self.store.query(self.embeddings.embed_query(question), k, sources=allowed)
+        return [(hit.id, hit.text, hit.metadata or {}) for hit in hits]
 
     @staticmethod
     def _bm25_route(

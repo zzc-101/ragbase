@@ -4,7 +4,7 @@ import json
 from dataclasses import asdict
 from pathlib import Path
 
-from ragbase.config import get_settings, load_env
+from ragbase.config import DEFAULT_COLLECTION, Settings, get_settings, load_env
 from ragbase.ingest.cleaner import clean_documents
 from ragbase.ingest.parser import load_document
 from ragbase.ingest.splitter import split_documents
@@ -12,7 +12,7 @@ from ragbase.ingest.toc import pdf_page_headings
 
 load_env()  # 载入项目主目录（RAG_HOME，默认当前目录）下的 .env
 
-COLLECTION = "rag"
+COLLECTION = DEFAULT_COLLECTION  # 默认集合名；实际生效的取 settings.collection（RAG_COLLECTION）
 INGEST_PIPELINE_VERSION = "3"  # 解析/清洗/切分/章节标题规则变化时递增（3：PDF 片段加 heading_path）
 
 
@@ -74,7 +74,7 @@ def with_heading(text: str, metadata: dict, separator: str) -> str:
 
 
 def embedding_input(text: str, metadata: dict) -> str:
-    """向量化的输入：章节路径 + 换行 + 正文（Chroma 里存的 document 仍是纯正文）。"""
+    """向量化的输入：章节路径 + 换行 + 正文（向量库里存的 document 仍是纯正文）。"""
     return with_heading(text, metadata, "\n")
 
 
@@ -83,21 +83,15 @@ def bm25_input(text: str, metadata: dict) -> str:
     return with_heading(text, metadata, " ")
 
 
-def collection_count(db_dir: str | Path | None = None, name: str = COLLECTION) -> int | None:
-    """返回集合片段数；索引目录或集合不存在时返回 None（不加载任何模型）。db_dir 缺省取配置里的 db_dir。"""
-    db_dir = db_dir or get_settings().db_dir
-    if not Path(db_dir).exists():  # PersistentClient 会自动建目录，所以先判断
-        return None
-    import chromadb
+def collection_count(settings: Settings | None = None) -> int | None:
+    """返回当前配置的向量库里的片段数；索引不存在时返回 None（不加载任何模型）。settings 缺省取全局配置。"""
+    from ragbase.vectorstores import store_count
 
-    try:
-        return chromadb.PersistentClient(path=str(db_dir)).get_collection(name).count()
-    except Exception:
-        return None
+    return store_count(settings)
 
 
 def prepare_file_chunks(path: Path):
-    """编排解析、清洗和切分，返回 Chroma 载荷及预处理报告。"""
+    """编排解析、清洗和切分，返回向量库载荷（文本、元数据、ID）及预处理报告。"""
     fid = file_id(path)
     parsed_documents = load_document(path)
     # PDF 书签 -> 每页章节路径；其他格式暂无章节信息
@@ -114,7 +108,7 @@ def prepare_file_chunks(path: Path):
         ).hexdigest()[:16]
         page = metadata.get("page")
         if isinstance(page, int) and 0 <= page < len(page_headings) and page_headings[page]:
-            metadata["heading_path"] = page_headings[page]  # 未知时不写该字段（Chroma 元数据只能是标量）
+            metadata["heading_path"] = page_headings[page]  # 未知时不写该字段（向量库元数据只能是标量）
         texts.append(chunk.page_content)
         metadatas.append(metadata)
         ids.append(chunk_id(fid, index))

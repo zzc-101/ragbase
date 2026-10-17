@@ -18,7 +18,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 def project_home() -> Path:
     """项目主目录：环境变量 RAG_HOME，未设置则为当前工作目录。
 
-    data/、chroma_db/、.ingest_meta.json、.bm25_cache/、web/dist、bm25_userdict.txt、eval_questions.json、.env
+    data/、chroma_db/、qdrant_db/、.ingest_meta.json、.bm25_cache/、web/dist、bm25_userdict.txt、eval_questions.json、.env
     的默认位置都从这里推导（在仓库根目录运行时与旧版布局完全一致）。
     注意 RAG_HOME 必须是真正的环境变量：.env 的位置本身依赖它，所以不能写在 .env 里。
     每次调用都重新读取环境变量（不缓存），便于测试里临时切换。
@@ -65,6 +65,9 @@ RERANK_MIN_SCORE = 0.7
 # 取满足“要点召回不低于未过滤值 0.01”的最高候选 0.95：库内题零损失，只在片段得分明显偏低时才裁剪。
 # 注意得分已饱和，提高阈值会开始裁掉对比 / 多方面题需要的片段，别盲目调高。
 CONTEXT_MIN_SCORE = 0.95
+
+DEFAULT_COLLECTION = "rag"  # 向量库里的集合名（Chroma collection / Qdrant collection）；RAG_COLLECTION 可改
+VECTOR_STORES = ("chroma", "qdrant")
 
 HALF_PRECISION_DEVICES = ("mps", "cuda")  # 只有这些设备上用 fp16；CPU 上半精度又慢又不稳
 
@@ -114,11 +117,18 @@ class Settings(BaseSettings):
 
     # 数据与索引位置（默认都在项目主目录 RAG_HOME 下，即运行目录里的 data/、chroma_db/ 等；测试里指向临时目录）
     data_dir: Path = Field(default_factory=lambda: project_home() / "data")  # 文档目录：POST /documents 上传到这里，POST /ingest 扫描这里
-    db_dir: Path = Field(default_factory=lambda: project_home() / "chroma_db")  # Chroma 持久化目录
+    db_dir: Path = Field(default_factory=lambda: project_home() / "chroma_db")  # Chroma 持久化目录（RAG_VECTOR_STORE=chroma 时用）
     meta_file: Path = Field(default_factory=lambda: project_home() / ".ingest_meta.json")  # 增量入库的文件指纹
     cache_dir: Path = Field(default_factory=lambda: project_home() / ".bm25_cache")  # BM25 分词缓存
     web_dist: Path = Field(default_factory=lambda: project_home() / "web" / "dist")  # 前端构建产物（pnpm build）；相对路径按主目录解析，目录存在时由 API 服务托管
     max_upload_mb: int = Field(300, ge=1)  # POST /documents 的单文件大小上限（最大的教材 PDF 约 235 MB）
+
+    # 向量库后端：chroma（默认，本地目录 db_dir）或 qdrant（本地嵌入式目录 qdrant_path，或服务端 qdrant_url）
+    vector_store: Literal["chroma", "qdrant"] = "chroma"
+    collection: str = Field(DEFAULT_COLLECTION, min_length=1)  # 集合名
+    qdrant_path: Path = Field(default_factory=lambda: project_home() / "qdrant_db")  # Qdrant 本地模式的数据目录
+    qdrant_url: str | None = None  # 设置后连接 Qdrant 服务端（如 http://localhost:6333），qdrant_path 被忽略
+    qdrant_api_key: SecretStr | None = None  # Qdrant 服务端的 API Key（可选）
 
     # 大模型（默认 OpenAI 兼容协议）：RAG_LLM_*，未设置时回退到旧的 ARK_* 变量名（方舟，同为 OpenAI 兼容）。
     # 注意：validation_alias 会绕过 env_prefix，所以两个名字都要写全；环境变量里先出现的别名优先，
@@ -161,12 +171,22 @@ class Settings(BaseSettings):
             raise ValueError(f"log_level 无效：{value!r}")
         return value
 
+    @field_validator("vector_store", mode="before")
+    @classmethod
+    def _normalize_vector_store(cls, value):
+        return value.strip().lower() if isinstance(value, str) else value
+
+    @field_validator("qdrant_url", mode="before")
+    @classmethod
+    def _blank_url_to_none(cls, value):
+        return (value.strip() or None) if isinstance(value, str) else value
+
     @field_validator("llm_model", "llm_base_url", "eval_llm_model", "eval_llm_base_url", mode="before")
     @classmethod
     def _blank_to_none(cls, value):
         return (value.strip() or None) if isinstance(value, str) else value
 
-    @field_validator("llm_api_key", "eval_llm_api_key", mode="before")
+    @field_validator("llm_api_key", "eval_llm_api_key", "qdrant_api_key", mode="before")
     @classmethod
     def _blank_secret_to_none(cls, value):
         return (value.strip() or None) if isinstance(value, str) else value

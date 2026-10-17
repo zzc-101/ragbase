@@ -5,7 +5,7 @@
 ## 架构
 
 ```text
-文档 → 解析 → 清洗 → 中文切分 → Qwen3-Embedding-0.6B → ChromaDB
+文档 → 解析 → 清洗 → 中文切分 → Qwen3-Embedding-0.6B → 向量库（ChromaDB 默认 / Qdrant 可选）
                                                       ↓
 提问 → 向量召回 + BM25 召回 → RRF 融合 Top 20 → Qwen3-Reranker 精排 Top 5 → 豆包生成 → 答案与来源
 ```
@@ -30,11 +30,12 @@
 ```text
 pyproject.toml / uv.lock       依赖与锁文件（uv 管理）；命令行入口 ragbase = ragbase.cli:main
 src/ragbase/
-  cli.py  __main__.py          命令行：serve / ingest / ask / chat / eval（python -m ragbase 等价）
+  cli.py  __main__.py          命令行：serve / ingest / ask / chat / eval / migrate-store（python -m ragbase 等价）
   config.py  logging_setup.py  集中配置（RAG_* 环境变量 / .env）；日志
   llm/factory.py               大模型工厂（OpenAI 兼容协议）
   models/embeddings.py reranker.py   本地 Qwen3 embedding / reranker
   ingest/                      parser / cleaner / splitter / toc / common / service / jobs
+  vectorstores/                向量库抽象（base）、chroma、qdrant、factory（按 RAG_VECTOR_STORE 创建）、migrate（后端间迁移）
   retrieval/                   hybrid（向量 + BM25 + RRF）、pipeline（召回 -> 精排 -> 拒答 -> 生成）、labels（来源标签）
   agent/                       tools（检索工具与引用登记）、service（对话 Agent 与会话）
   api/                         app（FastAPI 应用，ragbase.api.app:app）、schemas
@@ -42,16 +43,16 @@ src/ragbase/
 scripts/                       一次性脚本（如拒答阈值校准）
 tests/                         断言脚本式单元测试（tests/run_all.py 一次运行全部）
 web/                           前端工程（React + Vite）
-data/ chroma_db/ ...           运行时数据，默认都在项目主目录下（见下）
+data/ chroma_db/ qdrant_db/ ...  运行时数据，默认都在项目主目录下（见下）
 ```
 
-**项目主目录**：环境变量 `RAG_HOME`，未设置则为**当前工作目录**。`data/`、`chroma_db/`、`.ingest_meta.json`、`.bm25_cache/`、`web/dist`、`bm25_userdict.txt`、`eval_questions.json`、`eval_results.*.json`、`.ragas_cache/` 以及 `.env` 的默认位置都从它推导，所以请在仓库根目录运行命令（或设置 `RAG_HOME` 指向它）。`RAG_HOME` 必须是真正的环境变量，不能写在 `.env` 里（`.env` 的位置本身依赖它）。
+**项目主目录**：环境变量 `RAG_HOME`，未设置则为**当前工作目录**。`data/`、`chroma_db/`、`qdrant_db/`、`.ingest_meta.json`、`.bm25_cache/`、`web/dist`、`bm25_userdict.txt`、`eval_questions.json`、`eval_results.*.json`、`.ragas_cache/` 以及 `.env` 的默认位置都从它推导，所以请在仓库根目录运行命令（或设置 `RAG_HOME` 指向它）。`RAG_HOME` 必须是真正的环境变量，不能写在 `.env` 里（`.env` 的位置本身依赖它）。
 
 ## 混合检索
 
-[src/ragbase/retrieval/hybrid.py](src/ragbase/retrieval/hybrid.py) 同时走两路召回：向量路直接查 Chroma（各取 30），BM25 路用 `jieba` 分词 + `bm25s` 打分（各取 30），再用 RRF（`score = Σ 1/(60+rank)`，只看排名）融合取前 20 交给 Reranker。专有名词、缩写和公式（如 TOGAF、SPI）这类向量容易漏的内容，由 BM25 补召回。
+[src/ragbase/retrieval/hybrid.py](src/ragbase/retrieval/hybrid.py) 同时走两路召回：向量路直接查向量库（Chroma 或 Qdrant，各取 30），BM25 路用 `jieba` 分词 + `bm25s` 打分（各取 30），再用 RRF（`score = Σ 1/(60+rank)`，只看排名）融合取前 20 交给 Reranker。专有名词、缩写和公式（如 TOGAF、SPI）这类向量容易漏的内容，由 BM25 补召回。
 
-- BM25 索引在启动时从 Chroma 已有的片段文本现建，无需改动入库流程。
+- BM25 索引在启动时从向量库已有的片段文本现建（按片段 ID 排序后分词，所以换向量库后端分词缓存仍然有效），无需改动入库流程。
 - 分词结果缓存在 `.bm25_cache/`（已忽略）；缓存键包含全部片段内容的摘要和用户词典，入库 / 删除 / 章节标题变化后自动失效，旧缓存文件会被清掉。
 - BM25 索引、语料和书目录打包成不可变的“快照”，入库或删除文档后在后台建好新快照，再整体替换一个引用（原子切换），检索期间不会看到半成品索引。
 - 领域词典放在项目主目录（仓库根目录）的 [bm25_userdict.txt](bm25_userdict.txt)（jieba 格式：`词 词频 词性`）。不要放进 `data/`，那里的 `.txt` 会被当作文档入库。修改后下次启动自动生效。
@@ -64,7 +65,7 @@ data/ chroma_db/ ...           运行时数据，默认都在项目主目录下�
 
 - 对第 p 页，路径 = 起始页不晚于该页的各层级“最近一条”书签标题，用 ` > ` 连接；标题会去首尾空白、压缩空白，纯数字 / 标点的标题（如考试大纲里的 `1`）直接丢弃，没有可用书签则该文件没有章节。非 PDF 暂无章节。
 - **近似**：书签只记录起始页，不记录页内位置，一节从页中间开始时，整页都归给这一节。
-- 向量化输入 = `heading_path + "\n" + 正文`，BM25 分词输入 = `heading_path + " " + 正文`；Chroma 里存的 document 仍是纯正文。**精排 Reranker 的输入只用正文**，这样按纯正文校准的拒答阈值仍然有效。
+- 向量化输入 = `heading_path + "\n" + 正文`，BM25 分词输入 = `heading_path + " " + 正文`；向量库里存的 document 仍是纯正文。**精排 Reranker 的输入只用正文**，这样按纯正文校准的拒答阈值仍然有效。
 - 展示：`/search` 的 `chunks`、`/ask` 的 `citations` 带 `heading_path`（没有为 `null`）；交给大模型的上下文写成 `[片段1]（第11章 … > 11.3 …）正文`；`ragbase ask` 的来源标签带末级章节，如 `xxx.pdf:第12页「11.3 挣值分析」[V2+B1|0.93]`。
 - `INGEST_PIPELINE_VERSION` 已升到 `3`、分词版本升到 `3`：下次增量入库会把所有文件视为已变化并重新索引（这才会给现有的 PDF 加上章节）。**旧索引（没有 `heading_path`）无需改动即可继续使用**，章节全部为 `null`。
 
@@ -157,9 +158,38 @@ uv run ragbase ingest --full
 uv run ragbase ingest
 ```
 
-全量入库和增量入库使用相同的稳定片段 ID，并通过 `.ingest_meta.json` 记录文件状态（每个文件成功后立即写入，中途失败不会重做已完成的文件；失败的文件下次重试）。旧版索引首次执行增量命令时会迁移重建：先按 ID 分批清空旧片段，再逐文件写入（不删除 collection）。
+全量入库和增量入库使用相同的稳定片段 ID，并通过 `.ingest_meta.json` 记录文件状态（每个文件成功后立即写入，中途失败不会重做已完成的文件；失败的文件下次重试）。旧版索引首次执行增量命令时会迁移重建：先按 ID 分批清空旧片段，再逐文件写入（不删除集合）。
 
-> **服务运行期间不要运行 `ragbase ingest --full`**：它会删除整个 `chroma_db/` 目录，而服务进程还持有该索引。服务在线时请用下面的 `POST /documents` / `POST /ingest` / `DELETE /documents/{name}`（或先停服务再跑命令行）。`ragbase ingest`（增量）同样不要与服务同时运行（两个进程会同时写同一个库）。
+> **服务运行期间不要运行 `ragbase ingest --full`**：它会清空整个向量库（删除集合并重建），而服务进程还持有该索引。服务在线时请用下面的 `POST /documents` / `POST /ingest` / `DELETE /documents/{name}`（或先停服务再跑命令行）。`ragbase ingest`（增量）同样不要与服务同时运行（两个进程会同时写同一个库）。
+
+## 向量库
+
+向量库是可插拔的：默认 **Chroma**（本地目录），可切换为 **Qdrant**（本地嵌入式目录或 Qdrant 服务端）。入库、检索、API、迁移都只依赖 [src/ragbase/vectorstores/base.py](src/ragbase/vectorstores/base.py) 里的 `VectorStore` 接口，换后端不需要改任何业务代码；混合检索的 RRF 只看排名，所以两个后端的距离 / 相似度数值是否可比并不重要，只要排序正确。
+
+| 变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `RAG_VECTOR_STORE` | `chroma` | 向量库后端：`chroma` / `qdrant`；其他取值启动时报错 |
+| `RAG_COLLECTION` | `rag` | 集合名（Chroma collection / Qdrant collection） |
+| `RAG_DB_DIR` | 主目录下 `chroma_db/` | Chroma 数据目录（仅 `chroma`） |
+| `RAG_QDRANT_PATH` | 主目录下 `qdrant_db/` | Qdrant **本地嵌入式**模式的数据目录（`RAG_QDRANT_URL` 未设置时使用） |
+| `RAG_QDRANT_URL` | 无 | Qdrant **服务端**地址，如 `http://localhost:6333`；设置后忽略 `RAG_QDRANT_PATH` |
+| `RAG_QDRANT_API_KEY` | 无 | Qdrant 服务端的 API Key（`SecretStr`，不会出现在日志 / `repr` 中） |
+
+**切换步骤**（不想重新向量化的话）：先停服务，再迁移，最后改配置并重启：
+
+```bash
+uv run ragbase migrate-store --to qdrant            # 从 chroma 复制到 qdrant（--from 默认是另一个后端）
+echo 'RAG_VECTOR_STORE=qdrant' >> .env              # 然后重启 ragbase serve
+```
+
+`migrate-store` 把 ID、向量、正文和元数据按批（`--batch-size`，默认 500）从源库复制到目标库，**不加载模型、不重新向量化**，结束后校验源库 / 已复制 / 目标库的片段数一致。目标库非空时拒绝，加 `--force` 会先清空目标库再复制。片段 ID 与正文不变，所以 `.ingest_meta.json` 和 `.bm25_cache/` 继续有效，迁移完成后增量入库照常工作；反向迁移同理（`--to chroma`）。迁移时请停掉服务（本地 Qdrant 目录同一时刻只允许一个进程打开，见下）。
+
+**本地模式 vs 服务端模式**
+
+- 本地模式（只设 `RAG_VECTOR_STORE=qdrant`）：数据在 `qdrant_db/`，不用另外部署服务，适合单机；过滤和检索在进程内存里完成（几千到十万级片段够用），不支持 payload 索引。**同一个目录同一时刻只允许一个进程打开**：`ragbase serve` 运行时再运行 `ragbase ingest` / `ragbase ask` / `migrate-store` 会报“already accessed by another instance”——请用服务的在线入库接口，或先停服务。进程内同一目录共享一个 client（线程安全，调用被锁串行化）。
+- 服务端模式（再设 `RAG_QDRANT_URL`）：连接独立运行的 Qdrant（如 `docker run -p 6333:6333 qdrant/qdrant`），支持多进程同时访问和 payload 索引（`fid`、`source` 建了 keyword 索引）。
+- 实现细节：Qdrant 点 ID 必须是 UUID / 整数，字符串片段 ID 用 `uuid5(固定命名空间, chunk_id)` 映射，原始 ID、正文和元数据存在 payload（`chunk_id` / `document` / `metadata`）；距离用余弦（Qdrant 会把向量归一化，Qwen3 向量本来就是归一化的）；集合在第一次写入时按向量维度创建。
+- 两者在 upsert 同 ID 时对元数据的处理略有不同（Chroma 按键合并，Qdrant 整体替换）；入库每次都写完整元数据，不受影响。
 
 ## 问答与评测
 
@@ -222,7 +252,7 @@ uv run ragbase serve --host 127.0.0.1 --port 8000   # 不带参数时读取 RAG_
 
 | 接口 | 说明 |
 | --- | --- |
-| `GET /health` | `status`（`ok` / `not_ready`）、`chunk_count`、`bm25_ready`、`bm25_built_at`（当前 BM25 索引的构建时间，UTC）、`bm25_chunk_count`（BM25 覆盖的片段数，与 `chunk_count` 不同说明刷新未完成）、`device`、`mode`、`llm_configured`、`llm_protocol`、`llm_model`（模型名，不含密钥）、`agent_ready`（对话 Agent 是否就绪） |
+| `GET /health` | `status`（`ok` / `not_ready`）、`chunk_count`、`bm25_ready`、`bm25_built_at`（当前 BM25 索引的构建时间，UTC）、`bm25_chunk_count`（BM25 覆盖的片段数，与 `chunk_count` 不同说明刷新未完成）、`device`、`mode`、`llm_configured`、`vector_store`（向量库后端：`chroma` / `qdrant`）、`llm_protocol`、`llm_model`（模型名，不含密钥）、`agent_ready`（对话 Agent 是否就绪） |
 | `POST /search` | 召回 + 精排，不调用大模型 |
 | `POST /ask` | 召回 + 精排 + 大模型回答；得分过低时拒答且不调用大模型 |
 | `GET /documents` | 已入库的文档：`name`、`chunk_count`、`heading_chunks`、`has_headings`（按 `source` 的文件名汇总，旧版索引同样可用） |
@@ -277,7 +307,7 @@ curl -s -X POST http://127.0.0.1:8000/ask -H 'Content-Type: application/json' \
 
 `citations[n-1]` 对应回答中的 `[片段n]`（含 `heading_path`）；拒答时 `citations` 为空。
 
-**按书过滤**：`/search` 与 `/ask` 的 `sources` 是书名（文件名，取自 `GET /documents` 的 `name`）列表，只在这些书里检索；缺省或空列表表示全部；有未知书名返回 400 并列出可选项。服务端用检索器内存里的语料把书名解析成库里存的 `source` 原始值（旧索引存的是绝对路径，不会自己拼路径）；向量路用 Chroma 的 `where={"source": {"$in": [...]}}`，BM25 路用 bm25s 的 `weight_mask`，过滤后没有命中则判定拒答。命令行：`uv run ragbase ask --source 书名.pdf`（可重复）。
+**按书过滤**：`/search` 与 `/ask` 的 `sources` 是书名（文件名，取自 `GET /documents` 的 `name`）列表，只在这些书里检索；缺省或空列表表示全部；有未知书名返回 400 并列出可选项。服务端用检索器内存里的语料把书名解析成库里存的 `source` 原始值（旧索引存的是绝对路径，不会自己拼路径）；向量路让向量库按 `source` 过滤（Chroma 用 `where={"source": {"$in": [...]}}`，Qdrant 用 `MatchAny`），BM25 路用 bm25s 的 `weight_mask`，过滤后没有命中则判定拒答。命令行：`uv run ragbase ask --source 书名.pdf`（可重复）。
 
 ```bash
 curl -s -X POST http://127.0.0.1:8000/search -H 'Content-Type: application/json' \
@@ -296,7 +326,7 @@ curl -s -X DELETE 'http://127.0.0.1:8000/documents/新教材.pdf'
 - 任务状态字段：`job_id`、`status`、`files_total`、`files_done`、`current_file`、`chunks_added`、`chunks_deleted`、`skipped_files`（旧版 `.doc` 和入库失败的文件）、`error`、`started_at`、`finished_at`。`succeeded` 表示入库完成**且 BM25 已刷新**；有文件失败时整体 `failed`，其余文件已正常入库并写入元数据。
 - `POST /documents` 校验：扩展名（不区分大小写，支持 `.pdf/.docx/.md/.markdown/.txt`，`.doc` 提示另存为 `.docx`）、大小（`RAG_MAX_UPLOAD_MB`，默认 300，流式写盘不整体读入内存，超限 413）、文件名只取最后一段（`../x.pdf` 会存成 `x.pdf`），空 / 隐藏 / `~$` / `README` 开头的名字返回 400；同名文件覆盖（原子替换）。已有任务在运行时文件仍会保存，但返回 409，稍后调用 `POST /ingest` 即可。
 - **并发**：入库每 64 个片段为一批（向量化 + 写入）单独持有 `pipeline.lock`，批间释放，所以入库期间 `/search` 可以插进来（会比平时慢一点，本地模型同一时刻只服务一个调用）。同名修改的文件先 upsert 新片段、再删不再存在的旧片段，重建期间该文件仍可检索。任务结束后重建 BM25 快照并原子替换。删除文档期间也算“忙”，此时新任务 / 其他删除返回 409。
-- 旧版索引（片段无 `fid`、ID 是 UUID）第一次 `POST /ingest` 或上传时会迁移：按 ID 分批清空旧片段（不删除 collection）再逐文件重建，耗时与全量入库相当。`DELETE` 对旧片段按 `source` 的文件名匹配。
+- 旧版索引（片段无 `fid`、ID 是 UUID）第一次 `POST /ingest` 或上传时会迁移：按 ID 分批清空旧片段（不删除集合）再逐文件重建，耗时与全量入库相当。`DELETE` 对旧片段按 `source` 的文件名匹配。
 
 **配置**（环境变量或 `.env`，环境变量优先；[src/ragbase/config.py](src/ragbase/config.py) 是唯一来源，`ragbase ask` / `ragbase eval` 的默认值也取自这里，命令行参数仍可覆盖）：
 
@@ -311,6 +341,7 @@ curl -s -X DELETE 'http://127.0.0.1:8000/documents/新教材.pdf'
 | `RAG_CONTEXT_MIN_SCORE` | `0.95` | 交给大模型的片段最低精排得分，0 表示不过滤 |
 | `RAG_HOME`（须为真正的环境变量） | 当前工作目录 | 项目主目录：下面各路径的默认位置、`.env`、`bm25_userdict.txt`、`eval_questions.json` 都在它下面 |
 | `RAG_DATA_DIR` / `RAG_DB_DIR` | 主目录下 `data/` / `chroma_db/` | 文档目录 / Chroma 持久化目录（命令行脚本和服务共用） |
+| `RAG_VECTOR_STORE` / `RAG_COLLECTION` | `chroma` / `rag` | 向量库后端与集合名，详见下面的“向量库”一节 |
 | `RAG_META_FILE` / `RAG_CACHE_DIR` | 主目录下 `.ingest_meta.json` / `.bm25_cache/` | 入库元数据文件 / BM25 分词缓存目录 |
 | `RAG_MAX_UPLOAD_MB` | `300` | `POST /documents` 单文件大小上限 |
 | `RAG_AGENT_MAX_TOOL_CALLS` | `4` | 对话 Agent 每轮用户消息最多调用几次工具 |
@@ -352,7 +383,7 @@ RAG_EVAL_LLM_MODEL=gpt-4o
 - 模型回答超时：底层客户端先按 `RAG_LLM_MAX_RETRIES` 重试，仍超时则 `/ask` 返回 **504**（`llm_timeout`）；其他失败返回 502。完整异常只写日志，响应里不含密钥或上游地址。
 
 - 运行全部单元测试：`uv run python tests/run_all.py`（每个 `tests/test_*.py` 一个子进程，打印各自汇总行，任一失败则非零退出；可带文件名片段只跑部分，如 `run_all.py llm api`）。CI：`.github/workflows/tests.yml`（push / PR 到 main 时在 ubuntu 上 `uv sync --locked`，用 CPU 版 torch 跑同一个脚本）。
-- 单元测试（均不加载模型、不碰真实数据，网络只访问本机 127.0.0.1 的桩服务）：`uv run python tests/test_api.py`（假流水线 / 假入库，另有用临时 Chroma 的端到端用例）、`tests/test_ingest_service.py`（临时目录 + 假 embedding）、`tests/test_sources.py`（按书过滤、快照刷新、分词缓存）、`tests/test_toc.py`（用 fitz 生成带书签的 PDF）、`tests/test_config.py`、`tests/test_llm.py`（本机 OpenAI 兼容桩服务：参数透传、5xx 重试、超时 -> 504、`/ask` 端到端）、`tests/test_parser.py`（临时生成的 PDF / DOCX / GB18030 文本）。
+- 单元测试（均不加载模型、不碰真实数据，网络只访问本机 127.0.0.1 的桩服务）：`uv run python tests/test_api.py`（假流水线 / 假入库，另有用临时 ChromaStore 的端到端用例）、`tests/test_ingest_service.py`（临时目录 + 假 embedding）、`tests/test_sources.py`（按书过滤、快照刷新、分词缓存）、`tests/test_vectorstores.py`（Chroma / Qdrant 同一套契约测试、迁移、工厂与命令行）、`tests/test_toc.py`（用 fitz 生成带书签的 PDF）、`tests/test_config.py`、`tests/test_llm.py`（本机 OpenAI 兼容桩服务：参数透传、5xx 重试、超时 -> 504、`/ask` 端到端）、`tests/test_parser.py`（临时生成的 PDF / DOCX / GB18030 文本）。
 - 依赖：文件上传需要 `python-multipart`（已列入 `pyproject.toml` 的依赖，旧环境请重新执行 `uv sync`）。
 
 ## 对话 Agent

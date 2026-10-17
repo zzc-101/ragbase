@@ -1,10 +1,10 @@
 """增量入库服务：命令行（ragbase ingest [--full]）与 HTTP 服务（POST /ingest）共用。
 
-所有依赖都显式传入（文档目录、Chroma collection、向量化函数、元数据文件、锁、进度回调），
+所有依赖都显式传入（文档目录、向量库 store、向量化函数、元数据文件、锁、进度回调），
 所以测试可以用临时目录 + 假 embedding 运行，不碰真实数据。
 
-写入方式：直接用 collection.upsert / collection.delete（预先算好的向量），不经过 langchain 的 Chroma 封装，
-也不删除或重建 collection——运行中的服务持有 collection 对象，删集合会让它失效。
+写入方式：直接用 store.upsert / store.delete（预先算好的向量，store 见 ragbase.vectorstores，Chroma / Qdrant 通用），
+也不删除或重建集合（不调 store.reset）——运行中的服务持有 store 对象，清空集合要靠 ragbase ingest --full（服务未运行时）。
 
 并发（服务内）：传入 pipeline.lock，每个批次（向量化 + 写入，或一批删除）单独加锁、批间释放，
 所以入库期间 /search 可以插进来；本地模型不能并发推理，这把锁同时保证了入库与检索不会同时用模型。
@@ -28,6 +28,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from ragbase.ingest.parser import list_documents
+from ragbase.vectorstores.base import VectorStore, clean_metadata
 from ragbase.ingest.common import (
     build_ingest_meta,
     embedding_input,
@@ -40,7 +41,7 @@ from ragbase.ingest.common import (
 logger = logging.getLogger(__name__)
 
 EMBED_BATCH_SIZE = 64  # 每批向量化 + 写入的片段数；也是持锁的粒度
-DELETE_BATCH_SIZE = 1000  # 每次 collection.delete 的 ID 数（低于 SQLite 变量上限）
+DELETE_BATCH_SIZE = 1000  # 每次 store.delete 的 ID 数（低于 SQLite 变量上限）
 
 
 @dataclass
@@ -59,14 +60,14 @@ class IngestResult:
     changed: bool = False
 
 
-def plan_changes(old_meta: dict, cur_meta: dict, collection_count: int | None):
+def plan_changes(old_meta: dict, cur_meta: dict, indexed_count: int | None):
     """对比旧元数据和当前文件，返回 (to_add, deleted, unchanged, reason)。
 
-    collection_count 为 None 表示索引集合不存在。reason：
+    indexed_count 为 None 表示索引集合不存在。reason：
     None=正常增量；"index_missing"=有元数据但索引缺失/为空，全量重建；
     "legacy"=旧版索引（有数据但无元数据），迁移为可增量索引。
     """
-    index_empty = not collection_count
+    index_empty = not indexed_count
     if old_meta and index_empty:
         return list(cur_meta), [], 0, "index_missing"
     if not old_meta and not index_empty:
@@ -84,46 +85,28 @@ def plan_changes(old_meta: dict, cur_meta: dict, collection_count: int | None):
     return to_add, deleted, unchanged, None
 
 
-def clean_metadata(metadata: dict) -> dict:
-    """Chroma 元数据只接受 str / int / float / bool：去掉 None，其他类型转成字符串。"""
-    return {
-        key: value if isinstance(value, (str, int, float, bool)) else str(value)
-        for key, value in metadata.items()
-        if value is not None
-    }
-
-
-def delete_chunk_ids(collection, ids: list[str], lock=None) -> int:
+def delete_chunk_ids(store: VectorStore, ids: list[str], lock=None) -> int:
     """按 ID 分批删除片段，每批单独加锁。返回删除数。"""
     lock = nullcontext() if lock is None else lock
     for start in range(0, len(ids), DELETE_BATCH_SIZE):
         with lock:
-            collection.delete(ids=ids[start:start + DELETE_BATCH_SIZE])
+            store.delete(ids[start:start + DELETE_BATCH_SIZE])
     return len(ids)
 
 
-def _chunk_ids_where(collection, where: dict) -> list[str]:
-    return collection.get(where=where, include=[])["ids"]
-
-
-def delete_file_chunks(collection, fid: str | None = None, sources: list[str] | None = None, lock=None) -> int:
+def delete_file_chunks(store: VectorStore, fid: str | None = None, sources: list[str] | None = None, lock=None) -> int:
     """删除某个文件的全部片段：按 fid 匹配，并（旧版索引没有 fid）按 source 元数据的原始值匹配。"""
-    ids: dict[str, None] = {}
-    if fid:
-        ids.update(dict.fromkeys(_chunk_ids_where(collection, {"fid": fid})))
-    if sources:
-        ids.update(dict.fromkeys(_chunk_ids_where(collection, {"source": {"$in": list(sources)}})))
-    return delete_chunk_ids(collection, list(ids), lock)
+    return delete_chunk_ids(store, store.ids_where(fid=fid, sources=sources), lock)
 
 
-def _index_file(path: Path, fid: str, collection, embed_fn, lock, batch_size: int) -> tuple[int, int, dict]:
+def _index_file(path: Path, fid: str, store: VectorStore, embed_fn, lock, batch_size: int) -> tuple[int, int, dict]:
     """解析并写入一个文件，返回 (新增片段数, 删除的陈旧片段数, 预处理报告)。
 
     先 upsert 新片段（ID 稳定，同 ID 覆盖），最后才删除不再存在的旧片段，
     所以重建某个文件期间它的内容始终可被检索。
     """
     texts, metadatas, ids, report = prepare_file_chunks(path)
-    old_ids = _chunk_ids_where(collection, {"fid": fid})
+    old_ids = store.ids_where(fid=fid)
     for start in range(0, len(texts), batch_size):
         end = start + batch_size
         batch_inputs = [
@@ -132,7 +115,7 @@ def _index_file(path: Path, fid: str, collection, embed_fn, lock, batch_size: in
         ]
         with lock:
             vectors = embed_fn(batch_inputs)
-            collection.upsert(
+            store.upsert(
                 ids=ids[start:end],
                 embeddings=vectors,
                 documents=texts[start:end],  # 存纯正文；章节路径在 metadata.heading_path 里
@@ -140,13 +123,13 @@ def _index_file(path: Path, fid: str, collection, embed_fn, lock, batch_size: in
             )
     new_ids = set(ids)
     stale = [chunk_id for chunk_id in old_ids if chunk_id not in new_ids]
-    delete_chunk_ids(collection, stale, lock)
+    delete_chunk_ids(store, stale, lock)
     return len(texts), len(stale), report
 
 
 def run_ingest(
     data_dir: Path,
-    collection,
+    store: VectorStore,
     embed_fn,
     meta_path: Path,
     lock=None,
@@ -168,11 +151,11 @@ def run_ingest(
     old_meta = load_ingest_meta(meta_path)
     if not docs_paths and not old_meta:
         notify("no_documents", data_dir=Path(data_dir), skipped=result.skipped_files)
-        result.total_chunks = collection.count()
+        result.total_chunks = store.count()
         return result
 
     cur_meta = build_ingest_meta(docs_paths)
-    to_add, deleted, result.unchanged, result.reason = plan_changes(old_meta, cur_meta, collection.count())
+    to_add, deleted, result.unchanged, result.reason = plan_changes(old_meta, cur_meta, store.count())
     result.files_total = len(to_add) + len(deleted)
     notify(
         "plan",
@@ -184,22 +167,22 @@ def run_ingest(
     )
     if not to_add and not deleted:
         notify("nochange")
-        result.total_chunks = collection.count()
+        result.total_chunks = store.count()
         return result
 
     # index_missing / legacy 都是整体重建：旧元数据作废，从空开始逐文件记录
     new_meta = {} if result.reason else dict(old_meta)
     try:
         if result.reason == "legacy":
-            # 旧数据没有 fid，无法按文件删除。不能 delete_collection（运行中的服务持有该对象），按 ID 分批清空。
-            old_ids = collection.get(include=[])["ids"]
-            result.chunks_deleted += delete_chunk_ids(collection, old_ids, lock)
+            # 旧数据没有 fid，无法按文件删除。不能 reset 集合（运行中的服务持有该对象），按 ID 分批清空。
+            old_ids = store.all_ids()
+            result.chunks_deleted += delete_chunk_ids(store, old_ids, lock)
             result.changed = True
             notify("migrate", chunks=len(old_ids))
 
         for fid in deleted:
             name = old_meta[fid]["name"]
-            count = delete_file_chunks(collection, fid=fid, lock=lock)
+            count = delete_file_chunks(store, fid=fid, lock=lock)
             result.chunks_deleted += count
             result.changed = result.changed or bool(count)
             new_meta.pop(fid, None)
@@ -213,7 +196,7 @@ def run_ingest(
             new_meta.pop(fid, None)  # 处理期间不认为它是最新的：失败时下次会重试
             result.changed = True
             try:
-                added, stale, report = _index_file(data_dir / name, fid, collection, embed_fn, lock, batch_size)
+                added, stale, report = _index_file(data_dir / name, fid, store, embed_fn, lock, batch_size)
             except Exception as exc:
                 logger.exception("文件入库失败：%s", name)
                 result.failed_files[name] = f"{type(exc).__name__}: {exc}"
@@ -228,21 +211,21 @@ def run_ingest(
     finally:
         save_ingest_meta(new_meta, meta_path)  # 异常 / 中断时也把已完成的部分记下来
 
-    result.total_chunks = collection.count()
+    result.total_chunks = store.count()
     return result
 
 
 def delete_document(
     name: str,
     data_dir: Path,
-    collection,
+    store: VectorStore,
     meta_path: Path,
     lock=None,
     sources: list[str] | None = None,
 ) -> int:
     """删除一个文档：源文件、索引中的片段（按 fid；旧版片段按 source 原始值）和元数据条目。返回删除的片段数。"""
     fid = file_id(Path(name))
-    count = delete_file_chunks(collection, fid=fid, sources=sources, lock=lock)
+    count = delete_file_chunks(store, fid=fid, sources=sources, lock=lock)
     (Path(data_dir) / name).unlink(missing_ok=True)
     meta = load_ingest_meta(meta_path)
     if meta.pop(fid, None) is not None:

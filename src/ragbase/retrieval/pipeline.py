@@ -5,7 +5,6 @@ import threading
 import time
 from dataclasses import dataclass, field
 
-import chromadb
 import httpx
 from langchain_core.language_models import BaseChatModel
 from langchain_core.output_parsers import StrOutputParser
@@ -15,7 +14,7 @@ from ragbase.config import CONTEXT_MIN_SCORE, RERANK_MIN_SCORE, Settings, get_se
 from ragbase.models.embeddings import Qwen3Embeddings
 from ragbase.retrieval.hybrid import HybridRetriever
 from ragbase.llm.factory import create_chat_model
-from ragbase.ingest.common import COLLECTION
+from ragbase.vectorstores import create_vector_store
 from ragbase.models.reranker import Qwen3Reranker
 
 
@@ -129,10 +128,9 @@ def build_pipeline(
     embeddings = Qwen3Embeddings(device=device)
     reranker = Qwen3Reranker(device=device)
     logger.info("本地模型加载完成（设备 %s），用时 %.1fs", device, time.perf_counter() - start)
-    client = chromadb.PersistentClient(path=str(settings.db_dir))
-    collection = client.get_collection(COLLECTION)
+    store = create_vector_store(settings)
     retriever = HybridRetriever(
-        collection,
+        store,
         embeddings,
         mode=mode,
         per_route_k=per_route_k,

@@ -1,5 +1,5 @@
 """HybridRetriever 的按书过滤（sources）、书目录、BM25 快照刷新与分词缓存的单元测试
-（假 collection / 临时 Chroma，不加载模型、不访问网络）。
+（假向量库 / 临时 ChromaStore，不加载模型、不访问网络）。
 
 运行：uv run python tests/test_sources.py
 """
@@ -7,9 +7,9 @@ import tempfile
 import threading
 from pathlib import Path
 
-import chromadb
-
 from ragbase.retrieval.hybrid import HybridRetriever, UnknownSourceError
+from ragbase.vectorstores.base import Hit, Record
+from ragbase.vectorstores.chroma import ChromaStore
 
 # 旧版索引风格：source 是绝对路径，没有 heading_path / fid
 LEGACY = [
@@ -22,31 +22,22 @@ LEGACY = [
 
 
 class _Collection:
-    """极简 Chroma 假对象：get 返回全部片段；query 按固定顺序（逆序）返回，并支持 source 的 $in 过滤。"""
+    """极简假向量库（VectorStore）：iter_all 返回全部片段；query 按固定顺序（逆序）返回，并支持 sources 过滤。"""
 
     def __init__(self, rows=LEGACY):
         self.rows = list(rows)
-        self.query_kwargs = []
+        self.query_kwargs = []  # 每次 query 收到的 sources 参数
 
-    def get(self, include=None):
-        return {
-            "ids": [row[0] for row in self.rows],
-            "documents": [row[1] for row in self.rows],
-            "metadatas": [dict(row[2]) for row in self.rows],
-        }
+    def iter_all(self, batch_size=1000, with_vectors=False):
+        for row in self.rows:
+            yield Record(id=row[0], text=row[1], metadata=dict(row[2]))
 
-    def query(self, query_embeddings, n_results, include=None, where=None):
-        self.query_kwargs.append(where)
+    def query(self, embedding, k, sources=None):
+        self.query_kwargs.append(sources)
         rows = list(reversed(self.rows))
-        if where is not None:
-            allowed = set(where["source"]["$in"])
-            rows = [row for row in rows if row[2].get("source") in allowed]
-        rows = rows[:n_results]
-        return {
-            "ids": [[row[0] for row in rows]],
-            "documents": [[row[1] for row in rows]],
-            "metadatas": [[dict(row[2]) for row in rows]],
-        }
+        if sources is not None:
+            rows = [row for row in rows if row[2].get("source") in set(sources)]
+        return [Hit(id=row[0], text=row[1], metadata=dict(row[2]), score=0.0) for row in rows[:k]]
 
 
 class _Embeddings:
@@ -123,17 +114,17 @@ def test_bm25_route_respects_sources_and_k_larger_than_filtered_corpus():
         assert all(doc.metadata["bm25_rank"] and doc.metadata["vec_rank"] is None for doc in only_yi)
 
 
-def test_vector_route_passes_where_filter_and_hybrid_respects_it():
+def test_vector_route_passes_sources_filter_and_hybrid_respects_it():
     with tempfile.TemporaryDirectory() as tmp:
         collection = _Collection()
         retriever = _retriever(collection, cache_dir=Path(tmp))
         docs = retriever.invoke("关键路径", mode="vector", sources=["甲书.pdf", "丙书.md"])
-        assert collection.query_kwargs[-1] == {"source": {"$in": ["/Users/x/data/甲书.pdf", "/Users/x/data/丙书.md"]}}
+        assert collection.query_kwargs[-1] == ["/Users/x/data/甲书.pdf", "/Users/x/data/丙书.md"]
         assert set(_ids(docs)) == {"d1", "d2", "d4"}
         hybrid = retriever.invoke("关键路径", mode="hybrid", sources=["乙书.pdf"])
         assert set(_ids(hybrid)) == {"d3", "d5"}
         retriever.invoke("关键路径", mode="vector")
-        assert collection.query_kwargs[-1] is None  # 不过滤时不传 where
+        assert collection.query_kwargs[-1] is None  # 不过滤时 sources=None
         retriever.invoke("关键路径", mode="vector", sources=[])
         assert collection.query_kwargs[-1] is None  # 空列表等于不过滤
 
@@ -165,10 +156,9 @@ def test_vector_only_retriever_builds_catalog_lazily_for_sources():
         assert retriever.bm25_built_at is None and retriever.bm25_chunk_count is None
 
 
-def test_real_chroma_where_filter_with_k_larger_than_filtered_count():
+def test_real_chroma_store_filter_with_k_larger_than_filtered_count():
     with tempfile.TemporaryDirectory() as tmp:
-        client = chromadb.PersistentClient(path=str(Path(tmp) / "chroma"))
-        collection = client.get_or_create_collection("rag")
+        collection = ChromaStore(Path(tmp) / "chroma", "rag")
         collection.upsert(
             ids=[row[0] for row in LEGACY],
             embeddings=[[float(i), 1.0] for i in range(len(LEGACY))],
@@ -179,10 +169,10 @@ def test_real_chroma_where_filter_with_k_larger_than_filtered_count():
             collection, cache_dir=Path(tmp) / "cache", embeddings=_Embeddings((1.0, 1.0)),
             mode="vector", build_bm25=True, final_k=20,
         )
-        docs = retriever.invoke("anything", sources=["甲书.pdf"])  # n_results=20，但过滤后只有 2 个
+        docs = retriever.invoke("anything", sources=["甲书.pdf"])  # k=20，但过滤后只有 2 个
         assert set(_ids(docs)) == {"d1", "d2"}
         assert all(doc.metadata["source"].endswith("甲书.pdf") for doc in docs)
-        assert retriever._vector_route("q", 5, ["/no/such/source.pdf"]) == []  # where 零匹配 -> 空
+        assert retriever._vector_route("q", 5, ["/no/such/source.pdf"]) == []  # 过滤零匹配 -> 空
         hybrid = retriever.invoke("关键路径", mode="hybrid", sources=["乙书.pdf"])
         assert set(_ids(hybrid)) == {"d3", "d5"}
 

@@ -143,6 +143,7 @@ class HealthResponse(BaseModel):
     device: str
     mode: Mode
     llm_configured: bool
+    vector_store: str = Field(description="向量库后端（RAG_VECTOR_STORE）：chroma / qdrant")
     llm_protocol: str = Field(description="大模型协议（RAG_LLM_PROTOCOL），目前只有 openai")
     llm_model: str | None = Field(description="回答模型名（RAG_LLM_MODEL）；未配置为 null")
     agent_ready: bool = Field(description="对话 Agent（/chat）是否就绪；大模型未配置或索引缺失时为 false")

@@ -27,6 +27,7 @@ dependencies = [
     "pydantic-settings==2.14.2",
     "httpx==0.28.1",
     "python-multipart==0.0.32",
+    "qdrant-client==1.19.1",
 ]
 
 [project.scripts]

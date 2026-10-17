@@ -11,7 +11,7 @@
 
 文档管理（POST /documents、POST /ingest、DELETE /documents/{name}）也在本进程内完成：
 入库任务在后台线程里跑（同一时刻只有一个），每个批次单独持有 pipeline.lock，批间释放，/search 可以插进来；
-任务结束后重建 BM25 快照并原子替换。命令行 ragbase ingest --full（会删除整个 chroma_db）不能和服务同时运行。
+任务结束后重建 BM25 快照并原子替换。命令行 ragbase ingest --full（会清空整个向量库）不能和服务同时运行；本地 Qdrant 目录同一时刻也只允许一个进程打开。
 
 Web 界面：web/ 目录是前端工程，pnpm build 后产物在 web/dist（RAG_WEB_DIST 可改），本服务在同一端口托管它：
 /assets/* 是静态资源，/、/library、/c/{session_id} 返回 index.html（前端路由）；API 路由不受影响。
@@ -105,7 +105,7 @@ def default_ingest_fn(pipeline: RAGPipeline, settings: Settings, progress):
     """真实入库：向量化用流水线里同一个 embedding 模型，每个批次持 pipeline.lock。"""
     return run_ingest(
         settings.data_dir,
-        pipeline.retriever.collection,
+        pipeline.retriever.store,
         pipeline.embeddings.embed_documents,
         settings.meta_file,
         lock=pipeline.lock,
@@ -219,7 +219,7 @@ def create_app(pipeline_factory=None, settings: Settings | None = None, ingest_f
     async def lifespan(app: FastAPI):
         app.state.pipeline = None
         app.state.chat = None
-        count = collection_count(str(settings.db_dir))
+        count = collection_count(settings)
         if settings.data_dir.is_dir():
             for leftover in settings.data_dir.glob(".upload-*.tmp"):  # 上次上传中途崩溃留下的临时文件
                 leftover.unlink(missing_ok=True)
@@ -233,6 +233,12 @@ def create_app(pipeline_factory=None, settings: Settings | None = None, ingest_f
             if app.state.chat is None:
                 logger.warning("大模型未配置，对话 Agent 未启用（/chat 返回 503）")
         yield
+        store = getattr(getattr(app.state.pipeline, "retriever", None), "store", None)
+        if store is not None:
+            try:
+                store.close()  # 释放本地向量库的目录锁
+            except Exception:
+                logger.exception("关闭向量库失败")
 
     app = FastAPI(title="RAG 服务", version="0.1.0", lifespan=lifespan)
     app.state.settings = settings
@@ -289,7 +295,7 @@ def create_app(pipeline_factory=None, settings: Settings | None = None, ingest_f
     def health(request: Request):
         """服务状态：索引 / 模型都就绪才是 ok；索引缺失时服务仍可启动，这里报告 not_ready。"""
         pipeline = request.app.state.pipeline
-        count = collection_count(str(settings.db_dir))
+        count = collection_count(settings)
         retriever = pipeline.retriever if pipeline is not None else None
         return HealthResponse(
             status="ok" if pipeline is not None and count else "not_ready",
@@ -302,6 +308,7 @@ def create_app(pipeline_factory=None, settings: Settings | None = None, ingest_f
             llm_configured=(
                 pipeline.answer_chain is not None if pipeline is not None else settings.llm_configured
             ),
+            vector_store=settings.vector_store,
             llm_protocol=settings.llm_protocol,
             llm_model=settings.llm_model,  # 模型名不是密钥
             agent_ready=request.app.state.chat is not None,
@@ -571,7 +578,7 @@ def create_app(pipeline_factory=None, settings: Settings | None = None, ingest_f
                 count = delete_document(
                     name,
                     settings.data_dir,
-                    retriever.collection,
+                    retriever.store,
                     settings.meta_file,
                     lock=pipeline.lock,
                     sources=retriever.resolve_sources([name]) if indexed else None,

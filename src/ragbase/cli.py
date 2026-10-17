@@ -1,6 +1,6 @@
-"""ragbase 命令行入口：serve / ingest / ask / chat / eval 五个子命令。
+"""ragbase 命令行入口：serve / ingest / ask / chat / eval / migrate-store 六个子命令。
 
-- 子命令的重型依赖（torch、chromadb、ragas 等）都在各自的处理函数里才导入，所以 `ragbase --help` 很快。
+- 子命令的重型依赖（torch、chromadb、qdrant-client、ragas 等）都在各自的处理函数里才导入，所以 `ragbase --help` 很快。
 - 数据、索引、.env 等默认位置都在项目主目录下：环境变量 RAG_HOME，未设置则为当前工作目录（见 ragbase.config）。
 """
 import argparse
@@ -9,7 +9,7 @@ import sys
 import uuid
 
 from ragbase import __version__
-from ragbase.config import get_settings, load_env
+from ragbase.config import VECTOR_STORES, get_settings, load_env
 
 LLM_MISSING_HINT = "错误：请先在 .env 里配置 RAG_LLM_API_KEY、RAG_LLM_MODEL 和 RAG_LLM_BASE_URL（旧的 ARK_* 变量同样有效）"
 INDEX_MISSING_HINT = "错误：索引不存在或为空，请先运行：ragbase ingest --full"
@@ -50,25 +50,25 @@ def _cmd_ingest(args) -> None:
 
 def _ingest_incremental() -> None:
     """增量构建：只处理新增 / 修改的文档，删除已不存在的；首次运行（库为空）等价于全量。"""
-    import chromadb
-
-    from ragbase.ingest.common import COLLECTION
     from ragbase.ingest.service import print_progress, run_ingest
+    from ragbase.vectorstores import create_vector_store
 
     settings = get_settings()
-    client = chromadb.PersistentClient(path=str(settings.db_dir))
-    collection = client.get_or_create_collection(COLLECTION)
-    result = run_ingest(
-        settings.data_dir,
-        collection,
-        LazyEmbedder(),
-        settings.meta_file,
-        progress=print_progress,
-    )
-    if result.failed_files:
-        print(f"\n有 {len(result.failed_files)} 个文件入库失败，其余文件已写入；修复后重新运行即可重试。")
-    if result.changed:
-        print(f"\n完成！当前向量库共 {result.total_chunks} 个片段，存于 {settings.db_dir}")
+    store = create_vector_store(settings)
+    try:
+        result = run_ingest(
+            settings.data_dir,
+            store,
+            LazyEmbedder(),
+            settings.meta_file,
+            progress=print_progress,
+        )
+        if result.failed_files:
+            print(f"\n有 {len(result.failed_files)} 个文件入库失败，其余文件已写入；修复后重新运行即可重试。")
+        if result.changed:
+            print(f"\n完成！当前向量库共 {result.total_chunks} 个片段，存于 {store.location}（{store.name}）")
+    finally:
+        store.close()
     if result.failed_files:
         raise SystemExit(1)
 
@@ -76,19 +76,15 @@ def _ingest_incremental() -> None:
 def _ingest_full() -> None:
     """全量重建：先清空旧索引再重建。
 
-    警告：会删除整个 chroma_db 目录。HTTP 服务（ragbase serve）运行期间绝对不要运行它——
-    服务进程还握着旧的索引文件；服务在线时请用 POST /documents、POST /ingest 增量更新。
+    警告：会清空整个向量库（Chroma 集合 / Qdrant 集合）。HTTP 服务（ragbase serve）运行期间绝对不要运行它——
+    服务进程还握着旧的索引；服务在线时请用 POST /documents、POST /ingest 增量更新。
     """
-    import shutil
-
-    import chromadb
-
-    from ragbase.ingest.common import COLLECTION
     from ragbase.ingest.parser import list_documents, report_skipped
     from ragbase.ingest.service import print_progress, run_ingest
+    from ragbase.vectorstores import create_vector_store
 
     settings = get_settings()
-    data_dir, db_dir, meta_file = settings.data_dir, settings.db_dir, settings.meta_file
+    data_dir, meta_file = settings.data_dir, settings.meta_file
     docs_paths, skipped = list_documents(data_dir)
     if not docs_paths:
         report_skipped(skipped)
@@ -96,28 +92,62 @@ def _ingest_full() -> None:
         print("支持格式：PDF / Word(.docx) / Markdown / 纯文本")
         return
 
-    # 清空旧索引后重建
-    if db_dir.exists():
-        shutil.rmtree(db_dir)
-    # 避免重建中断后留下与半成品索引不匹配的旧元数据
-    meta_file.unlink(missing_ok=True)
+    store = create_vector_store(settings)
+    try:
+        # 清空旧索引后重建
+        store.reset()
+        # 避免重建中断后留下与半成品索引不匹配的旧元数据
+        meta_file.unlink(missing_ok=True)
 
-    # 本地 embedding：Qwen3-Embedding-0.6B（2025年，100+语言含中文+代码）
-    print("加载本地 embedding 模型 Qwen3-Embedding-0.6B...")
-    from ragbase.models.embeddings import Qwen3Embeddings
+        # 本地 embedding：Qwen3-Embedding-0.6B（2025年，100+语言含中文+代码）
+        print("加载本地 embedding 模型 Qwen3-Embedding-0.6B...")
+        from ragbase.models.embeddings import Qwen3Embeddings
 
-    embeddings = Qwen3Embeddings()
-    client = chromadb.PersistentClient(path=str(db_dir))
-    collection = client.get_or_create_collection(COLLECTION)
+        embeddings = Qwen3Embeddings()
+        # 库已清空、无元数据，run_ingest 会把所有文件当作新增；每个文件成功后才写入其元数据
+        result = run_ingest(data_dir, store, embeddings.embed_documents, meta_file, progress=print_progress)
+    finally:
+        store.close()
 
-    # 库已清空、无元数据，run_ingest 会把所有文件当作新增；每个文件成功后才写入其元数据
-    result = run_ingest(data_dir, collection, embeddings.embed_documents, meta_file, progress=print_progress)
-
-    print(f"\n完成！共写入 {result.chunks_added} 个片段，向量库已存到 {db_dir}")
+    print(f"\n完成！共写入 {result.chunks_added} 个片段，向量库（{store.name}）已存到 {store.location}")
     if result.failed_files:
         print(f"有 {len(result.failed_files)} 个文件入库失败（见上方提示），修复后可运行 ragbase ingest 重试。")
         raise SystemExit(1)
     print("现在可以运行：ragbase ask 开始问答")
+
+
+# ---------------------------------------------------------------- migrate-store（向量库后端间迁移）
+
+def _cmd_migrate_store(args) -> None:
+    from ragbase.vectorstores import create_vector_store
+    from ragbase.vectorstores.migrate import MigrationError, migrate_store
+
+    settings = get_settings()
+    target_name = args.to
+    source_name = args.from_ or next(name for name in VECTOR_STORES if name != target_name)
+    if source_name == target_name:
+        print(f"错误：源库与目标库相同（{source_name}）")
+        raise SystemExit(2)
+    source = create_vector_store(settings, backend=source_name)
+    target = create_vector_store(settings, backend=target_name)
+    print(f"迁移：{source_name}（{source.location}）-> {target_name}（{target.location}），集合 {settings.collection}")
+    print("提示：服务（ragbase serve）运行期间不要迁移；迁移不重新向量化，片段 ID 与正文不变，.ingest_meta.json 和 BM25 缓存继续有效。")
+    try:
+        result = migrate_store(
+            source,
+            target,
+            batch_size=args.batch_size,
+            force=args.force,
+            progress=lambda done, total: print(f"  已复制 {done}/{total}"),
+        )
+    except MigrationError as exc:
+        print(f"错误：{exc}")
+        raise SystemExit(1)
+    finally:
+        source.close()
+        target.close()
+    print(f"完成：源库 {result.source_count} 个片段，已复制 {result.copied}，目标库现有 {result.target_count}。")
+    print(f"现在把 RAG_VECTOR_STORE={target_name} 写进 .env 并重启服务即可使用新的向量库。")
 
 
 # ---------------------------------------------------------------- ask（原 query.py）
@@ -132,7 +162,7 @@ def _cmd_ask(args) -> None:
     if not settings.llm_configured:
         print(LLM_MISSING_HINT)
         return
-    if not collection_count(settings.db_dir):
+    if not collection_count(settings):
         print(INDEX_MISSING_HINT)
         return
 
@@ -232,7 +262,7 @@ def _cmd_chat(args) -> None:
     if not settings.llm_configured:
         print(LLM_MISSING_HINT)
         return
-    if not collection_count(settings.db_dir):
+    if not collection_count(settings):
         print(INDEX_MISSING_HINT)
         return
 
@@ -285,7 +315,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="ragbase：本地 RAG 知识库（项目主目录由环境变量 RAG_HOME 指定，默认当前目录）",
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
-    sub = parser.add_subparsers(dest="command", metavar="{serve,ingest,ask,chat,eval}", required=True)
+    sub = parser.add_subparsers(dest="command", metavar="{serve,ingest,ask,chat,eval,migrate-store}", required=True)
 
     serve = sub.add_parser("serve", help="启动 HTTP 服务（含 Web 界面）", description="启动 HTTP 服务（单进程，不要多 worker）")
     serve.add_argument("--host", default=None, help=f"监听地址（默认 {settings.host}，可由 RAG_HOST 设置）")
@@ -296,7 +326,7 @@ def build_parser() -> argparse.ArgumentParser:
         "ingest",
         help="构建向量索引（默认增量；--full 全量重建）",
         description=(
-            "扫描 data/ 下的文档（PDF / Word(.docx) / Markdown / 纯文本）-> 切分 -> 向量化 -> 存入 ChromaDB。"
+            "扫描 data/ 下的文档（PDF / Word(.docx) / Markdown / 纯文本）-> 切分 -> 向量化 -> 存入向量库（RAG_VECTOR_STORE：chroma 或 qdrant）。"
             "默认增量：只处理新增 / 修改的文档，删除已不存在的；首次运行等价于全量。"
             "服务（ragbase serve）运行时请用 POST /ingest，不要同时运行本命令。"
         ),
@@ -304,7 +334,7 @@ def build_parser() -> argparse.ArgumentParser:
     ingest.add_argument(
         "--full",
         action="store_true",
-        help="全量重建：先删除整个 chroma_db 再重建（服务运行期间绝对不要使用）",
+        help="全量重建：先清空整个向量库再重建（服务运行期间绝对不要使用）",
     )
     ingest.set_defaults(func=_cmd_ingest)
 
@@ -387,6 +417,21 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"只把精排得分不低于该值的片段交给 LLM（top1 总是保留；默认 {settings.context_min_score}；0 表示不过滤）",
     )
     ev.set_defaults(func=_cmd_eval)
+
+    migrate = sub.add_parser(
+        "migrate-store",
+        help="把向量库从一个后端迁移到另一个（不重新向量化）",
+        description=(
+            "把 ID、向量、正文和元数据按批从源向量库复制到目标向量库，不重新向量化，所以很快且不需要加载模型。"
+            "两个后端各自的位置取自配置（Chroma：RAG_DB_DIR；Qdrant：RAG_QDRANT_PATH 或 RAG_QDRANT_URL），集合名取 RAG_COLLECTION。"
+            "目标库非空时拒绝，加 --force 会先清空目标库。服务运行期间不要迁移。"
+        ),
+    )
+    migrate.add_argument("--to", required=True, choices=VECTOR_STORES, help="目标后端")
+    migrate.add_argument("--from", dest="from_", choices=VECTOR_STORES, default=None, help="源后端（默认：另一个后端）")
+    migrate.add_argument("--force", action="store_true", help="目标库非空时先清空它再复制")
+    migrate.add_argument("--batch-size", type=int, default=500, help="每批复制的片段数（默认 500）")
+    migrate.set_defaults(func=_cmd_migrate_store)
     return parser
 
 

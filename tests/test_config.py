@@ -47,6 +47,9 @@ def test_defaults_match_current_behavior():
     assert settings.meta_file == root / ".ingest_meta.json" and settings.cache_dir == root / ".bm25_cache"
     assert settings.web_dist == root / "web" / "dist"
     assert settings.max_upload_mb == 300
+    # 向量库默认仍是 Chroma，集合名 rag；Qdrant 本地目录默认在主目录下
+    assert (settings.vector_store, settings.collection) == ("chroma", "rag")
+    assert settings.qdrant_path == root / "qdrant_db" and settings.qdrant_url is None and settings.qdrant_api_key is None
     assert rag_pipeline.RERANK_MIN_SCORE == RERANK_MIN_SCORE  # 旧的导入路径仍可用
 
 
@@ -141,7 +144,7 @@ def test_eval_llm_overrides_fall_back_to_main():
 def test_invalid_values_rejected():
     for kwargs in (
         {"mode": "nope"}, {"device": "tpu"}, {"min_score": 2}, {"port": 0}, {"log_level": "loud"}, {"max_upload_mb": 0},
-        {"llm_protocol": "carrier-pigeon"}, {"llm_timeout": 0}, {"llm_max_retries": -1}, {"llm_max_tokens": 0},
+        {"llm_protocol": "carrier-pigeon"}, {"vector_store": "milvus"}, {"collection": ""}, {"llm_timeout": 0}, {"llm_max_retries": -1}, {"llm_max_tokens": 0},
     ):
         try:
             _settings(**kwargs)
@@ -166,11 +169,29 @@ def test_rag_home_drives_default_paths():
             assert settings.port == 9123
             assert settings.data_dir == home / "data" and settings.db_dir == home / "chroma_db"
             assert settings.meta_file == home / ".ingest_meta.json" and settings.cache_dir == home / ".bm25_cache"
-            assert settings.web_dist == home / "web" / "dist"
+            assert settings.web_dist == home / "web" / "dist" and settings.qdrant_path == home / "qdrant_db"
             assert _settings(web_dist="dist-x").web_dist == home / "dist-x"  # 相对路径按主目录解析
             assert _settings().port == 8000  # 显式 _env_file=None 不读 .env
         finally:
             os.environ.pop("RAG_HOME", None)
+
+
+def test_vector_store_settings_from_env():
+    import os
+
+    with _without_rag_env():
+        os.environ.update({
+            "RAG_VECTOR_STORE": " Qdrant ", "RAG_COLLECTION": "kb2", "RAG_QDRANT_URL": "  ", "RAG_QDRANT_API_KEY": "secret-key-xyz",
+            "RAG_QDRANT_PATH": "/tmp/ragdemo-test-qdrant",
+        })
+        try:
+            settings = Settings(_env_file=None)
+        finally:
+            for key in ("RAG_VECTOR_STORE", "RAG_COLLECTION", "RAG_QDRANT_URL", "RAG_QDRANT_API_KEY", "RAG_QDRANT_PATH"):
+                os.environ.pop(key, None)
+    assert (settings.vector_store, settings.collection) == ("qdrant", "kb2")  # 取值忽略大小写和首尾空白
+    assert settings.qdrant_url is None and settings.qdrant_path == Path("/tmp/ragdemo-test-qdrant")  # 空白 URL 视为未设置
+    assert "secret-key-xyz" not in repr(settings) and settings.qdrant_api_key.get_secret_value() == "secret-key-xyz"
 
 
 def test_resolve_device():

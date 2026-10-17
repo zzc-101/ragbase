@@ -1,4 +1,4 @@
-"""ragbase.retrieval.hybrid 的纯单元测试（不加载模型、不访问 Chroma）。
+"""ragbase.retrieval.hybrid 的纯单元测试（不加载模型、不访问真实向量库）。
 
 运行：uv run python tests/test_hybrid.py
 """
@@ -7,6 +7,7 @@ from pathlib import Path
 
 from ragbase.retrieval import hybrid as hybrid_retriever
 from ragbase.retrieval.hybrid import HybridRetriever, rrf_fuse, tokenize
+from ragbase.vectorstores.base import Hit, Record
 
 
 def test_rrf_worked_example():
@@ -49,25 +50,19 @@ def test_tokenize_empty_query():
 
 
 class _Collection:
-    """极简 Chroma 假对象：get 返回全部片段，query 固定返回 d3 > d1 > d2 的向量排名。"""
+    """极简假向量库：iter_all 返回全部片段，query 固定返回 d3 > d1 > d2 的向量排名。"""
 
-    def __init__(self):
-        self.data = {
-            "ids": ["d1", "d2", "d3"],
-            "documents": ["关键路径法计算总浮动时间", "挣值分析与进度偏差", "红烧肉的做法"],
-            "metadatas": [{"source": "a.pdf"}, {"source": "b.pdf"}, {"source": "c.pdf"}],
-        }
+    IDS = ["d1", "d2", "d3"]
+    TEXTS = ["关键路径法计算总浮动时间", "挣值分析与进度偏差", "红烧肉的做法"]
+    METADATAS = [{"source": "a.pdf"}, {"source": "b.pdf"}, {"source": "c.pdf"}]
 
-    def get(self, include=None):
-        return self.data
+    def iter_all(self, batch_size=1000, with_vectors=False):
+        for doc_id, text, metadata in zip(self.IDS, self.TEXTS, self.METADATAS):
+            yield Record(id=doc_id, text=text, metadata=dict(metadata))
 
-    def query(self, query_embeddings, n_results, include=None):
-        order = [2, 0, 1][:n_results]
-        return {
-            "ids": [[self.data["ids"][i] for i in order]],
-            "documents": [[self.data["documents"][i] for i in order]],
-            "metadatas": [[self.data["metadatas"][i] for i in order]],
-        }
+    def query(self, embedding, k, sources=None):
+        order = [2, 0, 1][:k]
+        return [Hit(id=self.IDS[i], text=self.TEXTS[i], metadata=dict(self.METADATAS[i]), score=0.0) for i in order]
 
 
 class _Embeddings:
