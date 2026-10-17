@@ -1,6 +1,6 @@
 """对话 Agent 的单元测试：假检索流水线 + 脚本化的假工具调用模型（不加载模型、不访问网络、不调用真实大模型）。
 
-覆盖：工具格式与拒答 / 未知书名消息、一轮内多次检索的引用编号稳定、/chat 与 /chat/stream、多轮历史与裁剪、
+覆盖：工具格式与拒答 / 未知书名消息、一轮内多次检索的引用编号稳定、会话级引用编号（跨轮连续 / 沿用历史编号 / 回滚 / 历史接口带 citations / 删除清空）、/chat 与 /chat/stream、多轮历史与裁剪、
 工具 / 模型调用上限、会话 GET / DELETE、失败回滚与 504 / 502、未配置大模型的 503、会话淘汰、同会话串行。
 
 运行：uv run python tests/test_agent.py
@@ -29,7 +29,7 @@ import api
 from agent_tools import NOT_FOUND_MESSAGE, format_fragment
 from chat_agent import MODEL_LIMIT_MESSAGE, SessionRegistry, build_chat_service
 from config import Settings
-from rag_pipeline import RAGPipeline
+from rag_pipeline import GenerationError, RAGPipeline
 
 logging.disable(logging.CRITICAL)  # 失败路径会 logger.exception，测试输出里不需要这些堆栈
 
@@ -39,7 +39,7 @@ SCRATCH = Path(_SCRATCH.name)
 
 # ---------------------------------------------------------------- 假检索流水线
 class _Retriever:
-    """三个候选：c0（book.pdf，第 12 页，有章节）、c1（book.pdf，无页码无章节）、c2（other.pdf）。"""
+    """五个候选：c0（book.pdf，第 12 页，有章节）、c1（book.pdf，无页码无章节）、c2（other.pdf）、c3 / c4（book.pdf）。"""
 
     NAMES = ["book.pdf", "other.pdf"]
 
@@ -62,7 +62,7 @@ class _Retriever:
                 "page": 11 if i == 0 else None,
                 **({"heading_path": "第1章 概述 > 1.1 范围"} if i == 0 else {}),
             })
-            for i in range(3)
+            for i in range(5)
         ]
         return [d for d in docs if not sources or Path(d.metadata["source"]).name in sources]
 
@@ -71,7 +71,7 @@ class _Reranker:
     """按问题返回预设的 (候选下标, 得分)；默认 c0=0.99、c1=0.96。"""
 
     def __init__(self):
-        self.by_query = {"红烧肉怎么做": [(0, 0.1)], "B": [(1, 0.99), (2, 0.97)]}
+        self.by_query = {"红烧肉怎么做": [(0, 0.1)], "B": [(1, 0.99), (2, 0.97)], "C": [(3, 0.99), (4, 0.97), (1, 0.96)]}
 
     def rerank_with_scores(self, query, documents, top_k=5):
         scores = self.by_query.get(query, [(0, 0.99), (1, 0.96)])
@@ -247,10 +247,112 @@ def test_citation_numbers_stable_across_tool_calls():
     assert first.startswith("[1] 来源：《book》> 第1章 概述 > 1.1 范围（第12页）\n内容：片段文本0\n\n[2] 来源：《book》\n内容：片段文本1")
     assert second.startswith("[2] 来源：《book》\n内容：片段文本1\n\n[3] 来源：《other》\n内容：片段文本2")
     assert [(n, d.metadata["chunk_id"]) for n, d in result.citations] == [(1, "c0"), (3, "c2")]  # 只返回回答里标注过的，编号不变
-    # 下一轮重新编号（登记表按轮新建）
+    # 同一会话的下一轮沿用编号（登记表按会话保存）：重新检索到 c0 仍是 [1]
     model.script += [search("A"), say("再答[1]")]
     again = service.chat("s", "再问")
     assert [(n, d.metadata["chunk_id"]) for n, d in again.citations] == [(1, "c0")]
+    # 不同会话的编号互不影响：新会话从 1 起
+    model.script += [search("B"), say("别的会话[1]")]
+    other = service.chat("other", "问")
+    assert [(n, d.metadata["chunk_id"]) for n, d in other.citations] == [(1, "c1")]
+
+
+def _cited(result_citations):
+    return [(n, d.metadata["chunk_id"]) for n, d in result_citations]
+
+
+def test_citations_reused_from_history_without_tool_call():
+    # 第 1 轮检索得到 [1][2][3]；第 2 轮不调用工具、沿用历史里的 [2][3] -> citations 仍能解析到 c1 c2（流式同理）
+    model = ScriptedModel(script=[
+        search("A"), search("B"), say("甲[1]乙[2]丙[3]"),
+        say("公式见[2]，小于1见[3]。"),
+        say("再次沿用[2]，并误写了不存在的[9]。"),
+    ])
+    service = _service(model)
+    first = service.chat("s", "CPI 是什么")
+    assert _cited(first.citations) == [(1, "c0"), (2, "c1"), (3, "c2")]
+    second = service.chat("s", "公式是什么")
+    assert second.tool_calls == [] and _cited(second.citations) == [(2, "c1"), (3, "c2")]
+    # 流式：citations 事件同样按会话级编号解析；没登记过的 [9] 不会产生引用
+    events = list(service.stream("s", "再问"))
+    assert [name for name, _ in events if name == "citations"] == ["citations"]
+    assert _cited(dict(events)["citations"]["citations"]) == [(2, "c1")]
+
+
+def test_citation_numbers_continue_across_turns():
+    # 第 1 轮 A -> c0 c1 = [1][2]；第 2 轮 C -> c3 c4 c1：新片段接着编 [3][4]，重复的 c1 仍是 [2]
+    model = ScriptedModel(script=[search("A"), say("甲[1]乙[2]"), search("C"), say("新[3]新[4]旧[2]")])
+    service = _service(model)
+    service.chat("s", "问1")
+    second = service.chat("s", "问2")
+    assert second.tool_calls == [{"name": "search_knowledge", "args": {"query": "C"}}]
+    assert _tool_texts(service, "s")[1].startswith("[3] 来源：《book》\n内容：片段文本3\n\n[4] 来源：《book》\n内容：片段文本4\n\n[2] 来源：《book》\n内容：片段文本1")
+    assert _cited(second.citations) == [(2, "c1"), (3, "c3"), (4, "c4")]
+
+
+def test_failed_turn_rolls_back_citation_registry():
+    def boom(messages):
+        raise RuntimeError("upstream exploded")
+
+    # 第 2 轮检索到 c3 c4 后大模型失败：本轮新登记的 [3][4] 一并撤销，第 3 轮从失败前的计数（2）接着编
+    model = ScriptedModel(script=[search("A"), say("甲[1]乙[2]"), search("C"), boom, search("C"), say("新[3]新[4]")])
+    service = _service(model)
+    service.chat("s", "问1")
+    registry = service.sessions.citations("s")
+    assert registry.mark() == 2
+    try:
+        service.chat("s", "问2")
+        raise AssertionError("应当抛出 GenerationError")
+    except GenerationError:
+        pass
+    assert registry.mark() == 2 and [n for n, _ in registry.all()] == [1, 2]
+    third = service.chat("s", "问3")
+    assert _cited(third.citations) == [(3, "c3"), (4, "c4")]
+    # 流式中途放弃（关闭生成器）也回滚本轮登记
+    model.script += [search("C"), say("不会走到")]
+    stream = service.stream("s", "问4")
+    for name, _ in stream:
+        if name == "tool_call":
+            break
+    stream.close()
+    assert registry.mark() == 4  # 第 3 轮登记的 [3][4] 保留；第 4 轮只重复登记已有片段，没有新增
+    # 首轮失败：空会话整体删除，登记表也清空
+    fresh = _service(ScriptedModel(script=[search("A"), boom]))
+    try:
+        fresh.chat("n", "问")
+    except GenerationError:
+        pass
+    assert fresh.history("n") is None and fresh.sessions.citations("n").mark() == 0
+
+
+def test_history_endpoint_returns_citations_for_assistant_messages():
+    model = ScriptedModel(script=[search("A"), say("答[1]与[2]"), say("沿用[2]，另有[7]")])
+    with _client(model) as client:
+        client.post("/chat", json={"message": "问1", "session_id": "h1"})
+        client.post("/chat", json={"message": "问2", "session_id": "h1"})
+        messages = client.get("/chat/sessions/h1").json()["messages"]
+        assert [m["role"] for m in messages] == ["user", "assistant", "tool", "assistant", "user", "assistant"]
+        first, second = messages[3]["citations"], messages[5]["citations"]
+        assert [c["n"] for c in first] == [1, 2] and first[0]["chunk_id"] == "c0" and first[0]["page"] == 12
+        assert first[0]["heading_path"] == "第1章 概述 > 1.1 范围" and first[0]["source"] == "book.pdf"
+        assert [(c["n"], c["chunk_id"]) for c in second] == [(2, "c1")]  # 沿用历史编号；未登记的 [7] 不返回
+
+
+def test_session_delete_and_eviction_clear_citation_registry():
+    service = _service(ScriptedModel(script=[search("A"), say("甲[1]乙[2]"), search("B"), say("新[1]")]), chat_max_sessions=1)
+    service.chat("s", "问")
+    registry = service.sessions.citations("s")
+    assert registry.mark() == 2
+    assert service.delete("s") is True
+    assert registry.mark() == 0 and service.history("s") is None
+    # 删除后同名会话重新开始，编号从 1 起（B 的第一个片段是 c1）
+    again = service.chat("s", "再问")
+    assert _cited(again.citations) == [(1, "c1")]
+    # 淘汰：上限 1，新会话进来时旧会话连同登记表一起被丢弃
+    other = _service(ScriptedModel(script=[say("一"), say("二")]), chat_max_sessions=1)
+    other.chat("a", "问")
+    other.chat("b", "问")
+    assert other.sessions.citations("a") is None and other.sessions.citations("b") is not None
 
 
 def test_chat_endpoint_happy_path_and_validation():
@@ -366,7 +468,9 @@ def test_session_get_and_delete():
         assert roles == ["user", "assistant", "tool", "assistant"], body
         assert body["messages"][1]["tool_calls"] == [{"name": "search_knowledge", "args": {"query": "A"}}]
         assert body["messages"][2]["content"].startswith("[search_knowledge] [1] 来源：《book》") and len(body["messages"][2]["content"]) < 120
-        assert body["messages"][3] == {"role": "assistant", "content": "答[1]", "tool_calls": None}
+        assert body["messages"][3]["content"] == "答[1]" and body["messages"][3]["tool_calls"] is None
+        assert [c["n"] for c in body["messages"][3]["citations"]] == [1]
+        assert all(m["citations"] == [] for m in body["messages"][:3])  # 用户 / 工具 / 发起工具调用的助手消息没有引用
         _assert_error(client.get("/chat/sessions/nope"), 404, "not_found")
         _assert_error(client.get("/chat/sessions/bad%20id"), 422, "validation_error")
         assert client.delete("/chat/sessions/keep-1").json() == {"session_id": "keep-1", "deleted": True}

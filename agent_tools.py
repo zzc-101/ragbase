@@ -1,12 +1,13 @@
-"""对话 Agent 的工具：search_knowledge（检索知识库）与 list_documents（列出书目），以及本轮的引用登记表。
+"""对话 Agent 的工具：search_knowledge（检索知识库）与 list_documents（列出书目），以及会话级的引用登记表。
 
 多轮改写不单独做一步：search_knowledge 的描述要求模型把 query 写成不依赖上下文的完整问句
 （代词 / 省略已在对话里补全），检索直接用这个 query。
 
-引用编号：同一轮用户消息内，模型可能多次调用 search_knowledge，片段编号必须全轮唯一且稳定
-（同一个 chunk_id 永远是同一个编号），最终回答里的 [n] 才能对应到 citations。
+引用编号：登记表按会话保存（随会话存活、被淘汰），多轮共用——片段编号在整个会话内唯一且稳定
+（同一个 chunk_id 永远是同一个编号，后续轮次的新片段接着往下编），最终回答里的 [n] 才能对应到 citations；
+模型直接沿用历史里出现过的编号作答时，也能解析到对应片段。某一轮失败回滚时，用 mark / rollback 撤销该轮新登记的片段。
 登记表走 LangGraph 的运行时上下文（create_agent 的 context_schema + 工具里的 ToolRuntime）：
-每次 agent.invoke / stream 都传入一个新的 ChatContext，工具从 runtime.context 取到它——
+每次 agent.invoke / stream 都传入一个 ChatContext（带上该会话的登记表），工具从 runtime.context 取到它——
 比 ContextVar 可靠：工具在线程池里执行，ContextVar 需要靠拷贝上下文才能传到，而显式传入的 context 不依赖这一点。
 """
 import logging
@@ -42,7 +43,7 @@ class ToolRetrievalError(RuntimeError):
 
 
 class CitationRegistry:
-    """一轮用户消息内的引用登记表：同一 chunk_id 返回同一个编号（1 起），线程安全。"""
+    """会话级的引用登记表：同一 chunk_id 返回同一个编号（1 起，跨轮不重置），线程安全。"""
 
     def __init__(self):
         self._lock = threading.Lock()
@@ -70,15 +71,29 @@ class CitationRegistry:
         with self._lock:
             return list(enumerate(self._docs, 1))
 
+    def mark(self) -> int:
+        """当前已登记的片段数；轮次开始时记下，失败回滚时传给 rollback。"""
+        with self._lock:
+            return len(self._docs)
+
+    def rollback(self, mark: int) -> None:
+        """撤销 mark 之后登记的片段（编号是按登记顺序连续分配的，所以直接截断即可）。"""
+        with self._lock:
+            del self._docs[mark:]
+            self._numbers = {key: number for key, number in self._numbers.items() if number <= mark}
+
+    def clear(self) -> None:
+        self.rollback(0)
+
     def cited_in(self, answer: str) -> list[tuple[int, Document]]:
-        """回答文本里实际出现过 [n] 的已登记片段（按编号升序）；编号保持不变，所以可能不连续。"""
+        """回答文本里实际出现过 [n] 的已登记片段（按编号升序，含历史轮次登记的）；编号保持不变，所以可能不连续。"""
         referenced = {int(match) for match in re.findall(r"\[(\d{1,4})\]", answer or "")}
         return [(number, doc) for number, doc in self.all() if number in referenced]
 
 
 @dataclass
 class ChatContext:
-    """每次 agent 调用传入的运行时上下文：本轮的引用登记表 + 请求里指定的默认书目过滤。"""
+    """每次 agent 调用传入的运行时上下文：所属会话的引用登记表 + 请求里指定的默认书目过滤。"""
 
     registry: CitationRegistry = field(default_factory=CitationRegistry)
     default_sources: list[str] | None = None

@@ -75,6 +75,8 @@ export interface SessionMessage {
   role: 'user' | 'assistant' | 'tool'
   content: string
   tool_calls?: ToolCallInfo[] | null
+  /** 助手消息正文里标注了 [n] 的片段（会话级编号）；其他角色为空 */
+  citations?: Citation[]
 }
 
 export interface ChatRequest {

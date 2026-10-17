@@ -35,7 +35,7 @@ export function describeStep(step: Pick<ToolStep, 'name' | 'args'>): string {
 }
 
 /** 把 GET /chat/sessions/{id} 的扁平消息还原成“用户消息 + 带工具步骤的助手回答”。
- * 历史里没有引用片段（后端只在流式 / 单轮响应里给），所以还原出的回答 citations 为空。 */
+ * 助手消息自带 citations（后端按会话级编号解析），与流式 citations 事件同形，所以重新加载的历史也能渲染引用角标和依据面板。 */
 export function messagesFromHistory(history: SessionMessage[]): ChatMessage[] {
   const result: ChatMessage[] = []
   let steps: ToolStep[] = []
@@ -47,7 +47,7 @@ export function messagesFromHistory(history: SessionMessage[]): ChatMessage[] {
       if (message.tool_calls?.length) {
         steps.push(...message.tool_calls.map((call) => ({ id: uid(), name: call.name, args: call.args, status: 'done' as const })))
       } else {
-        result.push({ id: uid(), role: 'assistant', content: message.content, steps, citations: [], status: 'done' })
+        result.push({ id: uid(), role: 'assistant', content: message.content, steps, citations: message.citations ?? [], status: 'done' })
         steps = []
       }
     }

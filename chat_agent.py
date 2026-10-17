@@ -6,6 +6,8 @@
 - 会话数有上限、空闲有 TTL：超出时淘汰最久未用的空闲会话，并从 checkpointer 里删除它的 thread。
 - 同一会话的请求串行（会话锁）；失败 / 客户端断开的那一轮会回滚，不会留下半截状态（否则下一轮的历史里可能有缺 ToolMessage 的 tool_calls，
   OpenAI 兼容服务会拒绝）。
+- 引用编号按会话保存（SessionRegistry 里每会话一个 CitationRegistry）：跨轮连续、同一片段编号不变；失败回滚时一并撤销本轮新登记的片段；
+  会话删除 / 淘汰时随之丢弃；历史裁剪不影响编号。
 - 限制：每轮工具调用上限（超出后工具被拒绝，模型据已有结果作答）、每轮模型调用上限（超出后直接结束并给出提示）。
 """
 import logging
@@ -23,7 +25,7 @@ from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, Rem
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph.message import REMOVE_ALL_MESSAGES
 
-from agent_tools import ChatContext, ToolRetrievalError, build_tools
+from agent_tools import ChatContext, CitationRegistry, ToolRetrievalError, build_tools
 from config import Settings
 from llm_factory import create_chat_model
 from rag_pipeline import GenerationError, RAGPipeline, is_timeout_error
@@ -36,7 +38,7 @@ SYSTEM_PROMPT = """你是知识库问答助手，知识库收录了《系统架�
 1. 用户的问题涉及知识库里的专业内容（概念、方法、公式、流程、考点等）时，必须先调用 search_knowledge 检索，再回答。
 2. 调用 search_knowledge 时，query 必须是自包含的完整问题：结合对话历史补全代词和省略，不要直接照抄“它”“那个”“上面说的”这类说法。
 3. 只能依据工具返回的片段回答，不要补充片段里没有的事实、数据或常识；片段只覆盖问题的一部分时，只回答有依据的部分，并说明其余部分知识库里没有。
-4. 在引用了某个片段的句子末尾用 [编号] 标注，编号取自工具返回的 [n]。只能使用本轮工具返回过的编号，不要自己编造；编号只在当次回答内有效，历史对话里出现过的编号不能沿用。
+4. 在引用了某个片段的句子末尾用 [编号] 标注，编号取自工具返回的 [n]。编号在整个对话内都有效：可以沿用本对话里更早的工具结果中出现过的编号；不要自己编造任何工具结果里没出现过的编号。
 5. 工具表示没有找到可靠的相关内容时，回答“知识库中没有相关内容”，不要编造，也不要换着说法反复检索。
 6. 寒暄、问候、关于你自己的问题可以直接回答，不需要调用工具。
 7. 回答简洁，直接给结论和依据。"""
@@ -74,7 +76,7 @@ class ChineseModelCallLimit(ModelCallLimitMiddleware):
 
 
 class SessionRegistry:
-    """会话登记：每会话一把锁（同会话串行）、最大会话数、空闲 TTL；被淘汰的会话调用 on_evict(session_id)。
+    """会话登记：每会话一把锁（同会话串行）、一个会话级引用登记表、最大会话数、空闲 TTL；被淘汰的会话调用 on_evict(session_id)。
 
     只淘汰“空闲”会话（没有请求持有或在排队等它的锁）；所有会话都忙时数量可暂时超过上限。
     """
@@ -85,6 +87,7 @@ class SessionRegistry:
         users: int = 0  # 正在使用 / 排队等锁的请求数
         last_used: float = 0.0
         updated_at: float = 0.0  # 最近一次使用的挂钟时间（epoch 秒），给会话列表展示；TTL / LRU 仍用单调时钟
+        citations: CitationRegistry = field(default_factory=CitationRegistry)  # 随会话存活，淘汰时一起丢弃
 
     def __init__(self, max_sessions: int, ttl: float, on_evict=None, clock=time.monotonic, wall_clock=time.time):
         self.max_sessions, self.ttl, self.on_evict, self.clock = max_sessions, ttl, on_evict, clock
@@ -117,7 +120,7 @@ class SessionRegistry:
 
     @contextmanager
     def session(self, session_id: str):
-        """进入会话：登记 / 续期，并持有会话锁到退出（同会话的并发请求在这里排队）。"""
+        """进入会话：登记 / 续期，并持有会话锁到退出（同会话的并发请求在这里排队）；产出该会话的引用登记表。"""
         with self._guard:
             self._expire_locked()
             entry = self._entries.get(session_id)
@@ -130,7 +133,7 @@ class SessionRegistry:
             self._entries.move_to_end(session_id)
         try:
             with entry.lock:
-                yield
+                yield entry.citations
         finally:
             with self._guard:
                 entry.users -= 1
@@ -143,6 +146,13 @@ class SessionRegistry:
         with self._guard:
             self._expire_locked()
             return session_id in self._entries
+
+    def citations(self, session_id: str) -> CitationRegistry | None:
+        """会话的引用登记表；会话不在登记表里返回 None（先清理过期的，不续期）。"""
+        with self._guard:
+            self._expire_locked()
+            entry = self._entries.get(session_id)
+            return entry.citations if entry else None
 
     def snapshot(self) -> list[tuple[str, float]]:
         """登记表里所有会话的 [(session_id, 最近使用的挂钟时间)]（先清理过期的，不续期）。"""
@@ -157,7 +167,7 @@ class SessionRegistry:
 
 @dataclass
 class ChatResult:
-    """一轮对话的结果：citations 是本轮回答里实际出现 [n] 的片段 [(n, Document)]。"""
+    """一轮对话的结果：citations 是回答里实际出现 [n] 的片段 [(n, Document)]（按会话级编号解析，可能含历史轮次登记的）。"""
 
     session_id: str
     answer: str
@@ -209,8 +219,9 @@ class ChatService:
     def _messages(self, session_id: str) -> list:
         return list(self.agent.get_state(self._config(session_id)).values.get("messages", []))
 
-    def _rollback(self, session_id: str, before: list) -> None:
-        """把会话恢复到本轮开始前的消息；本轮之前是空会话则整体删除。"""
+    def _rollback(self, session_id: str, before: list, registry: CitationRegistry, mark: int) -> None:
+        """把会话恢复到本轮开始前的消息（引用登记表也恢复到 mark）；本轮之前是空会话则整体删除。"""
+        registry.rollback(mark)
         try:
             if before:
                 self.agent.update_state(
@@ -230,14 +241,15 @@ class ChatService:
             return GenerationError(f"对话模型响应超时：{type(exc).__name__}", timeout=True)
         return GenerationError(f"对话模型调用失败：{type(exc).__name__}")
 
-    def _inputs(self, message: str, sources: list[str] | None):
-        return {"messages": [HumanMessage(content=message)]}, ChatContext(default_sources=sources or None)
+    @staticmethod
+    def _inputs(message: str, sources: list[str] | None, registry: CitationRegistry):
+        return {"messages": [HumanMessage(content=message)]}, ChatContext(registry=registry, default_sources=sources or None)
 
     def chat(self, session_id: str, message: str, sources: list[str] | None = None) -> ChatResult:
         """处理一条用户消息（非流式）。大模型失败抛 GenerationError，检索出错抛 ToolRetrievalError；失败的那一轮会被回滚。"""
-        payload, context = self._inputs(message, sources)
-        with self.sessions.session(session_id):
-            before, finished = self._messages(session_id), False
+        with self.sessions.session(session_id) as registry:
+            payload, context = self._inputs(message, sources, registry)
+            before, mark, finished = self._messages(session_id), registry.mark(), False
             try:
                 state = self.agent.invoke(payload, self._config(session_id), context=context)
                 finished = True
@@ -245,7 +257,7 @@ class ChatService:
                 raise self._convert(exc) from exc
             finally:
                 if not finished:
-                    self._rollback(session_id, before)
+                    self._rollback(session_id, before, registry, mark)
         turn = _current_turn(state["messages"])
         answer = _final_answer(turn) or EMPTY_ANSWER_MESSAGE
         return ChatResult(session_id, answer, context.registry.cited_in(answer), _tool_calls_of(turn))
@@ -258,10 +270,10 @@ class ChatService:
         token 是模型每次生成里的文本增量，立即转发；若同一次生成随后又带了 tool_calls，则后续增量不再转发。
         部分模型会在调用工具前先输出一句话，这句话会混进 token 流，所以 done.answer 才是权威的最终回答。
         """
-        payload, context = self._inputs(message, sources)
         yield "session", {"session_id": session_id}
-        with self.sessions.session(session_id):
-            before, finished = self._messages(session_id), False
+        with self.sessions.session(session_id) as registry:
+            payload, context = self._inputs(message, sources, registry)
+            before, mark, finished = self._messages(session_id), registry.mark(), False
             try:
                 streamed, final, tool_steps = "", None, set()
                 for mode, data in self.agent.stream(
@@ -294,13 +306,15 @@ class ChatService:
                 raise self._convert(exc) from exc
             finally:
                 if not finished:
-                    self._rollback(session_id, before)
+                    self._rollback(session_id, before, registry, mark)
         yield "citations", {"citations": context.registry.cited_in(answer)}
         yield "done", {"answer": answer}
 
     def history(self, session_id: str) -> list[dict] | None:
-        """会话消息 [{role, content, tool_calls?}]；会话不存在（含已被清空 / 淘汰）返回 None。工具消息只给摘要。"""
-        if not self.sessions.known(session_id):
+        """会话消息 [{role, content, tool_calls? / citations?}]；会话不存在（含已被清空 / 淘汰）返回 None。工具消息只给摘要。
+        助手消息带 citations：[(n, Document)]，按会话级登记表解析该消息正文里标注的 [n]。"""
+        registry = self.sessions.citations(session_id)
+        if registry is None:
             return None
         messages = self._messages(session_id)
         if not messages:
@@ -310,7 +324,7 @@ class ChatService:
             if isinstance(message, HumanMessage):
                 result.append({"role": "user", "content": message.text})
             elif isinstance(message, AIMessage):
-                entry = {"role": "assistant", "content": message.text}
+                entry = {"role": "assistant", "content": message.text, "citations": registry.cited_in(message.text)}
                 if message.tool_calls:
                     entry["tool_calls"] = [{"name": call["name"], "args": call["args"]} for call in message.tool_calls]
                 result.append(entry)
@@ -341,12 +355,13 @@ class ChatService:
         return result
 
     def delete(self, session_id: str) -> bool:
-        """清空会话历史（等当前请求结束）；会话不存在返回 False。登记项留给 TTL / LRU 淘汰。"""
+        """清空会话历史和引用登记表（等当前请求结束）；会话不存在返回 False。登记项留给 TTL / LRU 淘汰。"""
         if not self.sessions.known(session_id):
             return False
-        with self.sessions.session(session_id):
+        with self.sessions.session(session_id) as registry:
             existed = bool(self._messages(session_id))
             self.checkpointer.delete_thread(session_id)
+            registry.clear()
         return existed
 
 

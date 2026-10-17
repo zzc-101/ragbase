@@ -66,7 +66,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
     sourcesRef.current = validSources
   }, [validSources])
 
-  // 缓存当前会话的消息（含只在流式响应里才有的引用片段），切换会话再切回来时不丢
+  // 缓存当前会话的消息（含流式得到的引用片段，与 GET 历史里的 citations 同形），切换会话再切回来时不丢
   useEffect(() => {
     if (sessionId && !streaming && !historyLoading && messages.length) cacheRef.current.set(sessionId, messages)
   }, [sessionId, streaming, historyLoading, messages])

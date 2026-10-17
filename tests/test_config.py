@@ -59,7 +59,11 @@ def test_rag_env_prefix_and_ark_aliases():
         "RAG_DATA_DIR": "/tmp/ragdemo-test-data", "RAG_DB_DIR": "/tmp/ragdemo-test-db", "RAG_MAX_UPLOAD_MB": "50",
         "ARK_CHAT_MODEL": "ep-test", "ARK_CHAT_API_KEY": "sk-unit-test", "ARK_BASE_URL": "http://llm.test/v3",
     }
-    saved = {key: os.environ.get(key) for key in env}
+    # 本机 .env 里的 RAG_LLM_* 会被 load_dotenv 灌进 os.environ，且优先于 ARK_*，测试期间先清掉
+    shadowing = ("RAG_LLM_MODEL", "RAG_LLM_BASE_URL", "RAG_LLM_API_KEY")
+    saved = {key: os.environ.get(key) for key in (*env, *shadowing)}
+    for key in shadowing:
+        os.environ.pop(key, None)
     os.environ.update(env)
     try:
         settings = _settings()

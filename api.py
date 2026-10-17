@@ -453,6 +453,10 @@ def create_app(pipeline_factory=None, settings: Settings | None = None, ingest_f
         messages = _get_chat(request).history(session_id)
         if messages is None:
             raise HTTPException(status_code=404, detail=f"没有这个会话：{session_id}")
+        messages = [
+            {**m, "citations": [to_citation(n, doc) for n, doc in m["citations"]]} if "citations" in m else m
+            for m in messages
+        ]
         return SessionResponse(session_id=session_id, messages=messages)
 
     @app.delete("/chat/sessions/{session_id}", response_model=SessionDeleteResponse, responses=error_models)

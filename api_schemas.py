@@ -101,7 +101,7 @@ class ToolCallInfo(BaseModel):
 class ChatResponse(BaseModel):
     session_id: str
     answer: str
-    citations: list[Citation] = Field(description="回答里实际标注了 [n] 的片段；n 与回答中的 [n] 一致（可能不连续），只对本轮回答有效")
+    citations: list[Citation] = Field(description="回答里实际标注了 [n] 的片段；n 与回答中的 [n] 一致（可能不连续），编号在整个会话内稳定，回答沿用历史里的编号时也能解析")
     tool_calls: list[ToolCallInfo] = Field(description="本轮模型调用过的工具（按顺序）")
     took_ms: float
 
@@ -110,6 +110,7 @@ class SessionMessage(BaseModel):
     role: Literal["user", "assistant", "tool"]
     content: str = Field(description="工具消息只给前 80 字的摘要")
     tool_calls: list[ToolCallInfo] | None = Field(None, description="助手消息发起的工具调用")
+    citations: list[Citation] = Field(default_factory=list, description="助手消息正文里标注了 [n] 的片段（会话级编号）；其他角色为空")
 
 
 class SessionResponse(BaseModel):
