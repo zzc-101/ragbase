@@ -84,6 +84,7 @@ class Settings(BaseSettings):
     db_dir: Path = BASE_DIR / "chroma_db"  # Chroma 持久化目录
     meta_file: Path = BASE_DIR / ".ingest_meta.json"  # 增量入库的文件指纹
     cache_dir: Path = BASE_DIR / ".bm25_cache"  # BM25 分词缓存
+    web_dist: Path = BASE_DIR / "web" / "dist"  # 前端构建产物（pnpm build）；相对路径按仓库根目录解析，目录存在时由 API 服务托管
     max_upload_mb: int = Field(300, ge=1)  # POST /documents 的单文件大小上限（最大的教材 PDF 约 235 MB）
 
     # 大模型（默认 OpenAI 兼容协议）：RAG_LLM_*，未设置时回退到旧的 ARK_* 变量名（方舟，同为 OpenAI 兼容）。
@@ -109,6 +110,11 @@ class Settings(BaseSettings):
     eval_llm_base_url: str | None = None
     eval_llm_api_key: SecretStr | None = None
     eval_llm_model: str | None = None
+
+    @field_validator("web_dist")
+    @classmethod
+    def _resolve_web_dist(cls, value: Path) -> Path:
+        return value if value.is_absolute() else BASE_DIR / value
 
     @field_validator("log_level")
     @classmethod

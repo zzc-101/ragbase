@@ -15,3 +15,7 @@ data/*
 # 评估结果
 eval_results.json
 eval_results.*.json
+
+# Web 前端
+web/node_modules/
+web/dist/

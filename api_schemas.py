@@ -117,6 +117,17 @@ class SessionResponse(BaseModel):
     messages: list[SessionMessage]
 
 
+class SessionSummary(BaseModel):
+    session_id: str
+    title: str = Field(description="第一条用户消息（单行，最多 30 字，超出加省略号）")
+    updated_at: str = Field(description="最近使用时间（UTC，ISO 8601）")
+    message_count: int = Field(description="用户消息与最终回答的条数（不含工具调用步骤）")
+
+
+class SessionListResponse(BaseModel):
+    sessions: list[SessionSummary] = Field(description="按最近使用倒序；Agent 未就绪时为空列表")
+
+
 class SessionDeleteResponse(BaseModel):
     session_id: str
     deleted: bool

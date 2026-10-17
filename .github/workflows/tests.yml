@@ -49,3 +49,33 @@ jobs:
       - name: 运行全部测试
         # 测试只用本地桩 / 假流水线：不需要模型、.env、真实文档或外网（只访问 127.0.0.1 的 LLM 桩服务）
         run: .venv/bin/python tests/run_all.py
+
+  web:
+    # 前端只做类型检查 + 打包 + lint（不跑浏览器测试）；与后端测试互不依赖，并行执行
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 pnpm（版本取自 web/package.json 的 packageManager）
+        uses: pnpm/action-setup@v4
+        with:
+          package_json_file: web/package.json
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+
+      - name: 安装依赖
+        run: pnpm install --frozen-lockfile
+
+      - name: 类型检查 + 构建
+        run: pnpm build
+
+      - name: Lint
+        run: pnpm lint

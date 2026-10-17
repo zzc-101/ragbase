@@ -351,6 +351,7 @@ RAG_EVAL_LLM_MODEL=gpt-4o
 | --- | --- |
 | `POST /chat` | `{session_id?, message, sources?}` → `{session_id, answer, citations, tool_calls, took_ms}`；`session_id` 不传则新建（字母 / 数字 / `_` / `-`，最长 64）；`message` 1~2000 字；`sources` 作为检索的默认书目过滤（模型显式传了 `sources` 则以模型为准） |
 | `POST /chat/stream` | 同上，SSE 流式。事件：`session`、`tool_call`（`name` / `args`）、`token`（`text`）、`citations`、`done`（`answer` / `took_ms`）、`error`（统一错误 JSON） |
+| `GET /chat/sessions` | 会话列表 `{sessions:[{session_id, title, updated_at, message_count}]}`，按最近使用倒序；`title` 是第一条用户消息（最多 30 字）；Agent 未就绪时返回空列表（不是 503） |
 | `GET /chat/sessions/{id}` | 消息历史（`role` + `content`，工具消息只给摘要）；不存在 / 已清空 / 已过期返回 404 |
 | `DELETE /chat/sessions/{id}` | 清空会话 |
 
@@ -373,6 +374,33 @@ curl -s -X DELETE http://127.0.0.1:8000/chat/sessions/demo
 - 流式 `token` 是模型每次生成的文本增量；若模型在调用工具前先说了一句话，这句话也会出现在 token 流里，以 `done.answer` 为准。
 - 单元测试：`uv run python tests/test_agent.py`（假检索 + 假模型，不调用真实大模型）。
 
+## Web 界面
+
+`web/` 是前端工程（React + Vite + TypeScript + Tailwind CSS + shadcn/ui；路由 react-router，数据请求 TanStack Query，回答用 react-markdown 渲染），Stage 5 新增。需要 Node 22 与 pnpm。
+
+```bash
+# 开发：后端在 8000 端口运行（uv run api.py），前端 dev server 把 API 请求代理过去
+cd web && pnpm install && pnpm dev          # http://localhost:5173，热更新
+
+# 生产：构建后由 FastAPI 在同一端口托管，不需要另起前端服务
+cd web && pnpm install && pnpm build        # 产物在 web/dist
+uv run api.py                               # 浏览器打开 http://127.0.0.1:8000/
+```
+
+- **托管方式**：`web/dist` 存在时，API 服务提供 `/assets/*`（带内容哈希，长缓存）和前端路由 `/`、`/library`、`/c/{session_id}`（返回 `index.html`）；这些路径不会遮住 `GET /documents`、`/chat/sessions`、`/health` 等 JSON 接口。目录是否存在在请求时检查，服务运行中重新 `pnpm build` 立即生效；未构建时 `GET /` 返回提示“前端未构建：cd web && pnpm install && pnpm build”。构建目录可用 `RAG_WEB_DIST` 改（相对路径按仓库根目录解析）。
+- **对话页**（`/`、`/c/:id`）：左侧会话列表（`GET /chat/sessions`，可删除）；中间流式回答（`POST /chat/stream`，可随时“停止”）；回答里的 `[n]` 变成可悬停预览的引用小标，点击在右侧“依据”面板定位原文（书名、章节、页码、片段、精排得分）；检索步骤显示为回答上方的淡色折叠行；输入框旁的“范围”可限定只在某几本书里检索。窄屏（<1024px）侧栏、（<1280px）依据面板改为抽屉。
+- **知识库页**（`/library`）：书目卡片（片段数、章节覆盖率、删除）、拖拽或点击上传（`.pdf` `.docx` `.md` `.markdown` `.txt`）、“重新扫描”，以及入库任务的实时进度（轮询 `GET /ingest/jobs/{id}`，刷新页面后仍会继续显示）。
+- **状态指示**（右上角）：绿色“就绪”（索引与 Agent 都可用）、琥珀色“仅检索”（大模型未配置）、红色“未就绪 / 离线”；点开看片段数、BM25 构建时间、设备、召回模式、大模型和 Agent 状态。每 15 秒轮询 `/health`。
+- 书名显示去掉了扩展名和 z-library 之类的下载站后缀（`web/src/lib/books.ts`），完整文件名在悬停提示里。
+- 主题：浅色 / 深色 / 跟随系统，保存在浏览器 localStorage。
+- 检查：`cd web && pnpm build`（TypeScript 严格类型检查 + 打包）、`pnpm lint`（oxlint）。后端侧的单元测试：`uv run python tests/test_web.py`（会话列表、静态托管与 SPA 回退）。
+
+局限：
+- 历史会话重新打开时，后端只保存消息文本，不保存当时的引用片段，所以旧回答里的 `[n]` 只显示为普通文字（本页面会话内切换时引用保留在内存里，刷新页面后丢失）。
+- 会话只存在服务进程内存里（见“对话 Agent”），重启服务后会话列表为空。
+- 上传一次一个文件（后端同一时刻只有一个入库任务）。
+- 没有搜索实验页；`/search` 接口仍可直接调用。
+
 ## 性能设计
 
 - 已下载的 Qwen 模型优先从本机缓存加载，缓存缺失时才访问 Hugging Face Hub。
@@ -386,7 +414,7 @@ curl -s -X DELETE http://127.0.0.1:8000/chat/sessions/demo
 切分参数直接定义在代码中，其余集中在配置里：
 
 - 切分大小与重叠：[rag_common.py](rag_common.py)
-- 召回数、精排数、阈值、设备、服务地址：[config.py](config.py)（均可用 `RAG_*` 环境变量覆盖，见“服务化运行”）；`query.py` / `evaluate.py` 的命令行参数优先级更高
+- 召回数、精排数、阈值、设备、服务地址、前端构建目录：[config.py](config.py)（均可用 `RAG_*` 环境变量覆盖，见“服务化运行”）；`query.py` / `evaluate.py` 的命令行参数优先级更高
 - 本地模型与设备：[embed.py](embed.py)、[reranker.py](reranker.py)
 
 扫描版 PDF 或文本层质量较差的 PDF 需要另行增加 OCR；当前项目不会自动 OCR。

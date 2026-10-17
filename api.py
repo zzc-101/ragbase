@@ -6,12 +6,15 @@
 多 worker 会让每个进程各占一份模型显存，且 MPS 模型本身不能并发推理——
 并发请求由线程池接住，召回 + 精排在 pipeline.lock 内串行，大模型生成在锁外并行。
 
-对话 Agent（POST /chat、POST /chat/stream、GET|DELETE /chat/sessions/{id}）见 chat_agent.py：模型按需调用知识库检索工具，
+对话 Agent（POST /chat、POST /chat/stream、GET /chat/sessions、GET|DELETE /chat/sessions/{id}）见 chat_agent.py：模型按需调用知识库检索工具，
 历史按会话保存在进程内存里；检索仍走 pipeline.lock，同会话的请求串行。
 
 文档管理（POST /documents、POST /ingest、DELETE /documents/{name}）也在本进程内完成：
 入库任务在后台线程里跑（同一时刻只有一个），每个批次单独持有 pipeline.lock，批间释放，/search 可以插进来；
 任务结束后重建 BM25 快照并原子替换。命令行 ingest.py（会删除整个 chroma_db）不能和服务同时运行。
+
+Web 界面：web/ 目录是前端工程，pnpm build 后产物在 web/dist（RAG_WEB_DIST 可改），本服务在同一端口托管它：
+/assets/* 是静态资源，/、/library、/c/{session_id} 返回 index.html（前端路由）；API 路由不受影响。
 """
 import json
 import logging
@@ -26,7 +29,7 @@ from pathlib import Path
 import uvicorn
 from fastapi import FastAPI, File, HTTPException, Path as PathParam, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from api_schemas import (
@@ -44,6 +47,7 @@ from api_schemas import (
     SearchRequest,
     SearchResponse,
     SessionDeleteResponse,
+    SessionListResponse,
     SessionResponse,
     UploadResponse,
     to_chunk,
@@ -64,6 +68,7 @@ INDEX_MISSING_MESSAGE = "索引不存在或为空，请先运行 uv run ingest.p
 LLM_MISSING_MESSAGE = (
     "大模型未配置：请在 .env 中设置 RAG_LLM_API_KEY、RAG_LLM_MODEL 和 RAG_LLM_BASE_URL（旧的 ARK_* 变量同样有效）"
 )
+WEB_MISSING_HINT = "前端未构建：cd web && pnpm install && pnpm build"
 LLM_FAILED_MESSAGE = "大模型调用失败，请稍后重试"
 LLM_TIMEOUT_MESSAGE = "大模型响应超时，请稍后重试"
 INTERNAL_ERROR_MESSAGE = "服务内部错误"
@@ -432,6 +437,16 @@ def create_app(pipeline_factory=None, settings: Settings | None = None, ingest_f
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
+    @app.get("/chat/sessions", response_model=SessionListResponse, responses=error_models)
+    def list_chat_sessions(request: Request):
+        """会话列表（按最近使用倒序，供前端侧边栏）。Agent 未就绪（大模型未配置 / 索引缺失）时返回空列表而不是 503。"""
+        service = request.app.state.chat
+        if service is None:
+            return SessionListResponse(sessions=[])
+        return SessionListResponse(
+            sessions=[{**item, "updated_at": _iso(item["updated_at"])} for item in service.list_sessions()]
+        )
+
     @app.get("/chat/sessions/{session_id}", response_model=SessionResponse, responses=error_models)
     def get_chat_session(request: Request, session_id: str = PathParam(pattern=SESSION_ID_PATTERN)):
         """会话的消息历史（用户 / 助手 / 工具；工具消息只给摘要）。会话不存在、已清空或已过期返回 404。"""
@@ -562,7 +577,31 @@ def create_app(pipeline_factory=None, settings: Settings | None = None, ingest_f
             raise HTTPException(status_code=409, detail=f"{exc}，请稍后再删除") from exc
         return DeleteResponse(name=name, chunks_deleted=count)
 
+    _mount_web(app, settings.web_dist)
     return app
+
+
+def _mount_web(app: FastAPI, dist: Path) -> None:
+    """托管前端构建产物。放在所有 API 路由之后注册，且只匹配前端自己的路径（/assets/*、/、/library、/c/{id}），
+    所以不会遮住 GET /documents、/health 这类 JSON 接口。dist 是否存在在请求时才检查：服务运行中重新 pnpm build 也立即生效。"""
+    index = dist / "index.html"
+
+    def page():
+        if index.is_file():
+            return FileResponse(index, headers={"Cache-Control": "no-cache"})  # 入口页不缓存，哈希资源可长缓存
+        return HTMLResponse(f"<!doctype html><meta charset=utf-8><title>RAG 知识库</title><p>{WEB_MISSING_HINT}</p>")
+
+    for route in ("/", "/library", "/c/{session_id}"):
+        app.add_api_route(route, page, methods=["GET"], include_in_schema=False)
+
+    def asset(path: str):
+        root = (dist / "assets").resolve()
+        target = (root / path).resolve()
+        if not target.is_relative_to(root) or not target.is_file():  # 目录穿越 / 不存在 -> 404（不回退 index.html）
+            raise HTTPException(status_code=404, detail="资源不存在")
+        return FileResponse(target, headers={"Cache-Control": "public, max-age=31536000, immutable"})  # 文件名带内容哈希
+
+    app.add_api_route("/assets/{path:path}", asset, methods=["GET"], include_in_schema=False)
 
 
 app = create_app()

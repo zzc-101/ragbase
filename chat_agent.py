@@ -43,6 +43,7 @@ SYSTEM_PROMPT = """你是知识库问答助手，知识库收录了《系统架�
 
 MODEL_LIMIT_MESSAGE = "本轮处理步骤过多，已停止。请把问题拆小一些，或换个问法再试。"
 EMPTY_ANSWER_MESSAGE = "（模型没有给出回答，请重试）"
+TITLE_MAX_CHARS = 30  # 会话列表里标题（第一条用户消息）的最大长度
 
 
 class HistoryTrimMiddleware(AgentMiddleware):
@@ -83,9 +84,11 @@ class SessionRegistry:
         lock: threading.Lock = field(default_factory=threading.Lock)
         users: int = 0  # 正在使用 / 排队等锁的请求数
         last_used: float = 0.0
+        updated_at: float = 0.0  # 最近一次使用的挂钟时间（epoch 秒），给会话列表展示；TTL / LRU 仍用单调时钟
 
-    def __init__(self, max_sessions: int, ttl: float, on_evict=None, clock=time.monotonic):
+    def __init__(self, max_sessions: int, ttl: float, on_evict=None, clock=time.monotonic, wall_clock=time.time):
         self.max_sessions, self.ttl, self.on_evict, self.clock = max_sessions, ttl, on_evict, clock
+        self.wall_clock = wall_clock
         self._guard = threading.Lock()
         self._entries: OrderedDict[str, SessionRegistry._Entry] = OrderedDict()  # 最久未用的在前
 
@@ -123,6 +126,7 @@ class SessionRegistry:
                 entry = self._entries[session_id] = self._Entry()
             entry.users += 1
             entry.last_used = self.clock()
+            entry.updated_at = self.wall_clock()
             self._entries.move_to_end(session_id)
         try:
             with entry.lock:
@@ -131,6 +135,7 @@ class SessionRegistry:
             with self._guard:
                 entry.users -= 1
                 entry.last_used = self.clock()
+                entry.updated_at = self.wall_clock()
                 self._entries.move_to_end(session_id)
 
     def known(self, session_id: str) -> bool:
@@ -138,6 +143,12 @@ class SessionRegistry:
         with self._guard:
             self._expire_locked()
             return session_id in self._entries
+
+    def snapshot(self) -> list[tuple[str, float]]:
+        """登记表里所有会话的 [(session_id, 最近使用的挂钟时间)]（先清理过期的，不续期）。"""
+        with self._guard:
+            self._expire_locked()
+            return [(session_id, entry.updated_at) for session_id, entry in self._entries.items()]
 
     def __len__(self) -> int:
         with self._guard:
@@ -306,6 +317,27 @@ class ChatService:
             elif isinstance(message, ToolMessage):
                 text = message.text.replace("\n", " ")
                 result.append({"role": "tool", "content": f"[{message.name}] " + (text[:80] + "…" if len(text) > 80 else text)})
+        return result
+
+    def list_sessions(self) -> list[dict]:
+        """会话摘要 [{session_id, title, updated_at(epoch 秒), message_count}]，按最近使用倒序；空会话（已清空 / 回滚）不列出。
+        title 取第一条用户消息（压成单行，最多 TITLE_MAX_CHARS 字）；message_count 只数用户消息和最终回答（不含工具调用步骤）。"""
+        result = []
+        for session_id, updated_at in self.sessions.snapshot():
+            try:
+                messages = self._messages(session_id)
+            except Exception:
+                logger.exception("读取会话 %s 失败", session_id)
+                continue
+            users = [m for m in messages if isinstance(m, HumanMessage)]
+            if not users:
+                continue
+            title = " ".join(users[0].text.split())
+            if len(title) > TITLE_MAX_CHARS:
+                title = title[:TITLE_MAX_CHARS] + "…"
+            count = len(users) + sum(1 for m in messages if isinstance(m, AIMessage) and not m.tool_calls)
+            result.append({"session_id": session_id, "title": title, "updated_at": updated_at, "message_count": count})
+        result.sort(key=lambda item: item["updated_at"], reverse=True)
         return result
 
     def delete(self, session_id: str) -> bool:
