@@ -25,6 +25,15 @@ eval_results.json
 eval_results.*.json
 eval_results*.tmp
 
+# ragbase diagnose 的体检报告
+diagnose_report.json
+diagnose_report.tmp
+
+# 内置 SQLite 数据库（会话、题集、体检报告；WAL 模式会产生 -wal / -shm）
+ragbase.db
+ragbase.db-wal
+ragbase.db-shm
+
 # Web 前端
 web/node_modules/
 web/dist/

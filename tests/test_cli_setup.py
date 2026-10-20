@@ -15,7 +15,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from ragbase import cli, config, doctor, scaffold
-from ragbase.config import Settings, get_settings
+from ragbase.config import DEPRECATED_SETTINGS, Settings, get_settings
 from ragbase.models import download
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -78,6 +78,8 @@ def env_var_names() -> dict[str, str]:
     """Settings 每个字段对应的环境变量名（带别名的取第一个 RAG_*），从模型本身推导，新增字段后测试自动覆盖。"""
     names = {}
     for field_name, field in Settings.model_fields.items():
+        if field_name in DEPRECATED_SETTINGS:
+            continue  # 已废弃的配置项不再出现在 env.example 里（文档里单独列在“已废弃”一节）
         alias = field.validation_alias
         if alias is not None and hasattr(alias, "choices"):
             choices = [c for c in alias.choices if isinstance(c, str) and c.startswith("RAG_")]

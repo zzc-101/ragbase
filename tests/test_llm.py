@@ -8,9 +8,11 @@
 import json
 import logging
 import re
+import tempfile
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 from fastapi.testclient import TestClient
 from langchain_core.documents import Document
@@ -86,10 +88,14 @@ class StubLLM:
         return len(self.requests)
 
 
+_SCRATCH = tempfile.TemporaryDirectory(prefix="ragdemo-llm-test-")
+
+
 def _settings(stub: StubLLM, **overrides) -> Settings:
     values = dict(
         llm_model="stub-model", llm_api_key=SECRET, llm_base_url=stub.base_url,
         llm_timeout=5, llm_max_retries=0, device="cpu", log_level="WARNING",
+        db_path=Path(_SCRATCH.name) / "ragbase.db",  # 应用启动会打开内置数据库：指向临时目录，别在项目根目录生成 ragbase.db
     )
     return Settings(_env_file=None, **{**values, **overrides})
 

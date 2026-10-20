@@ -20,7 +20,7 @@ from typing import Literal, Union, get_args, get_origin
 from pydantic import SecretStr
 from pydantic_core import PydanticUndefined
 
-from ragbase.config import Settings
+from ragbase.config import DEPRECATED_SETTINGS, Settings
 
 ROOT = Path(__file__).resolve().parent.parent
 DOC_PATH = ROOT / "docs" / "configuration.md"
@@ -35,7 +35,7 @@ GROUPS: list[tuple[str, str, list[str]]] = [
         "`.env`、`bm25_userdict.txt`、`eval_questions.json`、`.ragas_cache/`、`eval_results.*.json` 的位置也由它决定（它们不是 Settings 字段，没有单独的变量）。\n\n"
         "`RAG_HOME` 必须是真正的环境变量（shell / Docker 的 `ENV`），**不能写在 `.env` 里**——`.env` 自己的位置就依赖它。"
         "下表的路径变量建议写绝对路径：除 `RAG_WEB_DIST` 外，相对路径不会按 `RAG_HOME` 解析（而是相对进程当前目录）。",
-        ["data_dir", "db_dir", "meta_file", "index_info_file", "cache_dir"],
+        ["data_dir", "db_dir", "meta_file", "index_info_file", "cache_dir", "db_path"],
     ),
     (
         "检索与拒答",
@@ -80,8 +80,8 @@ GROUPS: list[tuple[str, str, list[str]]] = [
     ),
     (
         "对话 Agent",
-        "会话只存在服务进程内存里，重启即丢。机制见 [architecture.md](architecture.md#对话-agent)。",
-        ["agent_max_tool_calls", "agent_max_model_calls", "chat_history_turns", "chat_max_sessions", "chat_session_ttl"],
+        "会话（消息、引用、会话列表）保存在内置数据库（见上面的 `RAG_DB_PATH`）里，重启不丢，也不会自动淘汰，只有在 Web 或 `DELETE /chat/sessions/{id}` 里删除才会清掉。机制见 [architecture.md](architecture.md#对话-agent)。",
+        ["agent_max_tool_calls", "agent_max_model_calls", "chat_history_turns"],
     ),
     (
         "服务、鉴权与 CORS",
@@ -93,6 +93,11 @@ GROUPS: list[tuple[str, str, list[str]]] = [
         "",
         ["web_dist"],
     ),
+    (
+        "已废弃的配置项",
+        "下面的配置项仍会被解析（旧 `.env` 不会因此启动报错），但**不再生效**；设置了它们，服务启动日志里会给一条“已废弃”的警告。请从 `.env` 中删除。",
+        list(DEPRECATED_SETTINGS),
+    ),
 ]
 
 # 字段 -> 说明（中文，单元格内不要出现竖线字符）
@@ -103,6 +108,7 @@ DESCRIPTIONS: dict[str, str] = {
     "meta_file": "增量入库的文件指纹记录。",
     "index_info_file": "索引的 embedding 签名文件（提供方 / 模型 / 维度）。留空 = 与 `RAG_META_FILE` 同目录的 `.index_info.json`。",
     "cache_dir": "BM25 分词缓存目录。",
+    "db_path": "内置 SQLite 数据库文件（对话会话、评测题集、体检报告都存在里面；WAL 模式，旁边会出现 `-wal` / `-shm` 文件）。留空 = `<RAG_HOME>/ragbase.db`，父目录不存在时自动创建；目录不可写时 `ragbase doctor` 报 ✗。",
     # 检索
     "mode": "默认召回方式：`vector` 仅向量、`bm25` 仅关键词、`hybrid` 两路 RRF 融合。",
     "retrieve_k": "精排前的候选数（混合检索是 RRF 融合后保留的条数；单路模式是该路取的条数）。",
@@ -152,9 +158,9 @@ DESCRIPTIONS: dict[str, str] = {
     # agent
     "agent_max_tool_calls": "每轮用户消息最多调用几次工具；超出后工具被拒绝，模型只能据已有结果作答。",
     "agent_max_model_calls": "每轮用户消息最多调用几次大模型；超出后直接结束并返回提示“本轮处理步骤过多”。",
-    "chat_history_turns": "每个会话保留最近几轮对话（一轮 = 一条用户消息及其全部回复 / 工具消息；整轮裁剪，不额外调用大模型做摘要）。",
-    "chat_max_sessions": "内存中最多保留的会话数；超出时淘汰最久未使用的空闲会话（所有会话都忙时可暂时超出）。",
-    "chat_session_ttl": "会话空闲多少秒后过期。",
+    "chat_history_turns": "发给大模型的最近几轮对话（一轮 = 一条用户消息及其全部回复 / 工具消息；整轮截取，不额外调用大模型做摘要）。只影响大模型看到的上下文，库里和 Web 上仍保留会话的全部消息。",
+    "chat_max_sessions": "**已废弃，不再生效。** 原来是内存中最多保留的会话数；会话持久化后不再按数量淘汰。",
+    "chat_session_ttl": "**已废弃，不再生效。** 原来是会话空闲多少秒后过期；会话持久化后不再按空闲时间过期。",
     # service
     "host": "`ragbase serve` 的监听地址。`0.0.0.0` = 对外开放（务必同时设置 `RAG_API_KEY`）。",
     "port": "`ragbase serve` 的监听端口。",
@@ -173,6 +179,7 @@ DEFAULT_TEXT: dict[str, str] = {
     "meta_file": "`<RAG_HOME>/.ingest_meta.json`",
     "index_info_file": "（空，即 `.index_info.json`，与 `RAG_META_FILE` 同目录）",
     "cache_dir": "`<RAG_HOME>/.bm25_cache`",
+    "db_path": "（空，即 `<RAG_HOME>/ragbase.db`）",
     "qdrant_path": "`<RAG_HOME>/qdrant_db`",
     "web_dist": "`<RAG_HOME>/web/dist`（没有则用随包副本）",
     "embedding_base_url": "（空，回退 `RAG_LLM_BASE_URL`）",
@@ -302,6 +309,8 @@ def render() -> str:
             info = Settings.model_fields[name]
             aliases = env_names(name, info)
             variable = f"`{aliases[0]}`" + "".join(f"<br>（旧名 `{alias}`）" for alias in aliases[1:])
+            if name in DEPRECATED_SETTINGS:
+                variable += "<br>（已废弃）"
             lines.append(f"| {variable} | {type_text(info)} | {default_text(name, info)} | {DESCRIPTIONS[name]} |")
         lines.append("")
     return "\n".join(lines).rstrip() + "\n"

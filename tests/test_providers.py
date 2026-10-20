@@ -163,7 +163,10 @@ class StubProviders:
 
 
 def _settings(stub: StubProviders | None = None, **overrides) -> Settings:
-    values = dict(device="cpu", log_level="WARNING", llm_model=None, llm_api_key=None, llm_base_url=None)
+    values = dict(
+        device="cpu", log_level="WARNING", llm_model=None, llm_api_key=None, llm_base_url=None,
+        db_path=SCRATCH / "ragbase.db",  # 应用启动会打开内置数据库：指向临时目录，别在项目根目录生成 ragbase.db
+    )
     if stub is not None:
         values.update(
             embedding_provider="openai", embedding_base_url=stub.base_url, embedding_api_key=KEY, embedding_model="stub-embed",

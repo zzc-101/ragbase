@@ -139,6 +139,7 @@ def _settings(**overrides):
         device="cpu", log_level="WARNING", vector_store="chroma", llm_api_key="sk-test-FAKE-KEY", llm_model="test-model", llm_base_url=None,  # None：不受环境变量影响
         data_dir=SCRATCH / "default-data", db_dir=SCRATCH / "default-chroma",
         meta_file=SCRATCH / "default-meta.json", cache_dir=SCRATCH / "default-cache",
+        db_path=SCRATCH / "default.db",  # 应用启动会打开内置数据库：指向临时目录，别在项目根目录生成 ragbase.db
     )
     return Settings(_env_file=None, **{**values, **overrides})
 

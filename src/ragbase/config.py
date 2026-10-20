@@ -18,7 +18,7 @@ from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 def project_home() -> Path:
     """项目主目录：环境变量 RAG_HOME，未设置则为当前工作目录。
 
-    data/、chroma_db/、qdrant_db/、.ingest_meta.json、.bm25_cache/、web/dist、bm25_userdict.txt、eval_questions.json、.env
+    data/、chroma_db/、qdrant_db/、.ingest_meta.json、.bm25_cache/、ragbase.db、web/dist、bm25_userdict.txt、eval_questions.json、.env
     的默认位置都从这里推导（在仓库根目录运行时与旧版布局完全一致）。
     注意 RAG_HOME 必须是真正的环境变量：.env 的位置本身依赖它，所以不能写在 .env 里。
     每次调用都重新读取环境变量（不缓存），便于测试里临时切换。
@@ -37,6 +37,20 @@ def userdict_file() -> Path:
 
 def eval_questions_file() -> Path:
     return project_home() / "eval_questions.json"
+
+
+def db_file(settings: "Settings | None" = None) -> Path:
+    """内置 SQLite 数据库文件：RAG_DB_PATH，未设置则为 <主目录>/ragbase.db（会话、题集、体检报告都在里面）。"""
+    settings = settings or get_settings()
+    return settings.db_path or project_home() / "ragbase.db"
+
+
+# 已废弃的配置项（字段名 -> 废弃原因）：仍能被解析（旧 .env 不会因此启动报错），但不再生效；
+# 显式设置了的话 build_chat_service 会记一条警告。env.example 里不再列出，文档里集中放在“已废弃”一节。
+DEPRECATED_SETTINGS = {
+    "chat_max_sessions": "会话已持久化到数据库，不再按数量淘汰",
+    "chat_session_ttl": "会话已持久化到数据库，不再按空闲时间过期",
+}
 
 
 def ragas_cache_dir() -> Path:
@@ -194,6 +208,7 @@ class Settings(BaseSettings):
     data_dir: Path = Field(default_factory=lambda: project_home() / "data")  # 文档目录：POST /documents 上传到这里，POST /ingest 扫描这里
     db_dir: Path = Field(default_factory=lambda: project_home() / "chroma_db")  # Chroma 持久化目录（RAG_VECTOR_STORE=chroma 时用）
     meta_file: Path = Field(default_factory=lambda: project_home() / ".ingest_meta.json")  # 增量入库的文件指纹
+    db_path: Path | None = None  # 内置 SQLite 数据库文件（会话、题集、体检报告）；留空 = <主目录>/ragbase.db，用 db_file() 取最终位置
     index_info_file: Path | None = None  # 索引的 embedding 签名（提供方 / 模型 / 维度）；留空 = 与 meta_file 同目录的 .index_info.json
     cache_dir: Path = Field(default_factory=lambda: project_home() / ".bm25_cache")  # BM25 分词缓存
     web_dist: Path = Field(default_factory=default_web_dist)  # 前端构建产物：默认 <主目录>/web/dist，没有则用随包的副本；相对路径按主目录解析，目录存在时由 API 服务托管
@@ -220,12 +235,12 @@ class Settings(BaseSettings):
     llm_timeout: float = Field(60, gt=0)  # 单次请求超时（秒）
     llm_max_retries: int = Field(2, ge=0)  # 超时 / 连接错误 / 429 / 5xx 的自动重试次数（指数退避）
 
-    # 对话 Agent（POST /chat）：会话只存在进程内存里，重启即丢
+    # 对话 Agent（POST /chat）：会话保存在内置 SQLite 里（重启不丢），不自动淘汰
     agent_max_tool_calls: int = Field(4, ge=1)  # 每轮用户消息最多调用几次工具（超出后工具被拒绝，模型只能据已有结果作答）
     agent_max_model_calls: int = Field(6, ge=2)  # 每轮用户消息最多调用几次大模型（超出后直接结束并返回提示）
-    chat_history_turns: int = Field(10, ge=1)  # 每个会话保留最近几轮对话（一轮 = 一条用户消息及其全部回复 / 工具消息）
-    chat_max_sessions: int = Field(200, ge=1)  # 内存中最多保留的会话数，超出时淘汰最久未使用的空闲会话
-    chat_session_ttl: float = Field(3600, gt=0)  # 会话空闲多少秒后过期（秒）
+    chat_history_turns: int = Field(10, ge=1)  # 发给大模型的最近几轮对话（一轮 = 一条用户消息及其全部回复 / 工具消息）；库里仍保存全部消息
+    chat_max_sessions: int = Field(200, ge=1)  # 已废弃（DEPRECATED_SETTINGS）：不再生效
+    chat_session_ttl: float = Field(3600, gt=0)  # 已废弃（DEPRECATED_SETTINGS）：不再生效
 
     # 评测裁判（评测 runner 的 ragas 与中文裁判）可单独指定模型；留空则沿用上面的回答模型配置
     eval_llm_base_url: str | None = None
@@ -259,7 +274,7 @@ class Settings(BaseSettings):
     def _blank_api_url_to_none(cls, value):
         return (value.strip() or None) if isinstance(value, str) else value
 
-    @field_validator("embedding_dimensions", "embedding_timeout", "embedding_max_retries", "reranker_timeout", "reranker_max_retries", "index_info_file", "llm_max_tokens", mode="before")
+    @field_validator("embedding_dimensions", "embedding_timeout", "embedding_max_retries", "reranker_timeout", "reranker_max_retries", "index_info_file", "db_path", "llm_max_tokens", mode="before")
     @classmethod
     def _blank_number_to_none(cls, value):
         return (value.strip() or None) if isinstance(value, str) else value

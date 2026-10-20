@@ -3,18 +3,22 @@
 多轮改写不单独做一步：search_knowledge 的描述要求模型把 query 写成不依赖上下文的完整问句
 （代词 / 省略已在对话里补全），检索直接用这个 query。
 
-引用编号：登记表按会话保存（随会话存活、被淘汰），多轮共用——片段编号在整个会话内唯一且稳定
-（同一个 chunk_id 永远是同一个编号，后续轮次的新片段接着往下编），最终回答里的 [n] 才能对应到 citations；
+引用编号：登记表按会话保存，多轮共用——片段编号在整个会话内唯一且稳定
+（同一个片段永远是同一个编号，后续轮次的新片段接着往下编），最终回答里的 [n] 才能对应到 citations；
 模型直接沿用历史里出现过的编号作答时，也能解析到对应片段。某一轮失败回滚时，用 mark / rollback 撤销该轮新登记的片段。
+登记表可以由数据库支撑（传入 ChatStore 和 session_id）：构造时从库里加载已有编号，新登记的片段写穿到库里，回滚同时撤销库里的行，
+所以服务重启后同一片段仍是原编号、新片段接着编。
 登记表走 LangGraph 的运行时上下文（create_agent 的 context_schema + 工具里的 ToolRuntime）：
 每次 agent.invoke / stream 都传入一个 ChatContext（带上该会话的登记表），工具从 runtime.context 取到它——
 比 ContextVar 可靠：工具在线程池里执行，ContextVar 需要靠拷贝上下文才能传到，而显式传入的 context 不依赖这一点。
 """
+import hashlib
 import logging
 import os
 import re
 import threading
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from langchain.tools import ToolRuntime, tool
 from langchain_core.documents import Document
@@ -22,6 +26,9 @@ from langchain_core.documents import Document
 from ragbase.config import Settings
 from ragbase.retrieval.hybrid import UnknownSourceError
 from ragbase.retrieval.pipeline import RAGPipeline, retrieve_and_rerank, select_context_docs, should_refuse
+
+if TYPE_CHECKING:
+    from ragbase.agent.store import ChatStore
 
 logger = logging.getLogger(__name__)
 
@@ -43,19 +50,35 @@ class ToolRetrievalError(RuntimeError):
 
 
 class CitationRegistry:
-    """会话级的引用登记表：同一 chunk_id 返回同一个编号（1 起，跨轮不重置），线程安全。"""
+    """会话级的引用登记表：同一片段返回同一个编号（1 起，跨轮不重置），线程安全。
 
-    def __init__(self):
+    传入 store 和 session_id 时由数据库支撑：构造时加载该会话已有的编号，add 写穿到库里，rollback 同时撤销库里的行。
+    """
+
+    def __init__(self, store: "ChatStore | None" = None, session_id: str | None = None):
+        if (store is None) != (session_id is None):
+            raise ValueError("store 与 session_id 必须同时提供")
         self._lock = threading.Lock()
+        self._store, self._session_id = store, session_id
         self._numbers: dict[str, int] = {}
         self._docs: list[Document] = []
+        if store is not None:
+            for number, key, doc in store.load_citations(session_id):
+                if number != len(self._docs) + 1:  # 编号按登记顺序连续分配；出现缺口说明库被外部改过，后面的当作不存在
+                    logger.warning("会话 %s 的引用编号不连续（缺 %d），丢弃其后的引用", session_id, len(self._docs) + 1)
+                    store.truncate_citations(session_id, len(self._docs))
+                    break
+                self._docs.append(doc)
+                self._numbers[key] = number
 
     @staticmethod
     def _key(doc: Document) -> str:
+        """片段的稳定标识。没有 chunk_id 的片段用内容哈希：必须是跨进程稳定的（内置 hash() 每个进程都不同，重启后同一片段会被当成新片段）。"""
         chunk_id = doc.metadata.get("chunk_id")
         if chunk_id:
             return f"id:{chunk_id}"
-        return f"text:{doc.metadata.get('source', '')}:{doc.metadata.get('page', '')}:{hash(doc.page_content)}"
+        raw = f"{doc.metadata.get('source', '')}|{doc.metadata.get('page', '')}|{doc.page_content}"
+        return "text:" + hashlib.md5(raw.encode("utf-8")).hexdigest()
 
     def add(self, doc: Document) -> int:
         """登记片段并返回编号；已登记过的片段返回原编号（保留首次登记的得分等元数据）。"""
@@ -63,8 +86,11 @@ class CitationRegistry:
         with self._lock:
             number = self._numbers.get(key)
             if number is None:
+                number = len(self._docs) + 1
+                if self._store is not None:
+                    self._store.add_citation(self._session_id, number, key, doc)  # 先写库：写失败时内存状态保持不变
                 self._docs.append(doc)
-                number = self._numbers[key] = len(self._docs)
+                self._numbers[key] = number
             return number
 
     def all(self) -> list[tuple[int, Document]]:
@@ -77,8 +103,10 @@ class CitationRegistry:
             return len(self._docs)
 
     def rollback(self, mark: int) -> None:
-        """撤销 mark 之后登记的片段（编号是按登记顺序连续分配的，所以直接截断即可）。"""
+        """撤销 mark 之后登记的片段（编号是按登记顺序连续分配的，所以直接截断即可）；有数据库时同时删掉库里的行。"""
         with self._lock:
+            if self._store is not None:
+                self._store.truncate_citations(self._session_id, mark)
             del self._docs[mark:]
             self._numbers = {key: number for key, number in self._numbers.items() if number <= mark}
 

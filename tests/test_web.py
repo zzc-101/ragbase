@@ -57,7 +57,7 @@ def test_sessions_list():
         assert client.get("/chat/sessions").json() == {"sessions": []}
         service = client.app.state.chat
         ticks = iter(range(1000, 2000))
-        service.sessions.wall_clock = lambda: next(ticks) * 10.0  # 保证每次使用的挂钟时间严格递增
+        service.clock = lambda: next(ticks) * 10.0  # 保证每轮结束时记录的挂钟时间严格递增
         assert client.post("/chat", json={"session_id": "s-old", "message": "最早的问题"}).status_code == 200
         assert client.post("/chat", json={"session_id": "s-long", "message": long_question}).status_code == 200
         assert client.post("/chat", json={"session_id": "s-old", "message": "追问"}).status_code == 200  # s-old 变成最近使用

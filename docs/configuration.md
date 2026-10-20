@@ -39,6 +39,7 @@ ragbase 的全部配置集中在 [`src/ragbase/config.py`](../src/ragbase/config
 | `RAG_META_FILE` | 路径 | `<RAG_HOME>/.ingest_meta.json` | 增量入库的文件指纹记录。 |
 | `RAG_INDEX_INFO_FILE` | 路径 | （空，即 `.index_info.json`，与 `RAG_META_FILE` 同目录） | 索引的 embedding 签名文件（提供方 / 模型 / 维度）。留空 = 与 `RAG_META_FILE` 同目录的 `.index_info.json`。 |
 | `RAG_CACHE_DIR` | 路径 | `<RAG_HOME>/.bm25_cache` | BM25 分词缓存目录。 |
+| `RAG_DB_PATH` | 路径 | （空，即 `<RAG_HOME>/ragbase.db`） | 内置 SQLite 数据库文件（对话会话、评测题集、体检报告都存在里面；WAL 模式，旁边会出现 `-wal` / `-shm` 文件）。留空 = `<RAG_HOME>/ragbase.db`，父目录不存在时自动创建；目录不可写时 `ragbase doctor` 报 ✗。 |
 
 ### 检索与拒答
 
@@ -129,15 +130,13 @@ ragbase 的全部配置集中在 [`src/ragbase/config.py`](../src/ragbase/config
 
 ### 对话 Agent
 
-会话只存在服务进程内存里，重启即丢。机制见 [architecture.md](architecture.md#对话-agent)。
+会话（消息、引用、会话列表）保存在内置数据库（见上面的 `RAG_DB_PATH`）里，重启不丢，也不会自动淘汰，只有在 Web 或 `DELETE /chat/sessions/{id}` 里删除才会清掉。机制见 [architecture.md](architecture.md#对话-agent)。
 
 | 环境变量 | 类型 / 取值 | 默认值 | 说明 |
 | --- | --- | --- | --- |
 | `RAG_AGENT_MAX_TOOL_CALLS` | 整数，≥ 1 | `4` | 每轮用户消息最多调用几次工具；超出后工具被拒绝，模型只能据已有结果作答。 |
 | `RAG_AGENT_MAX_MODEL_CALLS` | 整数，≥ 2 | `6` | 每轮用户消息最多调用几次大模型；超出后直接结束并返回提示“本轮处理步骤过多”。 |
-| `RAG_CHAT_HISTORY_TURNS` | 整数，≥ 1 | `10` | 每个会话保留最近几轮对话（一轮 = 一条用户消息及其全部回复 / 工具消息；整轮裁剪，不额外调用大模型做摘要）。 |
-| `RAG_CHAT_MAX_SESSIONS` | 整数，≥ 1 | `200` | 内存中最多保留的会话数；超出时淘汰最久未使用的空闲会话（所有会话都忙时可暂时超出）。 |
-| `RAG_CHAT_SESSION_TTL` | 数字，> 0 | `3600` | 会话空闲多少秒后过期。 |
+| `RAG_CHAT_HISTORY_TURNS` | 整数，≥ 1 | `10` | 发给大模型的最近几轮对话（一轮 = 一条用户消息及其全部回复 / 工具消息；整轮截取，不额外调用大模型做摘要）。只影响大模型看到的上下文，库里和 Web 上仍保留会话的全部消息。 |
 
 ### 服务、鉴权与 CORS
 
@@ -157,6 +156,15 @@ ragbase 的全部配置集中在 [`src/ragbase/config.py`](../src/ragbase/config
 | 环境变量 | 类型 / 取值 | 默认值 | 说明 |
 | --- | --- | --- | --- |
 | `RAG_WEB_DIST` | 路径 | `<RAG_HOME>/web/dist`（没有则用随包副本） | 前端构建产物目录。默认 `<RAG_HOME>/web/dist`，没有则用随包分发的副本；相对路径按 `RAG_HOME` 解析。目录存在时由 API 服务在同一端口托管。 |
+
+### 已废弃的配置项
+
+下面的配置项仍会被解析（旧 `.env` 不会因此启动报错），但**不再生效**；设置了它们，服务启动日志里会给一条“已废弃”的警告。请从 `.env` 中删除。
+
+| 环境变量 | 类型 / 取值 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `RAG_CHAT_MAX_SESSIONS`<br>（已废弃） | 整数，≥ 1 | `200` | **已废弃，不再生效。** 原来是内存中最多保留的会话数；会话持久化后不再按数量淘汰。 |
+| `RAG_CHAT_SESSION_TTL`<br>（已废弃） | 数字，> 0 | `3600` | **已废弃，不再生效。** 原来是会话空闲多少秒后过期；会话持久化后不再按空闲时间过期。 |
 
 <!-- END GENERATED:settings -->
 

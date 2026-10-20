@@ -7,7 +7,8 @@
 并发请求由线程池接住，召回 + 精排在 pipeline.lock 内串行，大模型生成在锁外并行。
 
 对话 Agent（POST /chat、POST /chat/stream、GET /chat/sessions、GET|DELETE /chat/sessions/{id}）见 ragbase/agent/service.py：模型按需调用知识库检索工具，
-历史按会话保存在进程内存里；检索仍走 pipeline.lock，同会话的请求串行。
+会话（消息历史、会话摘要、引用编号）按会话保存在内置 SQLite 里（启动时打开，见 ragbase/db/），重启不丢，不自动淘汰；检索仍走 pipeline.lock，同会话的请求串行。
+对话 Agent 未就绪（大模型未配置 / 索引为空）时，会话列表、查看历史和删除仍然可用（直接读库），只有发消息返回 503。
 
 文档管理（POST /documents、POST /ingest、DELETE /documents/{name}）也在本进程内完成：
 入库任务在后台线程里跑（同一时刻只有一个），每个批次单独持有 pipeline.lock，批间释放，/search 可以插进来；
@@ -19,6 +20,7 @@ Authorization: Bearer <key>（或 X-API-Key）；默认拒绝 + 显式公开白�
 Web 界面：web/ 目录是前端工程，pnpm build 后产物在 web/dist（RAG_WEB_DIST 可改），本服务在同一端口托管它：
 /assets/* 是静态资源，/、/library、/c/{session_id} 返回 index.html（前端路由）；API 路由不受影响。
 """
+import inspect
 import json
 import logging
 import os
@@ -67,8 +69,10 @@ from ragbase.api.schemas import (
     to_chunk,
     to_citation,
 )
-from ragbase.agent.service import ChatService, build_chat_service
+from ragbase.agent.service import ChatService, build_chat_service, delete_session_offline, read_session_history
+from ragbase.agent.store import ChatStore
 from ragbase.config import Settings, get_settings
+from ragbase.db import Database, open_database
 from ragbase.index_info import IndexRecorder
 from ragbase.ingest.parser import LEGACY_EXTS, SUPPORTED_EXTS, sanitize_filename
 from ragbase.ingest.jobs import IngestJobManager, JobRunningError, progress_handler
@@ -112,9 +116,20 @@ def default_pipeline_factory(settings: Settings) -> RAGPipeline:
     return pipeline
 
 
-def default_chat_factory(pipeline: RAGPipeline, settings: Settings) -> ChatService | None:
-    """真实对话 Agent：大模型未配置时为 None（/chat 返回 503）。"""
-    return build_chat_service(pipeline, settings)
+def default_chat_factory(pipeline: RAGPipeline, settings: Settings, db: Database | None = None) -> ChatService | None:
+    """真实对话 Agent：会话持久化到 db；大模型未配置时为 None（/chat 返回 503）。"""
+    return build_chat_service(pipeline, settings, db=db)
+
+
+def _make_chat_service(chat_factory, pipeline: RAGPipeline, settings: Settings, db: Database) -> ChatService | None:
+    """调用 chat_factory：能接收 db 参数（命名为 db，或带 **kwargs）的工厂收到 db=…，旧的 (pipeline, settings) 两参数工厂照旧调用。"""
+    try:
+        parameters = inspect.signature(chat_factory).parameters
+    except (TypeError, ValueError):
+        parameters = {}
+    if "db" in parameters or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values()):
+        return chat_factory(pipeline, settings, db=db)
+    return chat_factory(pipeline, settings)
 
 
 def default_ingest_fn(pipeline: RAGPipeline, settings: Settings, progress):
@@ -230,7 +245,8 @@ def _save_upload(upload: UploadFile, directory: Path, max_bytes: int, limit_mb: 
 
 def create_app(pipeline_factory=None, settings: Settings | None = None, ingest_fn=None, chat_factory=None) -> FastAPI:
     """应用工厂。pipeline_factory(settings) -> RAGPipeline、ingest_fn(pipeline, settings, progress) -> IngestResult、
-    chat_factory(pipeline, settings) -> ChatService | None，测试里可注入假实现避免加载模型 / 真实入库 / 调用大模型。"""
+    chat_factory(pipeline, settings[, db=Database]) -> ChatService | None（声明了 db 参数的工厂会收到应用打开的数据库，用它持久化会话），
+    测试里可注入假实现避免加载模型 / 真实入库 / 调用大模型。"""
     settings = settings or get_settings()
     pipeline_factory = pipeline_factory or default_pipeline_factory
     ingest_fn = ingest_fn or default_ingest_fn
@@ -244,31 +260,43 @@ def create_app(pipeline_factory=None, settings: Settings | None = None, ingest_f
     async def lifespan(app: FastAPI):
         app.state.pipeline = None
         app.state.chat = None
-        count = collection_count(settings)
-        if settings.data_dir.is_dir():
-            for leftover in settings.data_dir.glob(".upload-*.tmp"):  # 上次上传中途崩溃留下的临时文件
-                leftover.unlink(missing_ok=True)
-        if not count:
-            logger.warning("%s；服务仍会启动，/search 与 /ask 返回 503", INDEX_MISSING_MESSAGE)
-        else:
-            start = time.perf_counter()
-            app.state.pipeline = pipeline_factory(settings)
-            logger.info("流水线就绪：%d 个片段，启动加载用时 %.1fs", count, time.perf_counter() - start)
-            app.state.chat = chat_factory(app.state.pipeline, settings)
-            if app.state.chat is None:
-                logger.warning("大模型未配置，对话 Agent 未启用（/chat 返回 503）")
-        yield
-        store = getattr(getattr(app.state.pipeline, "retriever", None), "store", None)
-        if store is not None:
+        app.state.db = db = open_database(settings)  # 目录不可写 / 文件损坏时抛 DatabaseError（中文说明），服务不启动
+        app.state.chat_store = ChatStore(db)
+        try:
+            count = collection_count(settings)
+            if settings.data_dir.is_dir():
+                for leftover in settings.data_dir.glob(".upload-*.tmp"):  # 上次上传中途崩溃留下的临时文件
+                    leftover.unlink(missing_ok=True)
+            if not count:
+                logger.warning("%s；服务仍会启动，/search 与 /ask 返回 503", INDEX_MISSING_MESSAGE)
+            else:
+                start = time.perf_counter()
+                app.state.pipeline = pipeline_factory(settings)
+                logger.info("流水线就绪：%d 个片段，启动加载用时 %.1fs", count, time.perf_counter() - start)
+                app.state.chat = _make_chat_service(chat_factory, app.state.pipeline, settings, db)
+                if app.state.chat is None:
+                    logger.warning("大模型未配置，对话 Agent 未启用（/chat 返回 503）")
+            yield
+            store = getattr(getattr(app.state.pipeline, "retriever", None), "store", None)
+            if store is not None:
+                try:
+                    store.close()  # 释放本地向量库的目录锁
+                except Exception:
+                    logger.exception("关闭向量库失败")
+        finally:
             try:
-                store.close()  # 释放本地向量库的目录锁
+                if app.state.chat is not None:
+                    app.state.chat.close()  # 先关 checkpointer 的独立连接，再关主连接
             except Exception:
-                logger.exception("关闭向量库失败")
+                logger.exception("关闭对话服务失败")
+            db.close()
 
     app = FastAPI(title="RAG 服务", version="0.1.0", lifespan=lifespan)
     app.state.settings = settings
     app.state.pipeline = None
     app.state.chat = None
+    app.state.db = None
+    app.state.chat_store = None
     app.state.jobs = jobs
 
     def _reject_oversized_upload(request: Request):
@@ -500,18 +528,19 @@ def create_app(pipeline_factory=None, settings: Settings | None = None, ingest_f
 
     @app.get("/chat/sessions", response_model=SessionListResponse, responses=error_models)
     def list_chat_sessions(request: Request):
-        """会话列表（按最近使用倒序，供前端侧边栏）。Agent 未就绪（大模型未配置 / 索引缺失）时返回空列表而不是 503。"""
+        """会话列表（按最近使用倒序，供前端侧边栏）。直接读库，对话 Agent 未就绪（大模型未配置 / 索引缺失）时同样可用。"""
         service = request.app.state.chat
-        if service is None:
-            return SessionListResponse(sessions=[])
-        return SessionListResponse(
-            sessions=[{**item, "updated_at": _iso(item["updated_at"])} for item in service.list_sessions()]
-        )
+        sessions = service.list_sessions() if service is not None else request.app.state.chat_store.list_sessions()
+        return SessionListResponse(sessions=[{**item, "updated_at": _iso(item["updated_at"])} for item in sessions])
 
     @app.get("/chat/sessions/{session_id}", response_model=SessionResponse, responses=error_models)
     def get_chat_session(request: Request, session_id: str = PathParam(pattern=SESSION_ID_PATTERN)):
-        """会话的消息历史（用户 / 助手 / 工具；工具消息只给摘要）。会话不存在、已清空或已过期返回 404。"""
-        messages = _get_chat(request).history(session_id)
+        """会话的全部消息历史（用户 / 助手 / 工具；工具消息只给摘要）。会话不存在或已删除返回 404。对话 Agent 未就绪时直接读库。"""
+        service = request.app.state.chat
+        if service is not None:
+            messages = service.history(session_id)
+        else:
+            messages = read_session_history(request.app.state.db, request.app.state.chat_store, session_id)
         if messages is None:
             raise HTTPException(status_code=404, detail=f"没有这个会话：{session_id}")
         messages = [
@@ -522,8 +551,13 @@ def create_app(pipeline_factory=None, settings: Settings | None = None, ingest_f
 
     @app.delete("/chat/sessions/{session_id}", response_model=SessionDeleteResponse, responses=error_models)
     def delete_chat_session(request: Request, session_id: str = PathParam(pattern=SESSION_ID_PATTERN)):
-        """清空会话历史（等该会话正在处理的请求结束后执行）。"""
-        if not _get_chat(request).delete(session_id):
+        """删除会话（消息历史、引用、会话记录一并删除；等该会话正在处理的请求结束后执行）。对话 Agent 未就绪时同样可用。"""
+        service = request.app.state.chat
+        if service is not None:
+            deleted = service.delete(session_id)
+        else:
+            deleted = delete_session_offline(request.app.state.db, request.app.state.chat_store, session_id)
+        if not deleted:
             raise HTTPException(status_code=404, detail=f"没有这个会话：{session_id}")
         return SessionDeleteResponse(session_id=session_id, deleted=True)
 

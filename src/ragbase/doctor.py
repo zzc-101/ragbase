@@ -11,7 +11,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-from ragbase.config import DEFAULT_RERANKER_MODEL, RERANK_MIN_SCORE, Settings, project_home
+from ragbase.config import DEFAULT_RERANKER_MODEL, RERANK_MIN_SCORE, Settings, db_file, project_home
 
 OK, WARN, FAIL = "ok", "warn", "fail"
 MIN_PYTHON = (3, 12)
@@ -305,6 +305,48 @@ def _probe_llm(settings: Settings, secret: str, invoke: Callable | None) -> Chec
     return Check(OK, "大模型调用成功（一次最小请求）")
 
 
+def _nearest_existing_dir(path: Path) -> Path | None:
+    """path 本身或最近的已存在祖先目录；一路都不是目录则返回 None。"""
+    for candidate in (path, *path.parents):
+        if candidate.exists():
+            return candidate if candidate.is_dir() else None
+    return None
+
+
+def check_database(settings: Settings) -> list[Check]:
+    """内置 SQLite 数据库：能打开、表结构版本是最新。只读探测——不创建文件、不迁移（建库与升级在 ragbase serve 启动时自动完成）。"""
+    import sqlite3
+    from urllib.parse import quote
+
+    from ragbase.db import MIGRATIONS
+
+    path = db_file(settings)
+    latest = len(MIGRATIONS)
+    if not path.exists():
+        base = _nearest_existing_dir(path.parent)
+        if base is None or not _writable_dir(base):
+            return [Check(FAIL, f"数据库无法创建：{path}（目录 {base or path.parent} 不可写）", "检查目录权限，或用 RAG_DB_PATH 指向可写位置；ragbase serve 需要它来保存会话")]
+        return [Check(OK, f"数据库尚未创建：{path}（首次运行 ragbase serve 时自动创建）")]
+    if not path.is_file():
+        return [Check(FAIL, f"数据库路径不是文件：{path}", "检查 RAG_DB_PATH")]
+    if not (os.access(path, os.W_OK) and _writable_dir(path.parent)):
+        return [Check(FAIL, f"数据库不可写：{path}（WAL 模式还需要所在目录可写）", "检查文件与目录权限；ragbase serve 需要写入它来保存会话")]
+    try:
+        conn = sqlite3.connect(f"file:{quote(str(path))}?mode=ro", uri=True, timeout=5)
+        try:
+            version = conn.execute("PRAGMA user_version").fetchone()[0]
+            conn.execute("SELECT count(*) FROM sqlite_master").fetchone()  # 文件损坏时在这里报错
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        return [Check(FAIL, f"数据库无法打开：{path}（{exc}）", "文件可能已损坏：备份后删除它（会丢失会话与体检记录），重启后自动重建；或用 RAG_DB_PATH 换一个位置")]
+    if version == latest:
+        return [Check(OK, f"数据库：{path}，表结构版本 {version}（最新）")]
+    if version < latest:
+        return [Check(WARN, f"数据库表结构版本 {version}，当前程序需要 {latest}：{path}", "无需手动处理，下次运行 ragbase serve 会自动升级（升级前建议先备份该文件）")]
+    return [Check(FAIL, f"数据库表结构版本 {version} 比当前程序支持的 {latest} 更新：{path}", "请升级 ragbase；不要用旧版本打开新版本的数据库")]
+
+
 def check_auth(settings: Settings) -> list[Check]:
     from ragbase.api.auth import is_loopback_host
 
@@ -339,6 +381,7 @@ def run_checks(
         ("运行环境", lambda: check_python() + check_paths(settings) + check_env_file()),
         ("模型（embedding / reranker）", lambda: check_providers(settings, call=check_models_call) + _local_model_checks(settings)),
         ("知识库", lambda: check_knowledge(settings)),
+        ("数据库（会话、题集、体检报告）", lambda: check_database(settings)),
         ("大模型", lambda: check_llm(settings, call=check_llm_call)),
         ("服务", lambda: check_auth(settings) + check_web(settings)),
     ]

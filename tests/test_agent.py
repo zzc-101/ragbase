@@ -1,7 +1,9 @@
 """对话 Agent 的单元测试：假检索流水线 + 脚本化的假工具调用模型（不加载模型、不访问网络、不调用真实大模型）。
 
-覆盖：工具格式与拒答 / 未知书名消息、一轮内多次检索的引用编号稳定、会话级引用编号（跨轮连续 / 沿用历史编号 / 回滚 / 历史接口带 citations / 删除清空）、/chat 与 /chat/stream、多轮历史与裁剪、
-工具 / 模型调用上限、会话 GET / DELETE、失败回滚与 504 / 502、未配置大模型的 503、会话淘汰、同会话串行。
+覆盖：工具格式与拒答 / 未知书名消息、一轮内多次检索的引用编号稳定、会话级引用编号（跨轮连续 / 沿用历史编号 / 回滚 / 历史接口带 citations / 删除清空）、/chat 与 /chat/stream、
+多轮历史与历史窗口（状态完整、模型输入只含最近 N 轮，同步与流式都验证）、工具 / 模型调用上限、会话 GET / DELETE、失败回滚与 504 / 502、
+未配置大模型时发消息 503 而会话读 / 删可用、同会话串行。
+会话持久化（重启、崩溃恢复、checkpoint 瘦身等）见 tests/test_chat_persistence.py。
 
 运行：uv run python tests/test_agent.py
 """
@@ -24,7 +26,7 @@ from pydantic import PrivateAttr
 
 from ragbase.api import app as api
 from ragbase.agent.tools import NOT_FOUND_MESSAGE, format_fragment
-from ragbase.agent.service import MODEL_LIMIT_MESSAGE, SessionRegistry, build_chat_service
+from ragbase.agent.service import MODEL_LIMIT_MESSAGE, build_chat_service
 from ragbase.config import Settings
 from ragbase.retrieval.pipeline import GenerationError, RAGPipeline
 
@@ -79,11 +81,15 @@ def _pipeline():
     return RAGPipeline(retriever=_Retriever(), reranker=_Reranker(), answer_chain=None, embeddings=None, device="cpu")
 
 
+_db_numbers = iter(range(1, 10**6))
+
+
 def _settings(**overrides):
+    """db_path 每次给一个全新的临时库文件（需要持久化的测试自己传 db_path 复用同一个）：测试绝不会在项目根目录生成 ragbase.db。"""
     values = dict(
         device="cpu", log_level="WARNING", llm_api_key="sk-test-FAKE-KEY", llm_model="test-model",
         llm_base_url="http://127.0.0.1:1/v1", data_dir=SCRATCH / "data", db_dir=SCRATCH / "chroma",
-        meta_file=SCRATCH / "meta.json", cache_dir=SCRATCH / "cache",
+        meta_file=SCRATCH / "meta.json", cache_dir=SCRATCH / "cache", db_path=SCRATCH / f"ragbase-{next(_db_numbers)}.db",
     )
     return Settings(_env_file=None, **{**values, **overrides})
 
@@ -136,7 +142,8 @@ class ScriptedModel(BaseChatModel):
             time.sleep(self.delay)
             step = self.script[index]
             result = step(messages) if callable(step) else step
-            return result.model_copy(update={"id": f"run-fake-{index}-{self._cursor}"})
+            # id 要跨模型实例唯一（真实模型的响应 id 都是唯一的）：add_messages 按 id 合并，重启后新实例的 id 若与库里旧消息相同，会把旧消息覆盖掉
+            return result.model_copy(update={"id": f"run-fake-{index}-{self._cursor}-{next(_ids)}"})
         finally:
             with self._guard:
                 self._active -= 1
@@ -171,7 +178,7 @@ def _client(model=None, pipeline=None, factory=None, **overrides):
     pipeline = pipeline or _pipeline()
     settings = _settings(**overrides)
     kwargs = {} if factory == "default" else {
-        "chat_factory": factory or (lambda p, s: build_chat_service(p, s, model=model))
+        "chat_factory": factory or (lambda p, s, db=None: build_chat_service(p, s, model=model, db=db))  # 收到应用打开的库：会话落到临时库文件
     }
     try:
         app = api.create_app(pipeline_factory=lambda _s: pipeline, settings=settings, **kwargs)
@@ -200,6 +207,11 @@ def _assert_error(response, status, error):
 def _texts(messages) -> list[str]:
     """模型收到的消息（去掉开头的 system 提示）的文本。"""
     return [m.text for m in messages if m.type != "system"]
+
+
+def _citation_numbers(service, session_id) -> list[int]:
+    """库里该会话已登记的引用编号。"""
+    return [number for number, _, _ in service.store.load_citations(session_id)]
 
 
 def _tool_texts(service, session_id):
@@ -295,14 +307,13 @@ def test_failed_turn_rolls_back_citation_registry():
     model = ScriptedModel(script=[search("A"), say("甲[1]乙[2]"), search("C"), boom, search("C"), say("新[3]新[4]")])
     service = _service(model)
     service.chat("s", "问1")
-    registry = service.sessions.citations("s")
-    assert registry.mark() == 2
+    assert _citation_numbers(service, "s") == [1, 2]
     try:
         service.chat("s", "问2")
         raise AssertionError("应当抛出 GenerationError")
     except GenerationError:
         pass
-    assert registry.mark() == 2 and [n for n, _ in registry.all()] == [1, 2]
+    assert _citation_numbers(service, "s") == [1, 2]  # 本轮新登记的 [3][4] 连库里的行一起撤销
     third = service.chat("s", "问3")
     assert _cited(third.citations) == [(3, "c3"), (4, "c4")]
     # 流式中途放弃（关闭生成器）也回滚本轮登记
@@ -312,14 +323,14 @@ def test_failed_turn_rolls_back_citation_registry():
         if name == "tool_call":
             break
     stream.close()
-    assert registry.mark() == 4  # 第 3 轮登记的 [3][4] 保留；第 4 轮只重复登记已有片段，没有新增
+    assert _citation_numbers(service, "s") == [1, 2, 3, 4]  # 第 3 轮登记的 [3][4] 保留；第 4 轮只重复登记已有片段，没有新增
     # 首轮失败：空会话整体删除，登记表也清空
     fresh = _service(ScriptedModel(script=[search("A"), boom]))
     try:
         fresh.chat("n", "问")
     except GenerationError:
         pass
-    assert fresh.history("n") is None and fresh.sessions.citations("n").mark() == 0
+    assert fresh.history("n") is None and _citation_numbers(fresh, "n") == [] and fresh.list_sessions() == []
 
 
 def test_history_endpoint_returns_citations_for_assistant_messages():
@@ -335,21 +346,15 @@ def test_history_endpoint_returns_citations_for_assistant_messages():
         assert [(c["n"], c["chunk_id"]) for c in second] == [(2, "c1")]  # 沿用历史编号；未登记的 [7] 不返回
 
 
-def test_session_delete_and_eviction_clear_citation_registry():
-    service = _service(ScriptedModel(script=[search("A"), say("甲[1]乙[2]"), search("B"), say("新[1]")]), chat_max_sessions=1)
+def test_session_delete_clears_citation_registry():
+    service = _service(ScriptedModel(script=[search("A"), say("甲[1]乙[2]"), search("B"), say("新[1]")]))
     service.chat("s", "问")
-    registry = service.sessions.citations("s")
-    assert registry.mark() == 2
-    assert service.delete("s") is True
-    assert registry.mark() == 0 and service.history("s") is None
+    assert _citation_numbers(service, "s") == [1, 2]
+    assert service.delete("s") is True and service.delete("s") is False
+    assert _citation_numbers(service, "s") == [] and service.history("s") is None
     # 删除后同名会话重新开始，编号从 1 起（B 的第一个片段是 c1）
     again = service.chat("s", "再问")
     assert _cited(again.citations) == [(1, "c1")]
-    # 淘汰：上限 1，新会话进来时旧会话连同登记表一起被丢弃
-    other = _service(ScriptedModel(script=[say("一"), say("二")]), chat_max_sessions=1)
-    other.chat("a", "问")
-    other.chat("b", "问")
-    assert other.sessions.citations("a") is None and other.sessions.citations("b") is not None
 
 
 def test_chat_endpoint_happy_path_and_validation():
@@ -396,12 +401,29 @@ def test_multi_turn_history_and_isolation():
 
 
 def test_history_is_bounded_by_turns():
-    model = ScriptedModel(script=[say(f"答{i}") for i in range(4)])
+    # 状态完整（库里 / 历史接口里是全部消息），只有发给模型的输入被截到最近 2 轮（含当前），整轮丢弃；同步与流式两条路都验证
+    model = ScriptedModel(script=[say(f"答{i}") for i in range(5)])
     service = _service(model, chat_history_turns=2)
     for i in range(4):
         service.chat("s", f"问{i}")
-    assert _texts(model.seen[3]) == ["问2", "答2", "问3"]  # 保留最近 2 轮（含当前），整轮丢弃
-    assert [m["content"] for m in service.history("s")] == ["问2", "答2", "问3", "答3"]
+    assert _texts(model.seen[3]) == ["问2", "答2", "问3"]
+    assert [m["content"] for m in service.history("s")] == ["问0", "答0", "问1", "答1", "问2", "答2", "问3", "答3"]
+    assert len([m for m in service._messages("s") if isinstance(m, HumanMessage)]) == 4  # 状态没有被裁剪
+    events = list(service.stream("s", "问4"))
+    assert events[-1] == ("done", {"answer": "答4"})
+    assert _texts(model.seen[4]) == ["问3", "答3", "问4"]
+    assert len(service.history("s")) == 10
+
+
+def test_history_window_keeps_whole_turns_with_tool_calls():
+    # 窗口 2 轮：第 1 轮（含 tool_calls 与 ToolMessage）被整轮丢弃，不会剩下缺 ToolMessage 的 tool_calls
+    model = ScriptedModel(script=[search("A"), say("答0[1]"), say("答1"), search("B"), say("答2[1]")])
+    service = _service(model, chat_history_turns=2)
+    for i in range(3):
+        service.chat("s", f"问{i}")
+    # 第 4 次模型调用（第 3 轮的第 1 步）看到的是 问1 答1 问2；第 5 次多了 tool_calls 和 ToolMessage
+    assert _texts(model.seen[3]) == ["问1", "答1", "问2"]
+    assert [m.type for m in model.seen[4] if m.type != "system"] == ["human", "ai", "human", "ai", "tool"]
 
 
 def test_tool_call_limit_is_graceful():
@@ -508,40 +530,13 @@ def test_chat_503_when_llm_not_configured():
     for kwargs in ({"factory": lambda p, s: None}, {"factory": "default", **unconfigured}):
         with _client(**kwargs) as client:
             assert client.get("/health").json()["agent_ready"] is False
-            for response in (
-                client.post("/chat", json={"message": "你好"}),
-                client.post("/chat/stream", json={"message": "你好"}),
-                client.get("/chat/sessions/x"),
-                client.delete("/chat/sessions/x"),
-            ):
+            for response in (client.post("/chat", json={"message": "你好"}), client.post("/chat/stream", json={"message": "你好"})):
                 body = _assert_error(response, 503, "service_unavailable")
                 assert "大模型未配置" in body["detail"]
-
-
-def test_session_registry_ttl_lru_and_busy_sessions():
-    now, evicted = [0.0], []
-    registry = SessionRegistry(max_sessions=2, ttl=100, on_evict=evicted.append, clock=lambda: now[0])
-    for name in ("a", "b"):
-        with registry.session(name):
-            now[0] += 1
-    with registry.session("c"):  # 超出上限：最久未用的 a 被淘汰
-        assert evicted == ["a"] and not registry.known("a") and registry.known("b")
-    now[0] += 1000  # 全部过期
-    assert not registry.known("b") and not registry.known("c") and sorted(evicted) == ["a", "b", "c"]
-    assert len(registry) == 0
-    # 忙的会话不被淘汰，即使超过 TTL / 上限
-    with registry.session("x"):
-        now[0] += 1000
-        with registry.session("y"):
-            pass
-        assert registry.known("x")
-
-
-def test_evicted_session_history_is_deleted():
-    service = _service(ScriptedModel(script=[say("一"), say("二")]), chat_max_sessions=1)
-    service.chat("s1", "问")
-    service.chat("s2", "问")  # 上限 1：s1 被淘汰，同时从 checkpointer 删除
-    assert service.history("s1") is None and service._messages("s1") == [] and len(service.history("s2")) == 2
+            # 会话的读 / 删直接读库，不依赖对话 Agent：库里没有的会话是 404，列表为空
+            assert client.get("/chat/sessions").json() == {"sessions": []}
+            _assert_error(client.get("/chat/sessions/x"), 404, "not_found")
+            _assert_error(client.delete("/chat/sessions/x"), 404, "not_found")
 
 
 def test_same_session_requests_are_serialized():
