@@ -30,9 +30,9 @@ cd web && pnpm lint                         # oxlint
 scripts/build_web.sh                        # pnpm install --frozen-lockfile + build，并复制到 src/ragbase/web/dist（随包分发）
 ```
 
-- dev server 的代理在 `web/vite.config.ts`：`/health`、`/search`、`/ask`、`/documents`、`/ingest`、`/chat` 转发到 `http://127.0.0.1:8000`。**新增了以其他前缀开头的 API 路由，要把前缀加进 `apiPaths`**；前端路由（`/`、`/library`、`/c/:id`）与这些前缀互不重叠，所以刷新页面不会被代理走。
+- dev server 的代理在 `web/vite.config.ts`：把 API 路径前缀（`/health`、`/search`、`/ask`、`/documents`、`/ingest`、`/chat` 等）转发到 `http://127.0.0.1:8000`。**新增了以其他前缀开头的 API 路由，要把前缀加进 `apiPaths`**（题集 `/eval-questions*` 和体检 `/diagnose*` 同理）；前端路由（`/`、`/library`、`/diagnose`、`/c/:id`）刷新页面时不能被代理走。注意 `/diagnose` 既是前端页面（`GET`）又是体检接口（`POST /diagnose`、`/diagnose/jobs/*`、`/diagnose/reports*`），所以 `vite.config.ts` 对它单独配置：浏览器的页面导航（`Accept` 含 `text/html`）不走代理，刷新页面才能拿到前端。
 - API 服务托管 `web/dist`：目录是否存在在请求时检查，服务运行中重新 `pnpm build` 立即生效（细节见 [api.md](api.md#前端路由与静态资源)）。
-- 目录结构：`src/pages/`（`ChatPage`、`LibraryPage`）、`src/components/`（`chat/`、`library/`、`ui/` 为 shadcn 组件、`AppShell`、`StatusPill`、`AuthDialog`）、`src/hooks/`、`src/lib/`（`api.ts` 请求封装，上传用 XHR 以拿到进度；`sse.ts` 极简 SSE 解析器，因为 `EventSource` 不能 POST；`auth.ts` 密钥状态；`books.ts` 书名显示美化）。
+- 目录结构：`src/pages/`（`ChatPage`、`LibraryPage`、`DiagnosePage`）、`src/components/`（`chat/`、`library/`、`ui/` 为 shadcn 组件、`AppShell`、`StatusPill`、`AuthDialog`）、`src/hooks/`、`src/lib/`（`api.ts` 请求封装，上传用 XHR 以拿到进度；`sse.ts` 极简 SSE 解析器，因为 `EventSource` 不能 POST；`auth.ts` 密钥状态；`books.ts` 书名显示美化）。
 
 **界面功能**：
 
@@ -41,7 +41,8 @@ scripts/build_web.sh                        # pnpm install --frozen-lockfile + b
 - **状态指示**（右上角）：绿色“就绪”（索引与 Agent 都可用）、琥珀色“仅检索”（大模型未配置）、红色“未就绪 / 离线”；点开看片段数、BM25 构建时间、设备、召回模式、大模型和 Agent 状态，以及“更换密钥”。每 15 秒轮询 `/health`。
 - **鉴权**：服务要求密钥时弹出“需要访问密钥”对话框；密钥通过 `/health` 校验后保存在浏览器 localStorage（`ragbase.apiKey`），之后每个请求（含流式对话和上传）自动带上；任何请求返回 401（如密钥被更换）都会清掉本地密钥并重新弹出对话框，输入框里未发送的文字不受影响。
 - 主题：浅色 / 深色 / 跟随系统，保存在浏览器 localStorage。书名显示去掉了扩展名和 z-library 之类的下载站后缀（`web/src/lib/books.ts`），完整文件名在悬停提示里。
-- 重新打开历史会话时，引用角标和“依据”面板可以恢复（`GET /chat/sessions/{id}` 的助手消息带 `citations`）；但会话本身只存在服务进程内存里，重启后列表为空。
+- 重新打开历史会话时，引用角标和“依据”面板可以恢复（`GET /chat/sessions/{id}` 的助手消息带 `citations`）；会话保存在内置数据库里，重启后仍在，只有手动删除才会消失（见[架构：对话 Agent](architecture.md#对话-agent)）。
+- **体检页**（`/diagnose`）：在 Web 上发起体检（后台运行并显示进度）、查看最新或历史报告、删除报告、选两份报告对比，以及题集的增删改和导入 / 导出。功能说明见 [diagnostics.md](diagnostics.md#在-web-上体检)，接口见 [api.md](api.md#体检)。
 - 局限：上传一次一个文件（后端同一时刻只有一个入库任务）；没有“搜索实验”页（`/search` 接口仍可直接调用）；界面文案里还有“教材”字样（面向作者自己的语料）。
 
 ## 项目结构
@@ -56,7 +57,7 @@ scripts/            start.sh · build_web.sh · calibrate_rerank_threshold.py ·
 docs/               文档
 Dockerfile · docker-compose.yml · .dockerignore
 .env.example        配置模板（与 src/ragbase/resources/env.example 内容相同）
-eval_questions.json 作者语料的评测题集（评测 / 校准脚本读取）
+eval_questions.json 作者语料的评测题集（首次打开数据库时自动导入；校准脚本直接读这个文件）
 bm25_userdict.txt   领域词典（作者语料；新项目由 ragbase init 生成默认的）
 ```
 
@@ -71,7 +72,7 @@ uv run python tests/test_hybrid.py        # 单独运行一个
 约定：
 
 - **不用 pytest**。每个 `tests/test_*.py` 是一个**纯断言脚本**：`test_` 开头的函数用 `assert` 校验，末尾的 `__main__` 块依次调用它们、打印 `通过：<函数名>`，最后必须打印 `共 N 项测试通过`——`run_all.py` 靠这行汇总判断成功。新写测试脚本照抄现有文件的模板。
-- **不加载真实模型、不调用真实大模型、不碰真实的 `data/` 与索引**，也不访问外网：用假 embedding（确定性假向量）、假流水线、脚本化的假工具调用模型；需要 HTTP 对端时在本机 `127.0.0.1` 起**桩服务**（`test_llm.py` 的 OpenAI 兼容桩、`test_providers.py` 的 embedding / rerank 桩）；用临时目录和临时 Chroma / 本地 Qdrant；API 用 FastAPI `TestClient` + 注入的假流水线（`create_app(pipeline_factory=…, settings=…, ingest_fn=…, chat_factory=…)`）。
+- **不加载真实模型、不调用真实大模型、不碰真实的 `data/`、索引和 `ragbase.db`**，也不访问外网：用假 embedding（确定性假向量）、假流水线、脚本化的假工具调用模型；需要 HTTP 对端时在本机 `127.0.0.1` 起**桩服务**（`test_llm.py` 的 OpenAI 兼容桩、`test_providers.py` 的 embedding / rerank 桩）；用临时目录和临时 Chroma / 本地 Qdrant；涉及数据库的测试用临时目录里的 SQLite 文件（让 `RAG_HOME` / `RAG_DB_PATH` 指向临时目录，或直接 `Database(":memory:")`）；API 用 FastAPI `TestClient` + 注入的假流水线（`create_app(pipeline_factory=…, settings=…, ingest_fn=…, chat_factory=…)`）。
 - 测试里要与外部环境无关：先清掉 `RAG_*` / `ARK_*` 环境变量（参考 `test_config.py`、`test_cli_setup.py` 里的 `env()` 辅助），用 `Settings(_env_file=None)` 避免读到本机 `.env`。
 - **改动哪块就跑哪块**；合并前跑全量。
 
@@ -79,7 +80,12 @@ uv run python tests/test_hybrid.py        # 单独运行一个
 | --- | --- |
 | `test_api.py` | HTTP 接口（假流水线 / 假入库）、统一错误格式、上传校验 |
 | `test_auth.py` | API Key 鉴权、公开白名单、CORS、日志不泄密 |
-| `test_agent.py` | 对话 Agent：工具、会话级引用、限制、回滚、淘汰 |
+| `test_agent.py` | 对话 Agent：工具、会话级引用、限制、回滚、历史窗口 |
+| `test_db.py` | 内置 SQLite：建库、迁移、事务、并发写、错误信息、`RAG_DB_PATH`、doctor 检查 |
+| `test_chat_persistence.py` | 会话持久化：重启后会话 / 历史 / 引用编号保持、历史窗口、半截轮次恢复、checkpoint 瘦身、删除、Agent 未就绪时的会话接口 |
+| `test_questions.py` | 题集（`QuestionStore`）与体检报告历史（`ReportStore`）、`ragbase questions` 子命令 |
+| `test_diagnose.py` | 体检核心：分阶段计时、指标、建议规则、报告 |
+| `test_api_diagnose.py` | 题集 / 体检 / 报告 HTTP 接口：校验、互斥、快照、鉴权 |
 | `test_web.py` | 会话列表、前端静态托管与 SPA 回退 |
 | `test_llm.py` | 大模型工厂、超时 / 重试、`/ask` 端到端（本机桩服务） |
 | `test_providers.py` | 云端 embedding / rerank、提供方工厂、索引签名 |
@@ -112,6 +118,7 @@ uv run python scripts/gen_config_docs.py --check   # 只检查是否最新
 ## 编码约定
 
 - **注释、文档字符串、面向用户的消息一律用中文**；技术术语保留英文。错误信息要能直接展示给用户，且**绝不含密钥**。
+- **数据库表结构只通过迁移改**：`ragbase/db/migrations.py` 的 `MIGRATIONS` 只增不改，已发布的迁移不要动，要加表 / 加列就追加一个新的迁移函数（只用 `conn.execute`，不用 `executescript`）；写库一律走 `Database.transaction()`，读用 `Database.query()`；LangGraph checkpointer 的表由它自己管理，用 `new_connection()` 的独立连接。
 - **配置只有一个来源**：`ragbase/config.py` 的 `Settings`。不要在别处直接读 `os.environ`（`RAG_HOME` 除外，因为它决定 `.env` 的位置）。默认值也只在这里定义。
 - **密钥用 `SecretStr`**，只在真正需要时 `get_secret_value()`；不写进日志、`repr`、错误响应、`/health`。
 - **工厂是唯一的构造点**：`models.factory.create_embeddings / create_reranker`、`llm.factory.create_chat_model`、`vectorstores.create_vector_store`——调用方不要自己 new 具体实现。

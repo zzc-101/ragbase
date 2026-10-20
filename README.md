@@ -8,10 +8,12 @@
 - **低分拒答与幻觉抑制**：最相关片段得分低于阈值直接拒答；只把足够相关的片段交给大模型；“先摘录依据，再回答”。
 - **引用溯源**：回答带 `[n]` 引用，对应文件名、页码、PDF 书签章节路径和各路得分。
 - **对话 Agent**：多轮追问、按需检索、会话级引用编号、流式输出（SSE）。
+- **会话持久化（SQLite）**：内置 SQLite 数据库（零额外服务），会话的完整历史和引用重启后仍在，只在手动删除时才清掉；大模型只看到最近 N 轮。
 - **增量入库**：新增 / 修改 / 删除自动识别；服务在线时可通过 Web 界面或 API 上传文档。
 - **模型可本地可云端**：embedding / reranker 可选本地 Qwen3（Apple Silicon / CUDA / CPU）或云端 API；大模型走任意 OpenAI 兼容服务。
 - **向量库可插拔**：Chroma（默认）/ Qdrant（嵌入式或服务端），可无损迁移。
 - **安全默认**：可选静态 API Key 鉴权（默认拒绝 + 公开白名单）、CORS、`ragbase doctor` 体检。
+- **体检**：`ragbase diagnose` 或 Web 的“体检”页——当前参数、各阶段召回质量与耗时、调参建议（不调用大模型）；报告存进数据库保留历史，可两次对比；题集可在 Web 上增删改、导入导出。
 - **评测**：Ragas、无需大模型的词面指标、拒答阈值校准脚本。
 
 ## 架构
@@ -103,7 +105,7 @@ uv run ragbase ask                       # 命令行问答（--mode / --min-scor
 uv run ragbase chat                      # 命令行多轮对话（/new 新会话，exit 退出）
 uv run ragbase ingest                    # 增量入库；ingest --full 全量重建
 uv run ragbase eval --retrieval-only     # 评测（不调用大模型）
-uv run ragbase diagnose                  # 体检：当前参数、各阶段召回质量与耗时、调参建议（不调用大模型）
+uv run ragbase diagnose                  # 体检：当前参数、各阶段召回质量与耗时、调参建议（不调用大模型）；报告存进数据库，Web 体检页可查看
 uv run ragbase questions import FILE     # 评测题集导入（--replace 替换全部）；questions export FILE 导出
 uv run ragbase --help                    # 全部子命令：init models doctor serve ingest ask chat eval diagnose questions migrate-store
 ```
@@ -121,11 +123,11 @@ curl -s -X POST http://127.0.0.1:8000/ask -H 'Content-Type: application/json' \
 | --- | --- |
 | [docs/configuration.md](docs/configuration.md) | 全部配置项（由 `Settings` 生成）、优先级、`RAG_HOME` |
 | [docs/models.md](docs/models.md) | 本地 / 云端模型、示例组合、HF 镜像、索引签名规则、阈值重新标定、硬件 |
-| [docs/api.md](docs/api.md) | 全部 HTTP 接口、鉴权、错误格式、SSE 事件、引用编号 |
-| [docs/deployment.md](docs/deployment.md) | Docker Compose、start.sh、反向代理 / HTTPS、安全清单、备份、升级 |
-| [docs/architecture.md](docs/architecture.md) | 解析 / 切分 / 增量入库 / 混合检索 / 拒答 / Agent / 向量库 / 模块地图 |
+| [docs/api.md](docs/api.md) | 全部 HTTP 接口（含会话、题集、体检）、鉴权、错误格式、SSE 事件、引用编号 |
+| [docs/deployment.md](docs/deployment.md) | Docker Compose、start.sh、反向代理 / HTTPS、安全清单、备份（含 `ragbase.db`）、升级 |
+| [docs/architecture.md](docs/architecture.md) | 解析 / 切分 / 增量入库 / 混合检索 / 拒答 / Agent / 数据库 / 向量库 / 模块地图 |
 | [docs/evaluation.md](docs/evaluation.md) | 评测指标、运行方式、题集格式、校准工作流 |
-| [docs/diagnostics.md](docs/diagnostics.md) | `ragbase diagnose` 体检：报告各项含义、建议规则与阈值、注意事项 |
+| [docs/diagnostics.md](docs/diagnostics.md) | 体检（命令行与 Web）：题集、报告各项含义、历史与对比、建议规则与阈值、注意事项 |
 | [docs/development.md](docs/development.md) | 开发环境、前端、测试、CI、约定、如何扩展 |
 | [docs/troubleshooting.md](docs/troubleshooting.md) | 常见问题与排错 |
 | [CHANGELOG.md](CHANGELOG.md) | 更新日志 |
@@ -136,7 +138,8 @@ curl -s -X POST http://127.0.0.1:8000/ask -H 'Content-Type: application/json' \
 - **服务运行期间不要运行 `ragbase ingest --full`**（会清空整个向量库，而服务进程还持有该索引）；增量 `ragbase ingest` 也不要与服务同时运行。服务在线时用 Web 界面“知识库”页或 `POST /documents` / `POST /ingest`。
 - **嵌入式 Qdrant**（只设 `RAG_VECTOR_STORE=qdrant`）同一目录同一时刻只允许一个进程写，不能和运行中的 `serve` 同时跑 `ingest` / `migrate-store`。
 - 服务**必须单进程**，不要加 `--workers`。
-- 命令在**项目主目录**（`RAG_HOME`，默认当前目录）下读写 `data/`、索引和 `.env`；在别的目录运行请先设置 `RAG_HOME`。
+- 命令在**项目主目录**（`RAG_HOME`，默认当前目录）下读写 `data/`、索引、`ragbase.db` 和 `.env`；在别的目录运行请先设置 `RAG_HOME`。
+- 会话、评测题集和体检报告都存在 `ragbase.db` 里，**备份它**（运行中不要只拷这一个文件，见[备份](docs/deployment.md#备份)）。
 - 不会自动 OCR：扫描版 PDF（没有文本层）需要先自行做 OCR。
 
 ## 项目状态
@@ -146,7 +149,7 @@ curl -s -X POST http://127.0.0.1:8000/ask -H 'Content-Type: application/json' \
 - 对话 Agent 依赖模型的工具调用能力，单元测试用的是假模型，**未用真实大模型验证**；Agent 的系统提示词里目前写着作者语料（《系统架构设计师》《信息系统项目管理师》教材）的领域文案，换领域请改 `agent/service.py` 与 `agent/tools.py`。
 - 本地模型在 Apple Silicon（MPS）上日常使用；CUDA 路径代码支持但未实测；云端服务商的具体地址 / 模型 ID 均为示例，未逐一验证。
 - 默认拒答阈值（0.7 / 0.95）按作者语料上的本地 Qwen3-Reranker-0.6B 标定，换语料 / 换 reranker 请用 `scripts/calibrate_rerank_threshold.py` 重新标定。
-- 会话只存在服务进程内存里，重启即丢。
+- 数据库用 WAL 模式，**Docker Desktop（macOS）的绑定目录上有已知风险**，Docker 部署本身尚未验证，见[备份](docs/deployment.md#备份数据库ragbasedb)。
 
 ## 开发
 

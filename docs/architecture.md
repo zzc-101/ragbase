@@ -27,11 +27,11 @@ flowchart LR
     end
 ```
 
-对话 Agent 在此之上：由大模型决定要不要调用 `search_knowledge`（上图“查询”部分的同一套召回 + 精排 + 拒答 + 过滤），再带 `[n]` 引用作答，并保存多轮记忆。
+对话 Agent 在此之上：由大模型决定要不要调用 `search_knowledge`（上图“查询”部分的同一套召回 + 精排 + 拒答 + 过滤），再带 `[n]` 引用作答，并把多轮会话持久化到内置 SQLite 数据库（见[数据库](#数据库)）。
 
 设计取舍：
 
-- **RAG 能力和产品壳分开**：只提供检索 / 问答 / 对话 / 文档入库，没有用户、权限、多租户；访问控制只有一把静态共享密钥。
+- **RAG 能力和产品壳分开**：只提供检索 / 问答 / 对话 / 文档入库（外加体检与评测），没有用户、权限、多租户；访问控制只有一把静态共享密钥。
 - **拒答优先于编造**：精排得分不够就不调用大模型（省钱，也避免凭空编造）；够了也只给模型足够相关的片段，并要求它逐字摘录依据。
 - **单进程**：模型、BM25 索引都加载在服务进程内，用锁和快照保证并发安全，不做多 worker。
 
@@ -154,21 +154,27 @@ flowchart LR
 
 ## 对话 Agent
 
-在 `/ask`（单轮、固定流程）之外，多轮对话 Agent 由大模型决定是否检索、检索什么，再带 `[n]` 引用作答。代码：[`agent/tools.py`](../src/ragbase/agent/tools.py)（工具与引用登记表）、[`agent/service.py`](../src/ragbase/agent/service.py)（Agent、会话、限制）、命令行 `ragbase chat`。
+在 `/ask`（单轮、固定流程）之外，多轮对话 Agent 由大模型决定是否检索、检索什么，再带 `[n]` 引用作答。代码：[`agent/tools.py`](../src/ragbase/agent/tools.py)（工具与引用登记表）、[`agent/service.py`](../src/ragbase/agent/service.py)（Agent、会话、限制）、[`agent/store.py`](../src/ragbase/agent/store.py)（会话摘要与引用的数据库读写）、命令行 `ragbase chat`。
 
 ```text
 用户消息 → Agent（LangChain create_agent，基于 LangGraph）─┬→ search_knowledge(query, sources?) → 召回 + 精排 + 拒答 / 上下文过滤（同 /ask）
                                                           ├→ list_documents()                  → 书目与片段数
                                                           └→ 最终回答（[n] 引用）
-会话历史：InMemorySaver，thread_id = session_id
+会话历史：SqliteSaver（同一个 ragbase.db），thread_id = session_id
 ```
 
 - **工具**：`search_knowledge` 检索，结果格式为 `[n] 来源：《书名》> 章节路径（第N页）` + `内容：…`；被拒答时返回“知识库中没有找到可靠的相关内容……”，让模型直接告诉用户而不是编造。`list_documents` 列出书目（供模型用 `sources` 限定范围）。`sources` 里有未知书名时不抛异常，而是把可选项告诉模型让它自己纠正。
 - **多轮改写**不单独做一步：工具描述要求模型把 `query` 写成自包含的完整问题（补全代词 / 省略），检索直接用它。
-- **会话记忆**：LangGraph 的 `InMemorySaver`，**只在进程内存里，重启即丢**。历史有界：每次调用开头把状态裁到最近 `RAG_CHAT_HISTORY_TURNS` 条用户消息（含本轮；一轮 = 一条用户消息及其后的全部回复 / 工具消息，整轮保留或丢弃，不会留下缺 ToolMessage 的 `tool_calls`），不额外调用大模型做摘要。会话数有上限（`RAG_CHAT_MAX_SESSIONS`）、空闲有 TTL（`RAG_CHAT_SESSION_TTL`），超出时按 LRU 淘汰**空闲**会话（所有会话都忙时数量可暂时超过上限）。
-- **限制**：每轮工具调用上限（`RAG_AGENT_MAX_TOOL_CALLS`，超出后工具被拒绝，模型据已有结果作答）、每轮模型调用上限（`RAG_AGENT_MAX_MODEL_CALLS`，超出后直接结束并提示“本轮处理步骤过多”）；同一会话的请求串行（会话锁）。
-- **失败回滚**：失败 / 客户端断开的那一轮会回滚到轮次开始前的消息，并撤销本轮新登记的引用片段——否则下一轮的历史里可能有缺 ToolMessage 的 `tool_calls`，OpenAI 兼容服务会拒绝。
-- **引用编号是会话级的**：每个会话一个 `CitationRegistry`，同一 `chunk_id` 永远是同一个编号，新片段顺延；响应的 `citations` 只含回答里实际标注了 `[n]` 的片段（可能不连续、可能含更早轮次登记的）。语义细节见 [api.md](api.md#引用编号语义)。
+- **会话记忆与持久化**：历史由 LangGraph 的 SQLite checkpointer（`langgraph-checkpoint-sqlite`）保存在内置数据库里，**重启不丢**；会话摘要（标题、更新时间、消息数）在 `chat_sessions` 表，引用编号在 `chat_citations` 表（见[数据库](#数据库)）。会话**不自动淘汰**（没有 TTL 和数量上限），只有手动删除才会清掉。`ragbase chat` 命令行是例外：它用内存里的 `InMemorySaver` 和内存库，临时会话不写库、不会出现在 Web 的会话列表里。
+- **完整历史只在调用模型时截取**：状态里保留会话的**全部**消息（Web 上能翻看整段对话、引用面板完整），只在每次调用大模型前，由中间件（`HistoryTrimMiddleware` 的 `wrap_model_call` 钩子）把发给模型的消息截成最近 `RAG_CHAT_HISTORY_TURNS` 条用户消息（含本轮）。一轮 = 一条用户消息及其后的全部回复 / 工具消息，整轮保留或丢弃，不会留下缺 ToolMessage 的 `tool_calls`；截取不回写状态，也不额外调用大模型做摘要。大模型看到的上下文长度与“只保留最近 N 轮”时一致。
+- **标题与计数**：`title` 取会话第一轮成功时的第一条用户消息（压成单行、最多 30 字）并固定；`message_count` 累计用户消息和最终回答（不含工具步骤）。会话行在第一轮**成功**后才写入，第一轮失败不会留下空会话。
+- **半截轮次修复**：LangGraph 每个节点都写 checkpoint，进程在一轮中途被强杀（`kill -9` / 断电）时，库里可能留下“用户消息 + 带 `tool_calls` 的 AI 消息、缺少对应工具结果”这种残缺状态，下一轮会被大模型接口拒绝。所以每轮开始（拿到会话锁之后）会检查状态末尾：有 `tool_calls` 没对上 `ToolMessage`，或最后一条用户消息之后没有不带 `tool_calls` 的 AI 回答，就把从那条用户消息起的整段删掉，并把 `chat_citations` 截回该会话的“已提交编号”（`chat_sessions.committed_citations`，每轮成功时更新），清掉半截轮次多登记的引用。
+- **checkpoint 瘦身**：LangGraph 每个节点都会写一个 checkpoint，且每个 checkpoint 存完整的消息列表。每轮成功后，只保留该会话最新的一个 checkpoint，删掉更早的及其 writes，库不会随轮数无限膨胀，也不会丢任何消息。（`langgraph-checkpoint-sqlite` 3.1.1 没有现成的清理方法，直接对它的表执行 SQL。）
+- **限制**：每轮工具调用上限（`RAG_AGENT_MAX_TOOL_CALLS`，超出后工具被拒绝，模型据已有结果作答）、每轮模型调用上限（`RAG_AGENT_MAX_MODEL_CALLS`，超出后直接结束并提示“本轮处理步骤过多”）；同一会话的请求串行（会话锁，只存在内存里，不持久化）。
+- **失败回滚**：失败 / 客户端断开的那一轮会回滚到轮次开始前的消息，并撤销本轮新登记的引用片段（数据库里的引用行同步删除）——否则下一轮的历史里可能有缺 ToolMessage 的 `tool_calls`，OpenAI 兼容服务会拒绝。
+- **引用编号是会话级的**：每个会话一个 `CitationRegistry`（写穿到 `chat_citations`），同一片段永远是同一个编号，新片段顺延，**重启后接着编**；响应的 `citations` 只含回答里实际标注了 `[n]` 的片段（可能不连续、可能含更早轮次登记的）。片段的“身份”（`chunk_key`）是 `chunk_id`；没有 `chunk_id` 的片段用 `md5(来源|页码|正文)`——不能用 Python 内置 `hash()`，它每个进程都不一样，重启后同一片段会被当成新片段。语义细节见 [api.md](api.md#引用编号语义)。
+- **删除**：先删 checkpointer 里该会话的 thread，再在一个数据库事务里删会话行和引用行。两步不在同一事务里（checkpointer 用独立连接，见[数据库](#数据库)），中途失败时会话行还在，再删一次即可删完。
+- **对话 Agent 未就绪时**（大模型未配置或索引为空）：会话列表、历史和删除直接读写数据库，照常可用；只有发消息返回 503。
 - **流式**：`token` 是模型每次生成的文本增量；若模型在调用工具前先说了一句话，这句话也会出现在 token 流里，以 `done.answer` 为准。
 
 **已知局限**：
@@ -176,6 +182,37 @@ flowchart LR
 - 对话需要模型支持 `tools` / `tool_calls`。单元测试用脚本化的假模型，**没有用真实大模型验证过**，兼容性取决于你的服务商。
 - Agent 的系统提示词和 `search_knowledge` 工具描述里目前写着“知识库收录了《系统架构设计师》《信息系统项目管理师》等教材”（`agent/service.py`、`agent/tools.py`）；资料领域不同时，请改掉这两处文案。
 - 检索的拒答阈值、过滤阈值在对话里同样适用（用的是 Settings 的值，不能按请求覆盖）。
+
+## 数据库
+
+ragbase 内置一个 SQLite 数据库，零额外服务、开箱即用。代码在 [`src/ragbase/db/`](../src/ragbase/db/)，只用 Python 标准库 `sqlite3` 和 LangGraph 官方 SQLite checkpointer，不引入 ORM。
+
+**文件位置**：默认 `RAG_HOME/ragbase.db`，用 `RAG_DB_PATH` 覆盖（空值视为未设置，见 [configuration.md](configuration.md)）。父目录不存在时自动创建。开启了 WAL 模式，运行时旁边会出现 `ragbase.db-wal` 和 `ragbase.db-shm`，备份时要注意，见[部署：备份](deployment.md#备份)。
+
+**什么时候打开**：`ragbase serve` 启动时（先于加载模型，目录不可写 / 文件损坏会直接报中文错误退出）；命令行里只有用到它的子命令才打开：`diagnose`、`eval`、`questions`。`ragbase chat` 用内存库，不碰数据库文件。`ragbase doctor` 只做只读探测（不创建文件、不迁移），检查能否打开、表结构版本是不是最新。每次打开还会检查一次题集的“首次导入”（见[体检：题集](diagnostics.md#题集)）。
+
+**表**：
+
+| 表 | 内容 | 创建于 |
+| --- | --- | --- |
+| `meta` | 键值元数据，如“题集首次导入已做过”的标记 | 迁移 1 |
+| `chat_sessions` | 会话摘要：`session_id`、`title`、`created_at`、`updated_at`、`message_count`、`committed_citations`（已提交的引用编号，崩溃恢复用） | 迁移 2 |
+| `chat_citations` | 会话级引用：`(session_id, number)` 主键、`chunk_key`、`document`（JSON：正文 + 元数据，含精排得分） | 迁移 2 |
+| `eval_questions` | 评测题集：`id`、`question`、`reference`（可空）、`difficulty`、`type`、`source_topic`、时间戳 | 迁移 3 |
+| `diagnose_reports` | 体检报告历史：`origin`（`cli` / `web`）、`mode`、`question_count`，以及 `params` / `summary` / `recommendations` / `records` / `extra` 几列 JSON | 迁移 3 |
+| `checkpoints`、`writes` | LangGraph 的对话 checkpoint，**由它自己的 `setup()` 创建和管理**，不在我们的迁移里 | 启动时 |
+
+所有表放在同一个文件里，备份只有一个文件。
+
+**迁移**：表结构版本存在 SQLite 的 `PRAGMA user_version` 里。`ragbase/db/migrations.py` 的 `MIGRATIONS` 是按顺序排列的迁移函数，第 i 个把版本从 i 升到 i+1，**只增不改**——已发布的迁移不要再动，要改表结构就追加新的。每次打开数据库自动执行到最新，每个迁移各自在一个 `BEGIN IMMEDIATE` 事务里完成（迁移与版本号一起提交，中途失败整体回滚，下次从这一步继续），多个进程同时启动时靠写锁串行。全新目录首次启动自动建库，旧版本的库自动升级，不需要手动操作。数据库的版本比当前程序支持的更新（用旧版 ragbase 打开新版升级过的库）时拒绝打开并提示升级，不会降级或改动它。
+
+**连接与并发**：
+
+- 主连接 `check_same_thread=False`，供 FastAPI 线程池里的多个请求共用，用一把进程内可重入锁串行化；写事务一律 `BEGIN IMMEDIATE`，一开始就拿写锁，避免读转写时的 `SQLITE_BUSY`。开启 WAL（读写互不阻塞）、`foreign_keys=ON`、`busy_timeout=5000ms`（别的连接正在写时最多等 5 秒，而不是立刻报 `database is locked`）。
+- **LangGraph checkpointer 用独立的第二条连接**（`Database.new_connection()`）：它自己管理提交和锁，和主连接上手动开的事务混用会互相干扰。代价是“删除会话”不能把 checkpoint 和会话行放进同一个事务（见上面“删除”）。
+- 服务必须单进程。命令行的 `diagnose`、`eval`、`questions` 是另一个进程，也会读写同一个文件，SQLite 靠文件锁和 `busy_timeout` 让它们排队；但没有专门针对“多个进程同时写”做过测试，尽量不要让它们和服务同时大量写入。
+
+**限制**：只支持 SQLite，不支持 PostgreSQL 等其他数据库；`/chat/sessions` 不分页。
 
 ## 向量库抽象
 
@@ -204,6 +241,8 @@ flowchart LR
 - 入库任务在后台线程里，每批持锁、批间释放；同一时刻只有一个入库 / 删除任务（否则 409）。
 - BM25 快照不可变，刷新时整体替换引用；检索始终看到完整的旧快照或新快照。
 - 对话按会话串行，不同会话并行（但检索仍排队等 `pipeline.lock`）。
+- 体检在后台线程里跑，每道题单独持 `pipeline.lock`，所以对话能在题与题之间插进来（会变慢）；体检、入库任务、删除文档共用一把“忙”锁（`BusyLock`），同一时刻只能有一个，冲突时 409。
+- 数据库写入：主连接上的写事务串行（进程内锁 + `BEGIN IMMEDIATE`），checkpointer 用独立连接，跨连接靠 SQLite 的写锁和 `busy_timeout` 排队。
 
 ## 性能相关设计
 
@@ -219,7 +258,7 @@ flowchart LR
 ```text
 pyproject.toml / uv.lock       依赖与锁文件（uv 管理）；命令行入口 ragbase = ragbase.cli:main
 src/ragbase/
-  cli.py  __main__.py          命令行：init / models / doctor / serve / ingest / ask / chat / eval / diagnose / migrate-store（python -m ragbase 等价）
+  cli.py  __main__.py          命令行：init / models / doctor / serve / ingest / ask / chat / eval / diagnose / questions / migrate-store（python -m ragbase 等价）
   scaffold.py  doctor.py       ragbase init（生成 .env 等）、ragbase doctor（环境自检）
   index_info.py                索引的 embedding 签名（.index_info.json）与兼容性检查
   config.py  logging_setup.py  集中配置（Settings：RAG_* 环境变量 / .env）；日志（带请求 ID）
@@ -228,13 +267,16 @@ src/ragbase/
   llm/factory.py               大模型工厂（OpenAI 兼容协议；回答模型与评测裁判）
   models/                      factory（创建 embedding / reranker 的唯一入口）、embeddings / reranker（本地 Qwen3）、
                                api_client / api_embeddings / api_reranker（云端）、download（缓存检查与下载）
-  ingest/                      parser / cleaner / splitter / toc / common / service / jobs
+  db/                          core（Database：连接、事务、元数据；open_database 入口）、migrations（表结构版本与迁移）
+  ingest/                      parser / cleaner / splitter / toc / common / service / jobs（后台入库任务；BusyLock 与体检共用）
   vectorstores/                base（接口）、chroma、qdrant、factory（按 RAG_VECTOR_STORE 创建）、migrate（后端间迁移）
   retrieval/                   hybrid（向量 + BM25 + RRF）、pipeline（召回 → 精排 → 拒答 → 生成）、labels（来源标签）
-  agent/                       tools（检索工具与引用登记表）、service（对话 Agent 与会话）
-  api/                         app（FastAPI 应用，ragbase.api.app:app）、schemas、auth（API Key 鉴权）
-  evaluation/                  runner（评测流程）、metrics（Ragas 与聚合）、lexical（词面检索指标，不依赖 ragas）
-  diagnostics.py               ragbase diagnose：分阶段计时、指标汇总、建议规则、报告排版
+  agent/                       tools（检索工具与引用登记表）、service（对话 Agent 与会话）、store（会话摘要与引用的数据库读写）
+  api/                         app（FastAPI 应用，ragbase.api.app:app；含题集 / 体检 / 报告接口）、schemas、auth（API Key 鉴权）
+  evaluation/                  runner（评测流程）、metrics（Ragas 与聚合）、lexical（词面检索指标，不依赖 ragas）、questions（题集：QuestionStore、校验、首次导入）
+  diagnostics.py               体检核心：分阶段计时、指标汇总、建议规则、报告排版；run_diagnosis 供命令行与 Web 共用
+  diagnostics_reports.py       ReportStore：体检报告历史的数据库读写
+  diagnostics_jobs.py          Web 体检的后台任务注册表与对话请求计数
 scripts/                       start.sh（一键启动）、build_web.sh（构建前端并复制进包）、calibrate_rerank_threshold.py（拒答阈值校准）、gen_config_docs.py（生成配置文档）
 tests/                         断言脚本式单元测试（tests/run_all.py 一次运行全部）
 web/                           前端工程（React + Vite + TypeScript + Tailwind + shadcn/ui）
@@ -242,4 +284,4 @@ Dockerfile / docker-compose.yml  CPU 镜像与 Compose 部署
 docs/                          本目录文档
 ```
 
-运行时数据（`data/`、`chroma_db/`、`qdrant_db/`、`.ingest_meta.json`、`.index_info.json`、`.bm25_cache/` 等）默认都在项目主目录 `RAG_HOME` 下，见 [configuration.md](configuration.md#路径与项目主目录)。
+运行时数据（`data/`、`chroma_db/`、`qdrant_db/`、`ragbase.db`、`.ingest_meta.json`、`.index_info.json`、`.bm25_cache/` 等）默认都在项目主目录 `RAG_HOME` 下，见 [configuration.md](configuration.md#路径与项目主目录)。

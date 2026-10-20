@@ -4,7 +4,7 @@
 
 `ragbase eval` 对一组带参考要点的问题跑完整的“召回 → 精排 → 拒答 → 生成”流程，并给出三层指标。评测也是调拒答阈值、对比召回方式、验证换模型有没有变好的主要工具。
 
-> 仓库根目录自带的 `eval_questions.json`（30 题）是针对作者自己的语料（信息系统项目管理师 / 系统架构设计师教材）写的。用在你自己的资料上，请先换成你的题目，见[评测题格式](#评测题格式)。
+> 仓库根目录自带的 `eval_questions.json`（30 题）是针对作者自己的语料（信息系统项目管理师 / 系统架构设计师教材）写的，首次打开数据库时会被自动导入题集。用在你自己的资料上，请先换成你的题目，见[评测题格式](#评测题格式)。
 
 ## 三层指标
 
@@ -34,7 +34,7 @@ uv run ragbase eval --retrieval-only       # 只跑召回 + 精排和词面指�
 | 参数 | 说明 |
 | --- | --- |
 | `--limit N` | 只评估前 N 道题（在 `--start-id` 过滤之后取） |
-| `--start-id N` | 从题号 `id ≥ N` 开始，默认 1 |
+| `--start-id N` | 从题号 `id ≥ N` 开始，默认 1（`id` 是题集里的题号，见[评测题格式](#评测题格式)） |
 | `--skip-ragas` | 跳过 Ragas 指标 |
 | `--skip-legacy-judge` | 跳过中文 LLM 裁判 |
 | `--retrieval-mode {vector,bm25,hybrid}` | 召回方式，默认取 `RAG_MODE`（`hybrid`） |
@@ -45,6 +45,7 @@ uv run ragbase eval --retrieval-only       # 只跑召回 + 精排和词面指�
 说明：
 
 - 评测要求索引已建好；embedding 配置与索引不一致时会给出说明后退出（见 [models.md](models.md#换-embedding索引签名规则)）。
+- 题目从内置数据库读取（见[评测题格式](#评测题格式)）；题集为空时会提示先导入或在 Web 上添加。**`reference` 为空的题没有参考答案，评测会跳过它们**并打印被跳过的题号（`ragbase diagnose` 则照常计耗时、只是不计召回率）。
 - 评测只测单轮问答流程（与 `/ask` 同一套），**不涉及对话 Agent**，也没有按书过滤参数。
 - 完整评测会调用回答模型（每题一次）、评测裁判模型（Ragas 五项指标 + 两个裁判，并发执行）；具体调用次数取决于 Ragas 内部实现，这里不给数字。可以单独用 `RAG_EVAL_LLM_MODEL` 指定更强的裁判模型。
 - 因得分过低被拒答的题不会调用回答模型（评测裁判仍会评这条拒答回答）：Ragas 的上下文退回精排 Top5（保持原有行为），其余字段照常记录。
@@ -85,15 +86,19 @@ uv run ragbase eval --retrieval-only --retrieval-mode hybrid
 
 ## 评测题格式
 
-题集是项目主目录下的 `eval_questions.json`（`RAG_HOME/eval_questions.json`）：一个 JSON 数组，每题一个对象。没有这个文件时 `ragbase eval` 会因找不到文件而失败（`ragbase init` 不会生成它）。
+题集存在内置数据库（`RAG_HOME/ragbase.db`，见[架构：数据库](architecture.md#数据库)）里，`ragbase eval` 和 [`ragbase diagnose`](diagnostics.md) 共用，是唯一来源：
+
+- **首次启动自动导入**：数据库还没做过首次导入、题集为空，并且 `RAG_HOME/eval_questions.json` 存在时，第一次打开数据库就把它导入一次，之后不再导入（详见[体检：题集](diagnostics.md#题集)）。`ragbase init` 不会生成这个文件。
+- **之后用命令行或 Web 管理**：`ragbase questions import FILE [--replace]` / `ragbase questions export FILE`，或在 Web 的“体检”页增删改、导入、导出。改仓库根目录的 `eval_questions.json` 不会再影响已经导入过的数据库。
+
+JSON 文件是导入 / 导出用的格式：一个数组，每题一个对象。
 
 ```json
 [
   {
     "id": 1,
     "question": "什么是软件架构风格？",
-    "answer_keyword": "描述某一特定应用领域中系统组织方式的惯用模式，定义系统家族、词汇表和约束",
-    "reference": "（可选）更完整的参考答案",
+    "reference": "描述某一特定应用领域中系统组织方式的惯用模式，定义系统家族、词汇表和约束",
     "source_topic": "架构风格定义",
     "difficulty": "简单",
     "type": "概念题"
@@ -103,18 +108,24 @@ uv run ragbase eval --retrieval-only --retrieval-mode hybrid
 
 | 字段 | 必填 | 说明 |
 | --- | --- | --- |
-| `id` | 是 | 整数，用于 `--start-id` |
-| `question` | 是 | 问题 |
-| `answer_keyword` | 是 | 参考要点；没有 `reference` 时它就是参考答案 |
-| `reference` | 否 | 更完整的参考答案，设置后优先于 `answer_keyword`，用于 Ragas 与词面指标 |
-| `difficulty`、`type` | 是（代码按键直接读取，缺失会报错） | 自定义标签，只写进结果文件 |
+| `question` | 是 | 问题，非空字符串 |
+| `reference` | 否 | 参考答案（或参考要点），用于 Ragas 与词面指标。**为空的题 `ragbase eval` 会跳过**；体检照常计耗时，只是不计召回率 |
+| `answer_keyword` | 否 | 旧版字段，等同 `reference`（两个都写时取 `reference`）；老的题集文件不用改就能导入。库里不单独存它 |
+| `id` | 否 | 正整数，用于 `--start-id`。不写则自动分配；导入时 `id` 重复（文件内）算错误 |
+| `difficulty`、`type` | 否 | 自定义标签，只写进结果文件 |
 | `source_topic` | 否 | 备注，评测流程不使用 |
+
+导入规则：
+
+- **校验是整体的**：文件不是数组、某题缺 `question`、字段类型不对（如 `id` 不是整数、`reference` 不是字符串）、文件内 `id` 重复，都会让整个文件不导入，并逐题列出问题（命令行逐条打印；HTTP 返回 422 与 `errors`）。
+- **追加**（默认）：与库里已有题目 `id` 冲突的题改用新 `id`，并告诉你换了哪些；**替换全部**（`--replace`）：先清空题集，保留文件里的 `id`。
+- **导出**：每题同时写出 `reference` 和 `answer_keyword`（取值相同），所以导出的文件旧版 `ragbase eval` 也能直接读。
 
 ### 如何新增题目
 
 - 问题按真实用户的口吻写；覆盖不同类型（概念、对比、多方面、公式 / 步骤）。
-- `answer_keyword` 用**逗号 / 分号分隔的若干要点**，措辞尽量贴近资料原文——词面指标是靠字符二元组匹配的，要点太笼统或用了资料里没有的同义词会算作未命中。每个要点至少 2 个字符。
-- 想让 Ragas 的“事实正确性”等指标更可信，给题目加一个完整的 `reference`。
+- `reference` 用**逗号 / 分号分隔的若干要点**，措辞尽量贴近资料原文——词面指标是靠字符二元组匹配的，要点太笼统或用了资料里没有的同义词会算作未命中。每个要点至少 2 个字符。
+- 想让 Ragas 的“事实正确性”等指标更可信，把 `reference` 写成完整的参考答案（同时仍包含若干贴近原文的要点，词面指标靠它们匹配）。
 - 再准备几道**库外问题**（资料里没有答案的），用来检验拒答；它们放在校准脚本里，不放在这个题集里，见下。
 
 ## 校准工作流

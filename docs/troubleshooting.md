@@ -8,7 +8,7 @@ uv run ragbase doctor            # Docker：docker compose run --rm ragbase doct
 
 ## 先用 `ragbase doctor`
 
-一屏检查：Python 版本、项目主目录与文档目录是否可写（并显示 `RAG_HOME` 是否设置）、`.env`、embedding / reranker 的提供方与模型（本地：计算设备与模型缓存；云端：地址 / 密钥是否配置）、向量库是否可访问及片段数、索引的 embedding 签名是否与配置一致、是否需要 `ragbase ingest`、大模型是否配置（只显示协议 / 模型 / 地址，不显示密钥）、接口鉴权、Web 资源。每项给出 `✓`（正常）/ `!`（警告）/ `✗`（必须修复）和修复提示；**有 `✗` 时退出码非零**。
+一屏检查：Python 版本、项目主目录与文档目录是否可写（并显示 `RAG_HOME` 是否设置）、`.env`、内置数据库（路径、能否打开、表结构版本是否最新）、embedding / reranker 的提供方与模型（本地：计算设备与模型缓存；云端：地址 / 密钥是否配置）、向量库是否可访问及片段数、索引的 embedding 签名是否与配置一致、是否需要 `ragbase ingest`、大模型是否配置（只显示协议 / 模型 / 地址，不显示密钥）、接口鉴权、Web 资源。每项给出 `✓`（正常）/ `!`（警告）/ `✗`（必须修复）和修复提示；**有 `✗` 时退出码非零**。
 
 - 默认**不调用**大模型，也不调用云端 embedding / rerank。
 - `--check-llm`：额外发一次最小的大模型请求，验证地址 / 密钥 / 模型名。
@@ -111,7 +111,46 @@ uv run ragbase doctor            # Docker：docker compose run --rm ragbase doct
 
 - 大模型未配置：`/chat` 返回 503，`/health` 里 `agent_ready` 为 `false`，Web 界面状态为“仅检索”。
 - 对话要求模型支持工具调用（`tools` / `tool_calls`）。单元测试用的是假模型，**没有用真实大模型验证过**，如果你的服务商或模型不支持函数调用，会表现为 502 或回答异常；此时可以用不依赖工具调用的 `/ask`。
-- 会话丢失 / `GET /chat/sessions/{id}` 返回 404：会话只存在服务进程内存里，重启、超过 `RAG_CHAT_MAX_SESSIONS` 或空闲超过 `RAG_CHAT_SESSION_TTL` 都会丢。
+- 会话不见了 / `GET /chat/sessions/{id}` 返回 404：见下一节[会话不见了](#会话不见了)。
+
+## 数据库打不开 / 版本过新
+
+会话、评测题集和体检报告都存在内置 SQLite 数据库里（默认 `RAG_HOME/ragbase.db`，见[架构：数据库](architecture.md#数据库)）。`ragbase serve` 启动时先打开它，打不开会直接给出中文错误并退出，不会去加载模型。
+
+- **无法打开数据库 / 无法创建数据库目录 / 数据库不可写**：检查路径所在目录的权限和磁盘空间。WAL 模式要求**所在目录也可写**（运行时旁边会出现 `-wal` / `-shm` 文件）。Docker 里确认 `ragbase-home` 对容器内 uid 1000 可写。路径不合适时用 `RAG_DB_PATH` 指向一个可写的本地位置。
+- **文件已损坏**（错误里有 `file is not a database` 之类的原文）：先把 `ragbase.db`（连同 `-wal` / `-shm`）拷走留底，再删除它，重启后会自动建一个新库——**会丢失里面的会话和体检报告**，题集会在首次启动时从 `RAG_HOME/eval_questions.json` 重新导入（文件还在的话）。有备份的话从备份恢复，见[部署：备份](deployment.md#备份)。
+- **数据库版本比当前程序更新**（“数据库 … 的版本（N）比当前程序支持的（M）更新”）：这个库被更新版本的 ragbase 升级过，旧程序不能降级使用它，也不会去改它。升级 ragbase 到不低于那个版本，或者用 `RAG_DB_PATH` 换一个库。
+- `ragbase doctor` 的“数据库”一组会给出同样的判断：`✗` 表示打不开 / 不可写 / 版本过新；`!` 表示表结构版本较旧，下次启动时会自动升级（升级前建议先备份）；库还不存在是正常的，首次运行 `ragbase serve` 时自动创建。
+
+## `database is locked`
+
+SQLite 同一时刻只允许一个写入者。ragbase 的写事务在进程内串行，并设置了 5 秒的等待（`busy_timeout`），正常使用不会碰到它；真的出现（接口返回 500，服务日志里有 `database is locked`），通常是：
+
+- **另一个进程在长时间占用数据库**：比如命令行的 `ragbase diagnose` / `eval` / `questions` 与服务同时在写，或者一个 `sqlite3` 命令行 / 数据库浏览器开着事务没提交。关掉它们再试。
+- **数据库放在不支持 WAL 的文件系统上**：NFS / SMB 等网络盘，以及 macOS 上 Docker Desktop 的绑定目录（`./ragbase-home`），文件锁和共享内存不可靠（见[部署：备份](deployment.md#备份数据库ragbasedb)里的说明）。把 `RAG_DB_PATH` 指向本机磁盘，或在 Docker 里改用命名卷。
+- 同时跑了多个 `ragbase serve` 进程（服务必须单进程）。
+
+## 会话不见了
+
+对话会话持久化在数据库里，**只会被手动删除**，不会因为重启、空闲或数量多而消失。看不到会话时依次排查：
+
+1. **是不是被删了**：Web 上删除会话，或 `DELETE /chat/sessions/{id}`，都是永久删除，无法恢复（除非从备份恢复 `ragbase.db`）。
+2. **连的是不是同一个数据库**：库的位置是 `RAG_DB_PATH`，没设置就是 `RAG_HOME/ragbase.db`，而 `RAG_HOME` 没设置时是**当前工作目录**。换了目录启动、改了 `RAG_HOME` 或 `RAG_DB_PATH`、Docker 换了挂载目录，都会连到一个新的空库。运行 `ragbase doctor` 看“数据库”那一行显示的路径，和以前的对一下；旧库文件还在的话，把 `RAG_DB_PATH` 指回去即可。
+3. **是不是命令行 `ragbase chat` 里的会话**：命令行对话只存在内存里，不写库，也不会出现在 Web 的会话列表里。
+4. **第一轮就失败了**：会话在第一轮**成功**后才会出现；第一轮报错（大模型超时等）不会留下会话。
+5. **升级前的内存会话**：以前版本把会话放在内存里，重启就丢，升级后找不回来。
+6. **库被重建过**：数据库损坏后删除重建（见上），里面的会话随之丢失。
+
+另外，大模型未配置或索引为空时，会话列表、历史和删除仍然可用（直接读库），只有发消息返回 503；如果这时列表是空的，多半是上面第 2 条。
+
+## 体检与题集
+
+- **开始体检返回 400**：题集是空的——在 Web 体检页添加题目，或 `ragbase questions import FILE`。题集在数据库里；**重启后题目没有重新出现**是正常的：`eval_questions.json` 只在数据库首次导入时读取一次，之后（包括你把题目删光之后）不会再导入。需要的话手动导入。
+- **改了 `RAG_HOME/eval_questions.json` 但没有生效**：同上，文件只是导入 / 导出的格式，已经导入过的数据库不会再读它；用 `ragbase questions import FILE --replace` 替换。
+- **开始体检返回 409**：已有体检、入库任务或删除文档在运行，等它结束再试；**返回 503**：索引为空或服务还没加载好流水线。
+- **导入题集返回 422 / 命令行报“题集校验失败”**：整个文件都没有导入，`errors`（命令行是逐条打印）列出了第几题（命令行显示的序号从 1 起，接口 `errors` 里的 `index` 从 0 起）、哪个字段有问题；改好后重新导入。
+- **体检期间对话变慢**：预期行为，体检复用服务里的模型，每题单独占一次检索锁。报告里“体检期间有对话请求”的耗时数字偏高，对比时会有提示。
+- **`ragbase eval` 说有题被跳过**：这些题的 `reference`（参考答案）为空，评测没法算指标；补上参考答案即可。体检不受影响。
 
 ## 上传与入库
 
@@ -123,6 +162,7 @@ uv run ragbase doctor            # Docker：docker compose run --rm ragbase doct
 
 ## 其他
 
+- **启动日志提示 `RAG_CHAT_MAX_SESSIONS` / `RAG_CHAT_SESSION_TTL` 已废弃**：这两项在会话持久化后不再生效（会话不自动淘汰），从 `.env` 里删掉即可，不影响启动。
 - **启动时一大段 pydantic `ValidationError`**：某个配置值非法（枚举写错、数字超范围）。traceback 末尾会指出是哪个字段，如 `mode  Input should be 'vector', 'bm25' or 'hybrid'`。
 - **端口被占用**：`ragbase serve --port 8001` 或设置 `RAG_PORT`。
 - **依赖环境异常**：重新执行 `uv sync`（CI 用 `uv sync --locked`）。

@@ -13,6 +13,8 @@
 - [POST /search](#post-search)、[POST /ask](#post-ask)
 - [对话：POST /chat、POST /chat/stream、会话接口](#对话)
 - [文档与入库：/documents、/ingest](#文档与入库)
+- [题集：/eval-questions](#题集)
+- [体检：/diagnose、报告](#体检)
 - [前端路由与静态资源](#前端路由与静态资源)
 
 ## 约定
@@ -28,11 +30,11 @@ curl -H "X-API-Key: $RAG_API_KEY" http://127.0.0.1:8000/documents
 
 缺少或错误的密钥返回 `401`，响应头带 `WWW-Authenticate: Bearer`，响应体是统一错误格式 `{"error": "unauthorized", "detail": "..."}`。鉴权在读取请求体**之前**完成：未鉴权的大文件上传和 `/chat/stream` 不会被处理。
 
-**无需密钥的路径**（只限 `GET` / `HEAD`）：
+**无需密钥的路径**（只限 `GET` / `HEAD`；注意 `/diagnose` 的 `GET` 是 Web 页面，同路径的 `POST /diagnose` 是体检接口，仍需密钥）：
 
 | 路径 | 说明 |
 | --- | --- |
-| `/`、`/library`、`/c/{id}`、`/assets/*` | Web 界面页面与静态资源（里面没有数据，数据都走受保护的接口） |
+| `/`、`/library`、`/diagnose`、`/c/{id}`、`/assets/*` | Web 界面页面与静态资源（里面没有数据，数据都走受保护的接口） |
 | `/docs`、`/redoc`、`/openapi.json`、`/docs/oauth2-redirect` | 交互文档与接口描述（不含密钥） |
 | `/health` | 没有有效密钥时只返回 `{"status": "ok" 或 "not_ready", "auth_required": true}`（存活探针 / 让前端知道要输入密钥）；带有效密钥返回完整内容；未启用鉴权时返回完整内容和 `"auth_required": false` |
 
@@ -52,15 +54,15 @@ curl -H "X-API-Key: $RAG_API_KEY" http://127.0.0.1:8000/documents
 
 | 状态码 | `error` | 何时出现 |
 | --- | --- | --- |
-| 400 | `bad_request` | 请求了未构建的 BM25 模式；`sources` 里有未知书名（`detail` 里列出可选项）；上传的文件名无效 / 格式不支持 / 文件为空 |
+| 400 | `bad_request` | 请求了未构建的 BM25 模式；`sources` 里有未知书名（`detail` 里列出可选项）；上传的文件名无效 / 格式不支持 / 文件为空；`POST /diagnose` 时题集为空 |
 | 401 | `unauthorized` | 启用了鉴权但缺少或带了错误的密钥 |
-| 404 | `not_found` | 没有这个文档 / 入库任务 / 会话；未知路径 |
+| 404 | `not_found` | 没有这个文档 / 入库任务 / 会话 / 题目 / 体检任务 / 体检报告；未知路径 |
 | 405 | `method_not_allowed` | 方法不对 |
-| 409 | `conflict` | 已有入库任务（或删除文档）在运行 |
+| 409 | `conflict` | 已有入库任务、删除文档或体检在运行（三者共用一个“忙”状态，同一时刻只能有一个） |
 | 413 | `payload_too_large` | 上传文件超过 `RAG_MAX_UPLOAD_MB` |
-| 422 | `validation_error` | 参数校验失败（如 `query` 为空或超长、`session_id` 含非法字符、缺少上传字段 `file`） |
+| 422 | `validation_error` | 参数校验失败（如 `query` 为空或超长、`session_id` 含非法字符、缺少上传字段 `file`）；题集接口的题目校验失败（响应多一个逐题错误列表 `errors`，见[题集](#题集)） |
 | 502 | `llm_error` | 大模型调用失败（鉴权、限流、5xx 等，已按 `RAG_LLM_MAX_RETRIES` 重试过） |
-| 503 | `service_unavailable` | 索引不存在或为空；大模型未配置（`/ask`、`/chat*`） |
+| 503 | `service_unavailable` | 索引不存在或为空；大模型未配置（`/ask`、`POST /chat*`） |
 | 504 | `llm_timeout` | 大模型响应超时（单次请求超过 `RAG_LLM_TIMEOUT` 且重试用完） |
 | 500 | `internal_error` | 未处理的异常（详情只写日志）；对话时检索本身出错（模型加载、索引损坏等）也是它 |
 
@@ -72,7 +74,9 @@ curl -H "X-API-Key: $RAG_API_KEY" http://127.0.0.1:8000/documents
 
 ### 索引为空时
 
-索引不存在或为空时服务**仍会启动**：`/health` 报告 `not_ready`，`/search`、`/ask`、`/chat*`、`/documents*`、`/ingest` 返回 503（“索引不存在或为空，请先运行 ragbase ingest --full”）。用命令行建好索引后**需要重启服务**（在线入库要求服务启动时索引已存在）。`GET /chat/sessions` 在 Agent 未就绪时返回空列表而不是 503。
+索引不存在或为空时服务**仍会启动**：`/health` 报告 `not_ready`，`/search`、`/ask`、`/chat*`、`/documents*`、`/ingest` 返回 503（“索引不存在或为空，请先运行 ragbase ingest --full”）。用命令行建好索引后**需要重启服务**（在线入库要求服务启动时索引已存在）。
+
+不依赖索引和大模型的接口照常可用：会话的列表、历史、删除（直接读写数据库，见[会话接口](#会话接口)），题集接口（`/eval-questions*`），体检报告接口（`GET`、`DELETE /diagnose/reports*`）。`POST /diagnose` 需要索引，索引为空返回 503（但不需要配置大模型）。
 
 ## GET /health
 
@@ -257,13 +261,15 @@ curl -N -X POST http://127.0.0.1:8000/chat/stream -H 'Content-Type: application/
 
 ### 会话接口
 
-会话只存在服务进程内存里，**重启即丢**；超过 `RAG_CHAT_MAX_SESSIONS` 或空闲超过 `RAG_CHAT_SESSION_TTL` 的会话被淘汰。
+会话保存在内置 SQLite 数据库里（`RAG_HOME/ragbase.db`，见[架构：数据库](architecture.md#数据库)）：**重启服务不丢**，每轮问答、引用编号和引用片段都完整保留（Web 上能翻看整段对话，只是发给大模型时截取最近 `RAG_CHAT_HISTORY_TURNS` 轮）。会话**不会自动清理**，没有数量上限，也不会因为空闲过期——只有手动删除（下表的 `DELETE`，或 Web 上的删除）才会清掉。`RAG_CHAT_MAX_SESSIONS` 和 `RAG_CHAT_SESSION_TTL` 已废弃，设置了也不再生效。
+
+会话列表、历史和删除**不依赖对话 Agent**：大模型未配置或索引为空（`/health` 的 `agent_ready` 为 `false`）时，它们照常从数据库读写，只有发消息（`POST /chat`、`POST /chat/stream`）返回 503。
 
 | 接口 | 响应 |
 | --- | --- |
-| `GET /chat/sessions` | `{"sessions": [{"session_id", "title", "updated_at", "message_count"}]}`，按最近使用倒序；`title` 是第一条用户消息（单行，最多 30 字，超出加 `…`）；`message_count` 只数用户消息与最终回答；Agent 未就绪时返回空列表（不是 503） |
-| `GET /chat/sessions/{id}` | `{"session_id", "messages": [...]}`，每条消息 `role`（`user` / `assistant` / `tool`）+ `content`；助手消息可带 `tool_calls`，并带 `citations`（该条正文里标注了 `[n]` 的片段）；工具消息的 `content` 只给前 80 字的摘要。会话不存在 / 已清空 / 已过期返回 404 |
-| `DELETE /chat/sessions/{id}` | `{"session_id", "deleted": true}`；会话不存在返回 404。等该会话正在处理的请求结束后执行 |
+| `GET /chat/sessions` | `{"sessions": [{"session_id", "title", "updated_at", "message_count"}]}`，按最近使用倒序，没有分页；`title` 是第一条用户消息（单行，最多 30 字，超出加 `…`），第一轮成功后固定、之后不变；`message_count` 累计用户消息与最终回答（不含工具调用步骤）；第一轮没有成功的会话不会出现在列表里 |
+| `GET /chat/sessions/{id}` | `{"session_id", "messages": [...]}`，每条消息 `role`（`user` / `assistant` / `tool`）+ `content`；助手消息可带 `tool_calls`，并带 `citations`（该条正文里标注了 `[n]` 的片段）；工具消息的 `content` 只给前 80 字的摘要。返回会话的**全部**消息，不受历史窗口影响。会话不存在（含已被删除）返回 404 |
+| `DELETE /chat/sessions/{id}` | `{"session_id", "deleted": true}`；会话不存在返回 404。删除该会话的消息历史、引用和会话记录；对话 Agent 在线时，等该会话正在处理的请求结束后执行 |
 
 ```bash
 curl -s http://127.0.0.1:8000/chat/sessions/demo
@@ -276,7 +282,8 @@ curl -s -X DELETE http://127.0.0.1:8000/chat/sessions/demo
 
 - 同一个会话里，**同一个片段永远是同一个编号**，后续轮次检索到的新片段接着往下编；编号不会因为历史被裁剪而变化。
 - 回答里用 `[n]` 标注；响应的 `citations` 只含**回答里实际标注了 `[n]` 的片段**，所以 `n` 可能不连续，也可能包含更早几轮登记的片段（模型沿用历史里出现过的编号作答时同样能解析）。回答里出现了从未登记过的编号会被丢弃，不会出现在 `citations` 里。
-- 一轮失败 / 中断时，该轮新登记的片段会被撤销；会话被删除或淘汰时编号随之丢弃。
+- 编号随会话保存在数据库里：**重启服务后接着追问，编号继续接着之前的走，同一片段的编号不变**。
+- 一轮失败 / 中断时，该轮新登记的片段会被撤销（服务进程在一轮中途被强杀时，下一轮开始时会把这半截轮次整轮清掉，引用同样撤销）；会话被删除时编号随之丢弃。
 - 因此 `GET /chat/sessions/{id}` 里的助手消息可以带着它当时的引用，Web 界面重新打开历史会话也能渲染引用角标和“依据”面板。
 
 ## 文档与入库
@@ -309,6 +316,82 @@ curl -s -X DELETE 'http://127.0.0.1:8000/documents/新教材.pdf'
 
 **并发**：入库每 64 个片段为一批（向量化 + 写入）单独持有检索锁，批间释放，所以入库期间 `/search` 可以插进来（会比平时慢一点）。同名修改的文件先写入新片段、再删不再存在的旧片段，重建期间该文件仍可检索。任务结束后重建 BM25 快照并原子替换。
 
+## 题集
+
+评测题集（体检和 `ragbase eval` 共用）存在内置数据库里，用这组接口管理；题集本身的概念、字段与导入规则见[评测题格式](evaluation.md#评测题格式)。接口不依赖对话 Agent，大模型未配置也能用。
+
+| 接口 | 说明 |
+| --- | --- |
+| `GET /eval-questions` | `{"items": [题目…]}`，按 `id` 升序 |
+| `POST /eval-questions` | 新增一道题，`id` 自动分配；`201` 返回该题 |
+| `PUT /eval-questions/{id}` | 只改请求里出现的字段，传 `null` 清空可选字段；返回该题。没有这道题返回 404 |
+| `DELETE /eval-questions/{id}` | `{"deleted": true}`；没有这道题返回 404 |
+| `POST /eval-questions/import` | 批量导入，见下 |
+| `GET /eval-questions/export` | 整个题集，JSON 数组，响应头 `Content-Disposition: attachment; filename="eval_questions.json"`；每题同时有 `reference` 和 `answer_keyword`（取值相同），旧版 `ragbase eval` 也能读 |
+
+**题目**：`id`、`question`、`reference`（参考答案，可为 `null`）、`difficulty`、`type`、`source_topic`（均可为 `null`）、`created_at`、`updated_at`（服务器本地时间，ISO 8601）。新增 / 修改时请求体可带 `question`（新增必填，非空字符串）、`reference`、`difficulty`、`type`、`source_topic`，也接受旧字段名 `answer_keyword`（等同 `reference`，两个都给时取 `reference`）。
+
+**导入**：请求体 `{"items": [...], "mode": "append" | "replace"}`（`mode` 默认 `append`；`items` 是题目数组，与导出文件同格式）。成功返回 `{"imported": 30, "reassigned": [[旧 id, 新 id], …]}`：`append` 时 `id` 与已有题冲突的题会改用新 `id`，记在 `reassigned` 里；`replace` 先清空题集再按文件里的 `id` 写入。校验和写入在同一个事务里，**任何一题不合法都整体不写入**，返回 422。
+
+```bash
+curl -s http://127.0.0.1:8000/eval-questions
+curl -s -X POST http://127.0.0.1:8000/eval-questions -H 'Content-Type: application/json' \
+  -d '{"question": "什么是关键路径？", "reference": "最长的活动路径，决定项目最短工期"}'
+curl -s -X POST http://127.0.0.1:8000/eval-questions/import -H 'Content-Type: application/json' \
+  -d '{"items": [{"id": 1, "question": "什么是软件架构风格？", "answer_keyword": "惯用模式"}], "mode": "append"}'
+curl -s -o eval_questions.json http://127.0.0.1:8000/eval-questions/export
+```
+
+**校验失败（422）**：在统一错误格式 `{error, detail}` 之外多一个 `errors` 数组，每项 `{index, field, message}`：`index` 是出错题目在导入数组里的下标（**从 0 开始**）；整体错误（如输入不是数组）以及新增 / 修改时为 `null`；`field` 是出错字段，整体错误时为 `null`；`message` 是中文说明。例如导入 `{"items": [{"question": "a"}, {"id": "x"}], "mode": "append"}`：
+
+```json
+{
+  "error": "validation_error",
+  "detail": "题集校验未通过（共 2 处）：第 2 题（question）缺少必填字段 question（非空字符串）；第 2 题（id）必须是正整数（实际是 'x'）",
+  "errors": [
+    {"index": 1, "field": "question", "message": "缺少必填字段 question（非空字符串）"},
+    {"index": 1, "field": "id", "message": "必须是正整数（实际是 'x'）"}
+  ]
+}
+```
+
+`detail` 最多列出前 3 处，完整列表看 `errors`。请求体本身不是合法 JSON、`mode` 不是 `append` / `replace`、路径里的 `id` 不是整数等，则是普通的 422（没有 `errors`）。
+
+## 体检
+
+体检（`ragbase diagnose` 的 Web 版）在服务进程的后台线程里运行，**不调用大模型**，复用服务已加载的模型；每份报告存进数据库、保留到手动删除。报告各项的含义见 [diagnostics.md](diagnostics.md)。
+
+| 接口 | 说明 |
+| --- | --- |
+| `POST /diagnose` | 开始一次体检，返回 `202` + 任务信息。请求体可选：`mode`（`vector` / `bm25` / `hybrid`，默认服务配置）、`limit`（整数 ≥ 1，只用题集前 N 道）。无请求体也可以 |
+| `GET /diagnose/jobs/{job_id}` | 任务状态；不存在返回 404（内存里最多保留最近 100 个任务，服务重启后任务记录消失，但已生成的报告还在） |
+| `GET /diagnose/reports` | `{"items": [报告摘要…]}`，按 `id` 倒序（新的在前）；不含逐题记录 |
+| `GET /diagnose/reports/{id}` | 完整报告；没有这份报告返回 404 |
+| `DELETE /diagnose/reports/{id}` | `{"deleted": true}`；没有这份报告返回 404 |
+
+`POST /diagnose` 的错误：
+
+- `400`：题集为空（先添加或导入题目）；请求了服务未构建的 BM25 模式；
+- `409`：已有体检、入库任务或删除文档在运行（体检与它们互斥；反过来，体检运行时发起 `POST /ingest`、`POST /documents`、`DELETE /documents/{name}` 也返回 409）；
+- `503`：索引不存在或为空。
+
+题目在返回 `202` 之前就取好快照（先按 `limit` 截取、再对同文本重复的问题去重），运行期间编辑或删除题目不影响这次体检。体检期间对话请求能插进来，但会变慢；报告里记录了期间服务处理的对话请求数。
+
+**任务状态字段**：`job_id`、`status`（`pending` / `running` / `succeeded` / `failed`）、`total`（本次体检的题数，去重、按 `limit` 截取之后）、`done`（已测完的题数）、`report_id`（成功后的报告 id，否则为 `null`）、`error`、`started_at`、`finished_at`（UTC，ISO 8601）。
+
+**报告摘要**（列表项）：`id`、`created_at`（服务器本地时间，ISO 8601）、`origin`（`cli` / `web`）、`mode`、`question_count`、`candidates_recall`（召回 TopK 的 `point_recall` 均值）、`reranked_recall`（精排后）、`refusal_rate`、`total_ms_mean`（检索总耗时均值，毫秒）、`rerank_share_pct`（精排占比），后面几个数字在报告缺少对应数据时为 `null`；另有 `concurrent_chat_requests`（体检期间的对话请求数，大于 0 时耗时可能偏高）。
+
+**完整报告**：`id`、`origin`、`generated_at`、`params`、`warmup_question`、`questions`（逐题记录）、`summary`、`recommendations`、`question_ids`、`question_digest`（题集内容摘要，两份报告不同说明题集不同）、`concurrent_chat_requests`。结构说明见[体检：导出与保留](diagnostics.md#导出与保留)；字段细节以 `/docs` 为准。
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/diagnose -H 'Content-Type: application/json' -d '{"mode": "hybrid", "limit": 10}'
+# 202 {"job_id": "…", "status": "running", "total": 10, "done": 0, "report_id": null, …}
+curl -s http://127.0.0.1:8000/diagnose/jobs/<job_id>        # 轮询：done 递增，成功后 report_id 有值
+curl -s http://127.0.0.1:8000/diagnose/reports              # 报告列表（命令行跑出来的报告也在里面）
+curl -s http://127.0.0.1:8000/diagnose/reports/3
+curl -s -X DELETE http://127.0.0.1:8000/diagnose/reports/3
+```
+
 ### 按书过滤（`sources`）
 
 `/search`、`/ask`、`/chat*` 的 `sources` 是书名（文件名，取自 `GET /documents` 的 `name`）列表，只在这些书里检索；缺省或空列表表示全部；有未知书名返回 400 并列出可选项（对话里则把可选项告诉模型让它自己纠正）。命令行：`ragbase ask --source 书名.pdf`（可重复）。
@@ -322,4 +405,4 @@ curl -s -X POST http://127.0.0.1:8000/search -H 'Content-Type: application/json'
 
 ## 前端路由与静态资源
 
-`web/dist`（或随包的前端副本）存在时，API 服务在同一端口提供：`/assets/*`（带内容哈希，长缓存）和前端路由 `/`、`/library`、`/c/{session_id}`（返回 `index.html`）。这些路径不会遮住 `GET /documents`、`/chat/sessions`、`/health` 等 JSON 接口。目录是否存在在请求时检查，服务运行中重新构建前端立即生效；未构建时 `GET /` 返回提示“前端未构建”。
+`web/dist`（或随包的前端副本）存在时，API 服务在同一端口提供：`/assets/*`（带内容哈希，长缓存）和前端路由 `/`、`/library`、`/diagnose`、`/c/{session_id}`（返回 `index.html`）。这些路径不会遮住 `GET /documents`、`/chat/sessions`、`/health` 等 JSON 接口；`/diagnose` 只有 `GET` 是页面，`POST /diagnose` 仍是体检接口。目录是否存在在请求时检查，服务运行中重新构建前端立即生效；未构建时 `GET /` 返回提示“前端未构建”。

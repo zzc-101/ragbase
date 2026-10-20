@@ -111,7 +111,7 @@ uv run python scripts/calibrate_rerank_threshold.py [--mode hybrid]   # 只做�
 
 输出包括：每题得分；两组的 `min / median / max`；候选阈值（0.05 … 0.95）下的**误拒(a)**（可回答题被拒的数量）与**漏拦(b)**（库外题被放行的数量）；最后给出推荐值 = **可回答题最低分 × 0.75**（给没测到的题留余量），以及该阈值下拦下多少库外题、哪些库外题与可回答题分数重叠。把推荐值写进 `RAG_MIN_SCORE`，必要时同时调整 `RAG_CONTEXT_MIN_SCORE`。云端 reranker 每个问题会调一次 rerank 接口（共约 `题数 + 15 + 21` 次，默认评测集 30 题时约 66 次，会产生少量费用）。
 
-> **重要**：脚本里的评测题和库外问题是针对**作者自己的语料**（《系统架构设计师》《信息系统项目管理师》教材）写的。用在你自己的资料上时，要把 `eval_questions.json`（放在 `RAG_HOME` 下）换成你的题目，并改掉脚本里的 `EXTRA_ANSWERABLE` / `OUT_OF_SCOPE`，否则得到的数字没有意义。`eval_questions.json` 的格式见 [evaluation.md](evaluation.md#评测题格式)。
+> **重要**：脚本里的评测题和库外问题是针对**作者自己的语料**（《系统架构设计师》《信息系统项目管理师》教材）写的。用在你自己的资料上时，要把 `eval_questions.json`（放在 `RAG_HOME` 下）换成你的题目，并改掉脚本里的 `EXTRA_ANSWERABLE` / `OUT_OF_SCOPE`，否则得到的数字没有意义。`eval_questions.json` 的格式见 [evaluation.md](evaluation.md#评测题格式)。注意：这个脚本**直接读 `RAG_HOME/eval_questions.json` 这个文件**，不读数据库里的题集；题集已经搬进数据库的话，用 `ragbase questions export eval_questions.json` 导出到 `RAG_HOME` 下再跑。
 
 ### 默认阈值是怎么来的（本地 Qwen3-Reranker-0.6B）
 

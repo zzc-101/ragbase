@@ -38,7 +38,7 @@ docker compose run --rm ragbase doctor            # 随时体检
 
 | 位置 | 容器内 | 说明 |
 | --- | --- | --- |
-| `./ragbase-home`（绑定目录） | `/data`（= `RAG_HOME`） | 项目主目录：文档、索引、缓存、入库记录都在这里 |
+| `./ragbase-home`（绑定目录） | `/data`（= `RAG_HOME`） | 项目主目录：文档、索引、缓存、入库记录、数据库（会话 / 题集 / 体检报告）都在这里 |
 | `ragbase-models`（命名卷） | `/models`（= `HF_HOME`） | Hugging Face 模型缓存 |
 | `qdrant-storage`（命名卷，仅 qdrant profile） | `/qdrant/storage`（在 qdrant 容器里） | Qdrant 服务端的数据 |
 
@@ -49,6 +49,7 @@ docker compose run --rm ragbase doctor            # 随时体检
   data/                   你的文档（宿主机 ragbase-home/data/）
   chroma_db/              向量索引（chroma）
   qdrant_db/              向量索引（嵌入式 qdrant 时）
+  ragbase.db              内置 SQLite 数据库：对话会话、评测题集、体检报告（运行时旁边还有 -wal / -shm）
   .ingest_meta.json       增量入库的文件指纹
   .index_info.json        索引的 embedding 签名
   .bm25_cache/            BM25 分词缓存
@@ -200,7 +201,7 @@ server {
 - [ ] **`.env` 保护**：含密钥，已被 `.gitignore` 与 `.dockerignore` 排除（不会进仓库和镜像）；`ragbase init` 生成时权限为 `0600`。
 - [ ] **上传上限**：`RAG_MAX_UPLOAD_MB` 与代理的 `client_max_body_size` 一致。
 - [ ] **没有限流、没有按人区分的审计**：需要的话在代理层做限流。
-- [ ] **轮换密钥**：修改环境变量 / `.env` 里的 `RAG_API_KEY` 后重启服务（会话在内存里，重启会丢）；旧密钥立即失效，浏览器端下次请求收到 401 后会提示重新输入。
+- [ ] **轮换密钥**：修改环境变量 / `.env` 里的 `RAG_API_KEY` 后重启服务（会话保存在数据库里，重启不丢）；旧密钥立即失效，浏览器端下次请求收到 401 后会提示重新输入。
 - [ ] Docker：默认只绑定 `127.0.0.1`；容器以非 root 用户运行。
 
 ## 备份
@@ -209,18 +210,37 @@ server {
 | --- | --- | --- |
 | 原始文档 | `data/` | **是**——它是一切的来源，索引可以从它重建 |
 | 配置与密钥 | `.env` | **是**（含密钥，注意保管） |
-| 领域词典 / 评测题 | `bm25_userdict.txt`、`eval_questions.json` | 建议 |
+| 数据库 | `ragbase.db`（`RAG_DB_PATH` 可改位置） | **是**——对话会话（含引用）、评测题集、体检报告历史都只存在这里，**无法从别处重建**，见下 |
+| 领域词典 | `bm25_userdict.txt` | 建议 |
 | 向量索引 | `chroma_db/`（或 `qdrant_db/` / Qdrant 服务端的卷） | 可选：不备份就用 `ragbase ingest --full` 重建（要重新向量化，耗时 / 云端会产生费用） |
 | 入库记录与签名 | `.ingest_meta.json`、`.index_info.json` | 与向量索引**一起**备份、一起恢复 |
 | BM25 分词缓存 | `.bm25_cache/` | 否，启动时会按需重建 |
 | 模型缓存 | `HF_HOME`（Docker：`ragbase-models` 卷） | 否，可重新下载 |
-| 对话会话 | 无 | 会话只在服务进程内存里，不持久化 |
+
+仓库根目录的 `eval_questions.json` 只在首次启动时被导入一次，之后题集以数据库为准；想保留一份文本形式的题集，用 `ragbase questions export FILE` 导出。
+
+### 备份数据库（`ragbase.db`）
+
+数据库开启了 WAL 模式：写入先进入 `ragbase.db-wal`，之后才合并回 `ragbase.db`，`ragbase.db-shm` 是配套的共享内存索引文件。因此服务**运行中**只拷贝 `ragbase.db` 这一个文件，可能丢掉还留在 `-wal` 里的最近写入，甚至拷到不一致的状态。二选一：
+
+1. **停服务后拷贝**（最简单）：`ragbase serve` 正常停止后，`ragbase.db` 已经是完整的，拷走即可。如果旁边还留着 `ragbase.db-wal`（进程被强杀、断电之后会这样），要把 `ragbase.db`、`ragbase.db-wal`、`ragbase.db-shm` **三个文件一起拷**，不要只拷其中一个。
+2. **在线备份**：用 SQLite 自带的备份命令，服务不用停，得到的是一致的快照文件（不需要再拷 `-wal` / `-shm`）：
+
+   ```bash
+   sqlite3 ragbase.db ".backup ragbase-backup.db"
+   # 没有 sqlite3 命令行时，用 Python 标准库等价（在 ragbase 的环境里运行，路径自行替换）：
+   uv run python -c "import sqlite3; s=sqlite3.connect('ragbase.db'); d=sqlite3.connect('ragbase-backup.db'); s.backup(d); d.close(); s.close()"
+   ```
+
+恢复：停服务，把备份文件放回 `RAG_DB_PATH`（或 `RAG_HOME/ragbase.db`）并**删掉旧的 `-wal` / `-shm` 文件**（否则旧的 `-wal` 可能被套用到新文件上），再启动。
+
+**Docker Desktop（macOS）绑定目录上的已知风险**：SQLite 的 WAL 模式依赖同一台主机上的共享内存和文件锁，官方文档明确说它不适用于网络文件系统。Docker Desktop 在 macOS 上把宿主机目录经由虚拟化的文件共享层挂进容器，默认的绑定目录 `./ragbase-home` 就是这种情况，可能出现 `database is locked`，极端情况下数据库损坏的风险也更高。其他环境（命名卷、Linux 的绑定目录、本机直接运行）按理没有这个问题，但同样没有逐一实测。以上是按 SQLite 的已知限制做的推断，**本项目的 Docker 部署本身尚未验证，没有在 macOS 的 Docker Desktop 上实测过**；在 macOS 上用 Docker 时，建议把 `docker-compose.yml` 里的 `./ragbase-home` 改成命名卷 `ragbase-home:/data`（并在底部 `volumes:` 里声明；做法见上文“Linux 上……命名卷”一条），并勤做备份。
 
 备份向量索引前最好先停服务，以免拷到写到一半的 SQLite 文件（这是通用的稳妥做法，未针对 Chroma / Qdrant 做专门验证）。恢复后用 `ragbase doctor` 检查。
 
 ## 升级
 
-项目目前**未发布**（`0.1.0`），没有版本化的数据迁移机制；升级前先看 [CHANGELOG.md](../CHANGELOG.md)。
+项目目前**未发布**（`0.1.0`），升级前先看 [CHANGELOG.md](../CHANGELOG.md)。
 
 - **源码部署**：`git pull` → `uv sync --locked` → 需要界面更新时 `scripts/build_web.sh` → 重启服务。
 - **Docker**：`git pull` → `docker compose up -d --build`。数据在 `ragbase-home` 与 `ragbase-models`，不随镜像重建丢失。
@@ -228,4 +248,6 @@ server {
   - embedding 配置没变 → 索引仍可用（签名比对通过）。换了 embedding 提供方 / 模型 / 维度 → 必须 `ragbase ingest --full`，见 [models.md](models.md#换-embedding索引签名规则)。
   - 解析 / 清洗 / 切分规则的版本号（代码里的 `INGEST_PIPELINE_VERSION`）变化时，下次增量入库会把所有文件视为已变化并重新索引——旧索引在此之前照常可用，只是缺少新规则带来的信息（例如版本 3 起 PDF 片段带章节标题）。
   - BM25 分词规则版本变化时，分词缓存自动失效并在启动时重建，无需操作。
+- **数据库**（`ragbase.db`）：表结构有版本号，升级后第一次启动 `ragbase serve`（或运行用到数据库的命令）时**自动迁移**到最新，不需要手动操作；`ragbase doctor` 会提示“需要升级”。迁移不可逆，**升级前先备份 `ragbase.db`**。不支持降级：用旧版本程序打开被新版本升级过的数据库，会因为版本过新而拒绝启动并提示升级程序。
+- 从还把会话放在内存里的旧版本升级：之前的内存会话本来就随重启丢失，没有可迁移的内容；`RAG_CHAT_MAX_SESSIONS` 和 `RAG_CHAT_SESSION_TTL` 已废弃，`.env` 里还留着时启动日志会警告，删掉即可。
 - 换 reranker 或大模型：不需要重建索引，但换 reranker 要[重新标定阈值](models.md#reranker-换模型后重新标定拒答阈值)。
