@@ -1,7 +1,7 @@
 """校准拒答阈值 RERANK_MIN_SCORE（只跑召回 + 精排，不调用 LLM / API）。
 
 对比两组问题的最相关片段得分（top1 rerank_score，即 P(相关)）：
-  (a) 库内可回答：eval_questions.json 的 30 道题 + 下面 EXTRA_ANSWERABLE 的口语化问题，
+  (a) 库内可回答：数据库里的评测题集（与 ragbase diagnose / eval 同一份）+ 下面 EXTRA_ANSWERABLE 的口语化问题，
       阈值应让它们全部通过；
   (b) 本脚本里的库外问题：库里没有答案，阈值应尽量把它们拦下。
 
@@ -12,10 +12,11 @@ provider=none 没有分数，无需标定。云端提供方每个问题会调用
 运行（在项目主目录，即 RAG_HOME，默认当前目录下）：uv run python scripts/calibrate_rerank_threshold.py [--mode hybrid]
 """
 import argparse
-import json
 import statistics
 
-from ragbase.config import eval_questions_file, get_settings, load_env
+from ragbase.config import get_settings, load_env
+from ragbase.db import DatabaseError, open_database
+from ragbase.evaluation.questions import QuestionStore
 from ragbase.index_info import IndexMismatchError
 from ragbase.models.factory import ProviderConfigError
 from ragbase.retrieval.pipeline import build_pipeline, retrieve_and_rerank
@@ -63,7 +64,17 @@ OUT_OF_SCOPE = [
 
 
 def load_answerable() -> list[str]:
-    questions = json.loads(eval_questions_file().read_text(encoding="utf-8"))
+    """数据库里的评测题（首次打开时会自动导入 RAG_HOME/eval_questions.json）+ 口语化补充题。"""
+    try:
+        db = open_database()
+    except DatabaseError as exc:
+        raise SystemExit(f"错误：{exc}")
+    try:
+        questions = QuestionStore(db).list()
+    finally:
+        db.close()
+    if not questions:
+        print("提示：题集为空（可在 Web 体检页添加，或 ragbase questions import），只用脚本里的补充题。")
     return [item["question"] for item in questions] + EXTRA_ANSWERABLE
 
 
