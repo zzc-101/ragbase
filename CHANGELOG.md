@@ -39,13 +39,15 @@
 
 ### 开箱即用
 
-- 命令行 `ragbase`：`init`、`models download`、`doctor`、`serve`、`ingest [--full]`、`ask`、`chat`、`eval`、`migrate-store`。
+- 命令行 `ragbase`：`init`、`models download`、`doctor`、`serve`、`ingest [--full]`、`ask`、`chat`、`eval`、`diagnose`、`migrate-store`。
 - `ragbase init`（生成 `data/`、`.env` 模板、默认词典，可 `--api-key`）、`ragbase doctor`（环境自检，`--check-llm` / `--check-models`）、`ragbase models download`（支持 `HF_ENDPOINT` 镜像）、`ragbase serve --download-models`。
 - 一键脚本 `scripts/start.sh`、`scripts/build_web.sh`；`Dockerfile`（CPU）与 `docker-compose.yml`（可选 Qdrant profile）——**Docker 文件尚未在真实环境验证镜像构建和运行**。
 - 项目主目录 `RAG_HOME`（默认当前目录）；src 布局的 `ragbase` 包，`pyproject.toml` + `uv.lock` 管理依赖，Linux 用 PyTorch CPU 源。
 
 ### 评测
 
+- `ragbase diagnose`：参数与速度体检——复用评测题集，预热后对每题分阶段计时（向量化 / 向量库 / BM25 / 融合 / 精排）、算三组词面检索指标，按固定规则给出调参建议；只测量和建议，不改配置、不调用大模型；完整数据写入 `diagnose_report.json`。见 [docs/diagnostics.md](docs/diagnostics.md)。
+- 词面检索指标挪到 `evaluation/lexical.py`（不依赖 ragas），`evaluation.metrics` 照旧可导入。
 - `ragbase eval`：Ragas 五项指标、无需大模型的词面代理指标（要点召回、上下文精确率、MRR，分召回 Top20 / 精排 Top5 / 实际交给大模型的片段三组）、中文裁判；`--retrieval-only` 不调用任何大模型；结果按召回模式分文件。
 - `scripts/calibrate_rerank_threshold.py`：拒答阈值校准脚本（不调用大模型）。
 

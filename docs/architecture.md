@@ -219,7 +219,7 @@ flowchart LR
 ```text
 pyproject.toml / uv.lock       依赖与锁文件（uv 管理）；命令行入口 ragbase = ragbase.cli:main
 src/ragbase/
-  cli.py  __main__.py          命令行：init / models / doctor / serve / ingest / ask / chat / eval / migrate-store（python -m ragbase 等价）
+  cli.py  __main__.py          命令行：init / models / doctor / serve / ingest / ask / chat / eval / diagnose / migrate-store（python -m ragbase 等价）
   scaffold.py  doctor.py       ragbase init（生成 .env 等）、ragbase doctor（环境自检）
   index_info.py                索引的 embedding 签名（.index_info.json）与兼容性检查
   config.py  logging_setup.py  集中配置（Settings：RAG_* 环境变量 / .env）；日志（带请求 ID）
@@ -233,7 +233,8 @@ src/ragbase/
   retrieval/                   hybrid（向量 + BM25 + RRF）、pipeline（召回 → 精排 → 拒答 → 生成）、labels（来源标签）
   agent/                       tools（检索工具与引用登记表）、service（对话 Agent 与会话）
   api/                         app（FastAPI 应用，ragbase.api.app:app）、schemas、auth（API Key 鉴权）
-  evaluation/                  runner（评测流程）、metrics（Ragas 与词面指标）
+  evaluation/                  runner（评测流程）、metrics（Ragas 与聚合）、lexical（词面检索指标，不依赖 ragas）
+  diagnostics.py               ragbase diagnose：分阶段计时、指标汇总、建议规则、报告排版
 scripts/                       start.sh（一键启动）、build_web.sh（构建前端并复制进包）、calibrate_rerank_threshold.py（拒答阈值校准）、gen_config_docs.py（生成配置文档）
 tests/                         断言脚本式单元测试（tests/run_all.py 一次运行全部）
 web/                           前端工程（React + Vite + TypeScript + Tailwind + shadcn/ui）

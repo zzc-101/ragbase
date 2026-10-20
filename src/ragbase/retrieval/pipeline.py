@@ -178,6 +178,7 @@ def retrieve_and_rerank(
     rerank_k: int = 5,
     mode: str | None = None,
     sources: list[str] | None = None,
+    timings: dict | None = None,
 ):
     """召回并精排（不调用 LLM），返回 (精排片段, 原始候选片段)。
 
@@ -185,23 +186,30 @@ def retrieve_and_rerank(
     原始候选保持不变。mode 为 None 时用检索器构造时的默认模式；
     sources（书名 = 文件 basename 列表）不为空时只在这些书里检索。
     全程持有 pipeline.lock：本地模型不支持并发推理，多线程（API）调用时在此串行。
+    timings 不为 None 时把各阶段耗时（秒）写进该 dict（ragbase diagnose 用）：召回阶段的键见 HybridRetriever.invoke，
+    精排写 rerank（空召回不精排则没有该键）；为 None 时不计时，也不会把该参数传给 retriever.invoke。
     """
     options = {}
     if mode is not None:
         options["mode"] = mode
     if sources:
         options["sources"] = sources
+    if timings is not None:
+        options["timings"] = timings  # 只在需要时才传：自定义 retriever 的 invoke 可以不接受该参数
     with pipeline.lock:
         candidates = pipeline.retriever.invoke(question, **options)
         if not candidates:
             return [], []  # 空召回不调用 reranker
         # 精排输入只用正文，不拼章节路径：拒答阈值（RERANK_MIN_SCORE）是按纯正文的得分分布校准的，
         # 改了输入会让分数分布漂移、阈值失效。章节路径只参与向量化和 BM25 分词。
+        rerank_start = time.perf_counter() if timings is not None else 0.0
         ranked = pipeline.reranker.rerank_with_scores(
             question,
             [doc.page_content for doc in candidates],
             top_k=rerank_k,
         )
+        if timings is not None:
+            timings["rerank"] = time.perf_counter() - rerank_start
     docs = [
         candidates[index].model_copy(update={
             "metadata": {**candidates[index].metadata, "rerank_score": score},

@@ -326,9 +326,31 @@ class HybridRetriever:
             values.update(dict.fromkeys(snapshot.sources[name]))
         return list(values)
 
-    def _vector_route(self, question: str, k: int, allowed: list[str] | None) -> list[tuple[str, str, dict]]:
-        hits = self.store.query(self.embeddings.embed_query(question), k, sources=allowed)
+    def _vector_route(
+        self, question: str, k: int, allowed: list[str] | None, timings: dict | None = None
+    ) -> list[tuple[str, str, dict]]:
+        if timings is None:
+            hits = self.store.query(self.embeddings.embed_query(question), k, sources=allowed)
+        else:  # 分阶段计时（ragbase diagnose）：向量化与向量库查询分开记
+            start = time.perf_counter()
+            query_vector = self.embeddings.embed_query(question)
+            middle = time.perf_counter()
+            hits = self.store.query(query_vector, k, sources=allowed)
+            timings["embed"] = middle - start
+            timings["vector_search"] = time.perf_counter() - middle
         return [(hit.id, hit.text, hit.metadata or {}) for hit in hits]
+
+    @classmethod
+    def _bm25_route_timed(
+        cls, snapshot: _Snapshot, question: str, k: int, allowed: list[str] | None, timings: dict | None
+    ) -> list[tuple[str, str, dict]]:
+        """_bm25_route，timings 不为 None 时把整路耗时（含分词）记到 timings["bm25"]。"""
+        if timings is None:
+            return cls._bm25_route(snapshot, question, k, allowed)
+        start = time.perf_counter()
+        hits = cls._bm25_route(snapshot, question, k, allowed)
+        timings["bm25"] = time.perf_counter() - start
+        return hits
 
     @staticmethod
     def _bm25_route(
@@ -360,7 +382,17 @@ class HybridRetriever:
             hits.append((doc_id, text, metadata))
         return hits
 
-    def invoke(self, question: str, mode: str | None = None, sources: list[str] | None = None) -> list[Document]:
+    def invoke(
+        self,
+        question: str,
+        mode: str | None = None,
+        sources: list[str] | None = None,
+        timings: dict | None = None,
+    ) -> list[Document]:
+        """召回并融合。timings 不为 None 时，各阶段耗时（秒）写进该 dict，没跑的阶段不写：
+        embed（向量化查询）、vector_search（向量库查询）、bm25（BM25 整路，含分词）、fuse（RRF 融合 + 组装 Document）。
+        timings 为 None（默认）时不计时，行为与之前完全一致。
+        """
         mode = mode or self.mode
         if mode not in MODES:
             raise ValueError(f"mode 必须是 {MODES} 之一，收到 {mode!r}")
@@ -373,13 +405,14 @@ class HybridRetriever:
             allowed = self._resolve(snapshot, sources)
         routes: list[tuple[str, list[tuple[str, str, dict]]]] = []
         if mode == "vector":
-            routes.append(("vec", self._vector_route(question, self.final_k, allowed)))
+            routes.append(("vec", self._vector_route(question, self.final_k, allowed, timings)))
         elif mode == "bm25":
-            routes.append(("bm25", self._bm25_route(snapshot, question, self.final_k, allowed)))
+            routes.append(("bm25", self._bm25_route_timed(snapshot, question, self.final_k, allowed, timings)))
         else:
-            routes.append(("vec", self._vector_route(question, self.per_route_k, allowed)))
-            routes.append(("bm25", self._bm25_route(snapshot, question, self.per_route_k, allowed)))
+            routes.append(("vec", self._vector_route(question, self.per_route_k, allowed, timings)))
+            routes.append(("bm25", self._bm25_route_timed(snapshot, question, self.per_route_k, allowed, timings)))
 
+        fuse_start = time.perf_counter() if timings is not None else 0.0
         ranks: dict[str, dict[str, int]] = {"vec": {}, "bm25": {}}
         content: dict[str, tuple[str, dict]] = {}
         for name, hits in routes:
@@ -401,4 +434,6 @@ class HybridRetriever:
                     "bm25_rank": ranks["bm25"].get(doc_id),
                 },
             ))
+        if timings is not None:
+            timings["fuse"] = time.perf_counter() - fuse_start
         return documents

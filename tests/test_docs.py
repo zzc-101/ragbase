@@ -19,7 +19,7 @@ CONFIG_DOC = DOCS / "configuration.md"
 MARKDOWN_FILES = [ROOT / "README.md", ROOT / "CHANGELOG.md", *sorted(DOCS.glob("*.md"))]
 EXPECTED_DOCS = {
     "configuration.md", "models.md", "api.md", "deployment.md", "architecture.md",
-    "evaluation.md", "development.md", "troubleshooting.md",
+    "evaluation.md", "diagnostics.md", "development.md", "troubleshooting.md",
 }
 
 
