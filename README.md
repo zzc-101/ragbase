@@ -103,7 +103,9 @@ uv run ragbase ask                       # 命令行问答（--mode / --min-scor
 uv run ragbase chat                      # 命令行多轮对话（/new 新会话，exit 退出）
 uv run ragbase ingest                    # 增量入库；ingest --full 全量重建
 uv run ragbase eval --retrieval-only     # 评测（不调用大模型）
-uv run ragbase --help                    # 全部子命令：init models doctor serve ingest ask chat eval migrate-store
+uv run ragbase diagnose                  # 体检：当前参数、各阶段召回质量与耗时、调参建议（不调用大模型）
+uv run ragbase questions import FILE     # 评测题集导入（--replace 替换全部）；questions export FILE 导出
+uv run ragbase --help                    # 全部子命令：init models doctor serve ingest ask chat eval diagnose questions migrate-store
 ```
 
 ```bash
@@ -123,6 +125,7 @@ curl -s -X POST http://127.0.0.1:8000/ask -H 'Content-Type: application/json' \
 | [docs/deployment.md](docs/deployment.md) | Docker Compose、start.sh、反向代理 / HTTPS、安全清单、备份、升级 |
 | [docs/architecture.md](docs/architecture.md) | 解析 / 切分 / 增量入库 / 混合检索 / 拒答 / Agent / 向量库 / 模块地图 |
 | [docs/evaluation.md](docs/evaluation.md) | 评测指标、运行方式、题集格式、校准工作流 |
+| [docs/diagnostics.md](docs/diagnostics.md) | `ragbase diagnose` 体检：报告各项含义、建议规则与阈值、注意事项 |
 | [docs/development.md](docs/development.md) | 开发环境、前端、测试、CI、约定、如何扩展 |
 | [docs/troubleshooting.md](docs/troubleshooting.md) | 常见问题与排错 |
 | [CHANGELOG.md](CHANGELOG.md) | 更新日志 |

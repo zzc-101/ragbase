@@ -1,4 +1,4 @@
-"""ragbase 命令行入口：init / models / doctor / serve / ingest / ask / chat / eval / migrate-store 子命令。
+"""ragbase 命令行入口：init / models / doctor / serve / ingest / ask / chat / eval / diagnose / questions / migrate-store 子命令。
 
 - 子命令的重型依赖（torch、chromadb、qdrant-client、ragas 等）都在各自的处理函数里才导入，所以 `ragbase --help` 很快。
 - 数据、索引、.env 等默认位置都在项目主目录下：环境变量 RAG_HOME，未设置则为当前工作目录（见 ragbase.config）。
@@ -142,6 +142,13 @@ def _cmd_serve(args) -> None:
     problem = _preflight(settings)
     if problem:
         print(f"错误：{problem}")
+        raise SystemExit(1)
+    from ragbase.db import DatabaseError, open_database
+
+    try:  # 服务启动时会话也存在这个库里：目录不可写 / 文件损坏在加载模型之前就报中文错误
+        open_database(settings).close()
+    except DatabaseError as exc:
+        print(f"错误：{exc}")
         raise SystemExit(1)
     _ensure_models_for_serve(settings, args.download_models)
     from ragbase.api.app import serve
@@ -440,7 +447,7 @@ def _cmd_chat(args) -> None:
             print(f"错误：未知的书名 {exc.unknown}")
             print("可选：" + "、".join(exc.valid))
             return
-    service = build_chat_service(pipeline, settings)
+    service = build_chat_service(pipeline, settings, db=None)  # 命令行 chat 的会话只存在内存里，不写库（临时会话不混进 Web 的会话列表）
 
     scope = f"，默认限定：{'、'.join(sources)}" if sources else ""
     print(f"对话已就绪{scope}。输入问题开始；/new 新会话，exit 退出")
@@ -470,6 +477,74 @@ def _cmd_eval(args) -> None:
     run(args)
 
 
+# ---------------------------------------------------------------- diagnose
+
+def _cmd_diagnose(args) -> None:
+    from ragbase.diagnostics import run
+
+    run(args)
+
+
+# ---------------------------------------------------------------- questions（评测题集的导入 / 导出）
+
+def _open_question_store_or_exit():
+    """打开数据库并返回 (db, QuestionStore)；打不开时打印中文说明并退出。"""
+    from ragbase.db import DatabaseError, open_database
+    from ragbase.evaluation.questions import QuestionStore
+
+    try:
+        db = open_database()
+    except DatabaseError as exc:
+        raise SystemExit(f"错误：{exc}")
+    return db, QuestionStore(db)
+
+
+def _cmd_questions_import(args) -> None:
+    from pathlib import Path
+
+    from ragbase.evaluation.questions import QuestionValidationError
+
+    path = Path(args.file).expanduser()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise SystemExit(f"错误：无法读取题集文件 {path}：{exc}")
+    mode = "replace" if args.replace else "append"
+    db, store = _open_question_store_or_exit()
+    try:
+        try:
+            result = store.import_items(data, mode)
+        except QuestionValidationError as exc:
+            print(f"题集校验失败，没有导入任何题目（共 {len(exc.errors)} 处问题）：")
+            for error in exc.errors:
+                where = f"第 {error['index'] + 1} 题" if error["index"] is not None else "整体"
+                field = f"（{error['field']}）" if error["field"] else ""
+                print(f"  {where}{field}：{error['message']}")
+            raise SystemExit(1)
+    finally:
+        db.close()
+    print(f"已导入 {result['imported']} 道题（{'替换全部' if args.replace else '追加'}）。")
+    if result["reassigned"]:
+        pairs = "，".join(f"{old} → {new}" for old, new in result["reassigned"])
+        print(f"以下题目的 id 与已有题目冲突，已改用新 id：{pairs}")
+
+
+def _cmd_questions_export(args) -> None:
+    from pathlib import Path
+
+    db, store = _open_question_store_or_exit()
+    try:
+        items = store.export()
+    finally:
+        db.close()
+    path = Path(args.file).expanduser()
+    try:
+        path.write_text(json.dumps(items, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    except OSError as exc:
+        raise SystemExit(f"错误：无法写入 {path}：{exc}")
+    print(f"已导出 {len(items)} 道题到 {path}")
+
+
 # ---------------------------------------------------------------- 参数解析
 
 def build_parser() -> argparse.ArgumentParser:
@@ -479,7 +554,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="ragbase：本地 RAG 知识库（项目主目录由环境变量 RAG_HOME 指定，默认当前目录）",
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
-    sub = parser.add_subparsers(dest="command", metavar="{init,models,doctor,serve,ingest,ask,chat,eval,migrate-store}", required=True)
+    sub = parser.add_subparsers(dest="command", metavar="{init,models,doctor,serve,ingest,ask,chat,eval,diagnose,questions,migrate-store}", required=True)
 
     init = sub.add_parser(
         "init",
@@ -622,6 +697,50 @@ def build_parser() -> argparse.ArgumentParser:
     )
     ev.set_defaults(func=_cmd_eval)
 
+    diagnose = sub.add_parser(
+        "diagnose",
+        help="体检：当前参数、各阶段召回质量与耗时，并给出调参建议（不调用大模型）",
+        description=(
+            "复用数据库里的评测题集（用 ragbase questions import 导入，或在 Web 体检页管理），对每道题跑一遍召回 + 精排（先预热），统计当前参数、三组词面检索指标、"
+            "各阶段耗时，并按固定规则给出调参建议。只测量和建议：不改配置、不自动扫参数、不调用大模型（零大模型费用；"
+            "本地模型或云端 embedding / 精排接口照常调用）。报告存进数据库的报告历史（可在 Web 体检页查看），--json 可另外导出一份。"
+        ),
+    )
+    diagnose.add_argument("--limit", type=int, help="只用前 N 道题，适合冒烟测试")
+    diagnose.add_argument(
+        "--retrieval-mode",
+        choices=("vector", "bm25", "hybrid"),
+        default=settings.mode,
+        help=f"召回方式：向量 / BM25 / 两路 RRF 融合（默认 {settings.mode}，可由 RAG_MODE 设置）",
+    )
+    diagnose.add_argument("--json", metavar="PATH", help="另外把完整报告导出为 JSON 文件（默认只存进数据库）")
+    diagnose.set_defaults(func=_cmd_diagnose)
+
+    questions = sub.add_parser(
+        "questions",
+        help="评测题集的导入 / 导出（题集存在数据库里，供 eval 与 diagnose 使用）",
+        description=(
+            "评测题集存在内置数据库里：首次打开数据库时会自动导入主目录下的 eval_questions.json（只导入一次），之后以数据库为准。"
+            "JSON 是导入 / 导出格式：题目数组，每题 question 必填，可选 id、reference（或 answer_keyword）、difficulty、type、source_topic。"
+        ),
+    )
+    questions_sub = questions.add_subparsers(dest="questions_command", metavar="{import,export}", required=True)
+    q_import = questions_sub.add_parser(
+        "import",
+        help="从 JSON 文件导入题目（默认追加）",
+        description="校验失败时整体不导入并逐条列出问题。追加时与已有题目 id 冲突的题会改用新 id；--replace 先清空题集再按文件里的 id 写入。",
+    )
+    q_import.add_argument("file", metavar="FILE", help="题集 JSON 文件（题目数组）")
+    q_import.add_argument("--replace", action="store_true", help="替换全部：先清空现有题集，再导入文件里的题目")
+    q_import.set_defaults(func=_cmd_questions_import)
+    q_export = questions_sub.add_parser(
+        "export",
+        help="把题集导出为 JSON 文件",
+        description="导出格式与 eval_questions.json 相同：reference 与 answer_keyword 写同一个值，旧版 ragbase eval 也能直接读取。",
+    )
+    q_export.add_argument("file", metavar="FILE", help="导出的 JSON 文件路径")
+    q_export.set_defaults(func=_cmd_questions_export)
+
     migrate = sub.add_parser(
         "migrate-store",
         help="把向量库从一个后端迁移到另一个（不重新向量化）",
@@ -641,8 +760,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _skip_torch_if_all_cloud(args) -> None:
     """embedding 与 reranker 都不用本地模型时，不让 torch / transformers 被顺带加载（启动更快、更省内存），见 block_local_ml_imports。
-    只对会走检索 / 入库的命令生效；eval（ragas 可能用到它们）和 doctor / models 不受影响。"""
-    if args.command not in ("serve", "ask", "chat", "ingest"):
+    只对会走检索 / 入库的命令生效（diagnose 只测检索，也在内）；eval（ragas 可能用到它们）和 doctor / models 不受影响。"""
+    if args.command not in ("serve", "ask", "chat", "ingest", "diagnose"):
         return
     try:
         settings = get_settings()

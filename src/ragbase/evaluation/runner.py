@@ -7,7 +7,7 @@ from pathlib import Path
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 
-from ragbase.config import eval_questions_file, get_settings, project_home
+from ragbase.config import get_settings, project_home
 from ragbase.evaluation.metrics import (
     RagasEvaluator,
     lexical_retrieval_metrics,
@@ -30,8 +30,25 @@ def result_path(mode: str, retrieval_only: bool) -> Path:
 
 
 def load_eval_questions(start_id: int = 1, limit: int | None = None):
-    questions = json.loads(eval_questions_file().read_text(encoding="utf-8"))
-    questions = [question for question in questions if question["id"] >= start_id]
+    """从数据库读评测题（id >= start_id，再取前 limit 道）；reference 为空的题没法评测，跳过并打印提示。"""
+    from ragbase.db import DatabaseError, open_database
+    from ragbase.evaluation.questions import QuestionStore
+
+    try:
+        db = open_database()
+    except DatabaseError as exc:
+        raise SystemExit(f"错误：{exc}")
+    try:
+        all_questions = QuestionStore(db).list()
+    finally:
+        db.close()
+    if not all_questions:
+        raise SystemExit("错误：评测题集是空的。请在 Web 的体检页添加题目，或运行：ragbase questions import <文件>")
+    questions = [question for question in all_questions if question["id"] >= start_id]
+    skipped = [question["id"] for question in questions if not question["reference"]]
+    if skipped:
+        print(f"提示：{len(skipped)} 道题没有参考答案（reference 为空），评测时已跳过：ID {', '.join(map(str, skipped))}")
+    questions = [question for question in questions if question["reference"]]
     return questions[:limit] if limit is not None else questions
 
 
@@ -287,7 +304,7 @@ def run(args):
     with asyncio.Runner() as runner:
         for index, question in enumerate(questions, 1):
             prompt = question["question"]
-            reference = question.get("reference", question["answer_keyword"])
+            reference = question["reference"]
             print(f"\n[{index}/{len(questions)}] ID {question['id']}：{prompt}")
 
             if args.retrieval_only:
