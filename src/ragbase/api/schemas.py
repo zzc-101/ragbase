@@ -198,6 +198,124 @@ class DeleteResponse(BaseModel):
     chunks_deleted: int
 
 
+class QuestionFields(BaseModel):
+    """题目的可写字段。字段类型故意放宽（Any）：类型和必填由 QuestionStore 统一校验，错误以 {detail, errors} 返回，不走 pydantic 的 422。"""
+
+    question: Any = Field(None, description="问题文本，必填，非空字符串（首尾空白会被去掉）")
+    reference: Any = Field(None, description="参考答案（字符串或 null）；空时这题只计耗时、不计召回率。也接受旧字段名 answer_keyword")
+    difficulty: Any = Field(None, description="难度（字符串或 null），自由文本")
+    type: Any = Field(None, description="题型（字符串或 null），自由文本")
+    source_topic: Any = Field(None, description="出处 / 主题（字符串或 null），自由文本")
+    answer_keyword: Any = Field(None, description="旧版字段，等同 reference（两者都给时取 reference）")
+
+
+class QuestionCreate(QuestionFields):
+    """POST /eval-questions：新增一道题，id 自动分配。"""
+
+
+class QuestionUpdate(QuestionFields):
+    """PUT /eval-questions/{id}：只改请求里出现的字段；传 null 表示清空可选字段。"""
+
+
+class QuestionResponse(BaseModel):
+    id: int
+    question: str
+    reference: str | None
+    difficulty: str | None
+    type: str | None
+    source_topic: str | None
+    created_at: str = Field(description="本地时间，ISO 8601")
+    updated_at: str
+
+
+class QuestionListResponse(BaseModel):
+    items: list[QuestionResponse] = Field(description="按 id 升序")
+
+
+class QuestionDeleteResponse(BaseModel):
+    deleted: bool
+
+
+class QuestionImportRequest(BaseModel):
+    items: Any = Field(description="题目数组（与导出文件同格式）；不是数组或某题不合法时整体不写入，返回 422 与逐题错误")
+    mode: Literal["append", "replace"] = Field("append", description="append：追加（id 冲突时改用新 id）；replace：先清空题集再导入")
+
+
+class QuestionImportResponse(BaseModel):
+    imported: int
+    reassigned: list[list[int]] = Field(description="[旧 id, 新 id] 列表：追加时 id 与已有题冲突而改用了新 id")
+
+
+class QuestionErrorItem(BaseModel):
+    index: int | None = Field(description="出错题目在导入数组里的下标（从 0 开始）；整体错误（如“不是数组”）以及新增 / 修改时为 null")
+    field: str | None = Field(description="出错字段；整体错误时为 null")
+    message: str = Field(description="中文说明")
+
+
+class QuestionValidationResponse(BaseModel):
+    """题集校验失败（422）：在统一错误格式 {error, detail} 之外多一个逐题错误列表。"""
+
+    error: Literal["validation_error"] = "validation_error"
+    detail: str
+    errors: list[QuestionErrorItem]
+
+
+class DiagnoseRequest(BaseModel):
+    mode: Mode | None = Field(None, description="召回方式，默认取服务配置")
+    limit: int | None = Field(None, ge=1, description="只用题集的前 N 道题（按 id 升序）；不传用全部")
+
+
+class DiagnoseJobResponse(BaseModel):
+    job_id: str
+    status: Literal["pending", "running", "succeeded", "failed"]
+    total: int = Field(0, description="本次体检的题数（去重、按 limit 截取之后）")
+    done: int = Field(0, description="已测完的题数")
+    report_id: int | None = Field(None, description="成功后的报告 id（GET /diagnose/reports/{id}）")
+    error: str | None = None
+    started_at: str | None = Field(None, description="UTC，ISO 8601")
+    finished_at: str | None = None
+
+
+class ReportSummary(BaseModel):
+    """报告列表项（不含逐题记录）；几个关键数字在报告缺少对应数据时为 null。"""
+
+    id: int
+    created_at: str = Field(description="报告生成时间（服务器本地时间，ISO 8601）")
+    origin: Literal["cli", "web"]
+    mode: Mode
+    question_count: int = Field(description="参与统计的题数")
+    candidates_recall: float | None = Field(description="召回 TopK 候选的 point_recall 均值")
+    reranked_recall: float | None = Field(description="精排后的 point_recall 均值")
+    refusal_rate: float | None
+    total_ms_mean: float | None = Field(description="检索总耗时均值（毫秒）")
+    rerank_share_pct: float | None = Field(description="精排占检索耗时的百分比")
+    concurrent_chat_requests: int = Field(description="体检期间服务处理的对话请求数，大于 0 时耗时可能偏高")
+
+
+class ReportListResponse(BaseModel):
+    items: list[ReportSummary] = Field(description="按 id 倒序（新的在前）")
+
+
+class ReportResponse(BaseModel):
+    """完整报告：结构同 ragbase.diagnostics.build_report 的产出，外加 id 与来源。"""
+
+    id: int
+    origin: Literal["cli", "web"]
+    generated_at: str
+    params: dict[str, Any] = Field(description="体检时的参数（召回方式、模型、索引规模、模型加载耗时等）")
+    warmup_question: str | None
+    questions: list[dict[str, Any]] = Field(description="逐题记录")
+    summary: dict[str, Any] = Field(description="汇总：quality（三组指标、拒答率等）、speed（各阶段耗时）、questions（题数）等")
+    recommendations: list[dict[str, Any]] = Field(description="触发的建议，每项含 id / title / phenomenon（现象）/ try（可以尝试）/ cost（可能的代价）")
+    question_ids: list[Any] = Field(description="所用题目的 id")
+    question_digest: str | None = Field(description="所用题集的内容摘要；两份报告不同说明题集不同，质量指标不可直接比较")
+    concurrent_chat_requests: int
+
+
+class ReportDeleteResponse(BaseModel):
+    deleted: bool
+
+
 class ErrorResponse(BaseModel):
     error: str
     detail: str

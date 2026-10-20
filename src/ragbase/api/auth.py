@@ -18,7 +18,7 @@ UNAUTHORIZED_DETAIL = "需要有效的 API Key：请在请求头带上 Authoriza
 NO_AUTH_EXPOSED_WARNING = "未设置 RAG_API_KEY，服务对外暴露且没有鉴权"
 
 # 公开路径（无需密钥）：前端静态资源与 SPA 路由、交互文档（schema 里没有密钥）。/health 单独处理（见 is_health）。
-_PUBLIC_EXACT = frozenset({"/", "/library", "/docs", "/redoc", "/openapi.json", "/docs/oauth2-redirect"})
+_PUBLIC_EXACT = frozenset({"/", "/library", "/diagnose", "/docs", "/redoc", "/openapi.json", "/docs/oauth2-redirect"})
 _PUBLIC_PATTERNS = (re.compile(r"/c/[^/]+"), re.compile(r"/assets/.+"))
 _PUBLIC_METHODS = frozenset({"GET", "HEAD"})
 

@@ -14,11 +14,17 @@
 入库任务在后台线程里跑（同一时刻只有一个），每个批次单独持有 pipeline.lock，批间释放，/search 可以插进来；
 任务结束后重建 BM25 快照并原子替换。命令行 ragbase ingest --full（会清空整个向量库）不能和服务同时运行；本地 Qdrant 目录同一时刻也只允许一个进程打开。
 
+评测题集与体检（Web 体检页）：题集在内置 SQLite 的 eval_questions 表里，GET|POST /eval-questions、PUT|DELETE /eval-questions/{id}、
+POST /eval-questions/import、GET /eval-questions/export；POST /diagnose 在后台线程里复用已加载的流水线做 RAG 体检（不调用大模型），
+GET /diagnose/jobs/{job_id} 查进度，完成后报告存进数据库：GET /diagnose/reports、GET|DELETE /diagnose/reports/{id}。
+体检与入库、删除文档共用一把“忙”锁，同一时刻只能有一个，冲突回 409；体检用开始时的题目快照，运行中改题集不影响本次体检。
+题集和报告接口不依赖对话 Agent / 流水线，大模型未配置或索引为空时照常可用。
+
 接口鉴权：设置 RAG_API_KEY 后，除前端页面 / 静态资源、/docs、/openapi.json 和精简版 /health 外，所有接口都要带
 Authorization: Bearer <key>（或 X-API-Key）；默认拒绝 + 显式公开白名单，见 ragbase/api/auth.py。RAG_CORS_ORIGINS 配置跨域来源。
 
 Web 界面：web/ 目录是前端工程，pnpm build 后产物在 web/dist（RAG_WEB_DIST 可改），本服务在同一端口托管它：
-/assets/* 是静态资源，/、/library、/c/{session_id} 返回 index.html（前端路由）；API 路由不受影响。
+/assets/* 是静态资源，/、/library、/diagnose、/c/{session_id} 返回 index.html（前端路由）；API 路由不受影响。
 """
 import inspect
 import json
@@ -53,6 +59,8 @@ from ragbase.api.schemas import (
     ChatRequest,
     ChatResponse,
     DeleteResponse,
+    DiagnoseJobResponse,
+    DiagnoseRequest,
     DocumentInfo,
     DocumentsResponse,
     ErrorResponse,
@@ -60,6 +68,17 @@ from ragbase.api.schemas import (
     LivenessResponse,
     JobResponse,
     ModelInfo,
+    QuestionCreate,
+    QuestionDeleteResponse,
+    QuestionImportRequest,
+    QuestionImportResponse,
+    QuestionListResponse,
+    QuestionResponse,
+    QuestionUpdate,
+    QuestionValidationResponse,
+    ReportDeleteResponse,
+    ReportListResponse,
+    ReportResponse,
     SearchRequest,
     SearchResponse,
     SessionDeleteResponse,
@@ -73,9 +92,13 @@ from ragbase.agent.service import ChatService, build_chat_service, delete_sessio
 from ragbase.agent.store import ChatStore
 from ragbase.config import Settings, get_settings
 from ragbase.db import Database, open_database
+from ragbase.diagnostics import dedupe_questions, run_diagnosis
+from ragbase.diagnostics_jobs import DiagnoseJob, DiagnoseJobManager, RequestCounter
+from ragbase.diagnostics_reports import ReportStore
+from ragbase.evaluation.questions import QuestionStore, QuestionValidationError
 from ragbase.index_info import IndexRecorder
 from ragbase.ingest.parser import LEGACY_EXTS, SUPPORTED_EXTS, sanitize_filename
-from ragbase.ingest.jobs import IngestJobManager, JobRunningError, progress_handler
+from ragbase.ingest.jobs import BusyLock, IngestJobManager, JobRunningError, progress_handler
 from ragbase.ingest.service import delete_document, run_ingest
 from ragbase.logging_setup import request_id_var, setup_logging
 from ragbase.ingest.common import collection_count
@@ -254,7 +277,9 @@ def create_app(pipeline_factory=None, settings: Settings | None = None, ingest_f
     setup_logging(settings.log_level)
     max_upload_bytes = settings.max_upload_mb * 1024 * 1024
     api_key = settings.api_key  # None = 鉴权关闭
-    jobs = IngestJobManager()
+    busy = BusyLock()  # 入库、删除文档、体检共用：同一时刻只能有一个
+    jobs = IngestJobManager(busy)
+    diagnose_jobs = DiagnoseJobManager(busy)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -262,6 +287,8 @@ def create_app(pipeline_factory=None, settings: Settings | None = None, ingest_f
         app.state.chat = None
         app.state.db = db = open_database(settings)  # 目录不可写 / 文件损坏时抛 DatabaseError（中文说明），服务不启动
         app.state.chat_store = ChatStore(db)
+        app.state.question_store = QuestionStore(db)
+        app.state.report_store = ReportStore(db)
         try:
             count = collection_count(settings)
             if settings.data_dir.is_dir():
@@ -272,7 +299,8 @@ def create_app(pipeline_factory=None, settings: Settings | None = None, ingest_f
             else:
                 start = time.perf_counter()
                 app.state.pipeline = pipeline_factory(settings)
-                logger.info("流水线就绪：%d 个片段，启动加载用时 %.1fs", count, time.perf_counter() - start)
+                app.state.model_load_seconds = time.perf_counter() - start  # 体检报告里的“模型加载耗时”
+                logger.info("流水线就绪：%d 个片段，启动加载用时 %.1fs", count, app.state.model_load_seconds)
                 app.state.chat = _make_chat_service(chat_factory, app.state.pipeline, settings, db)
                 if app.state.chat is None:
                     logger.warning("大模型未配置，对话 Agent 未启用（/chat 返回 503）")
@@ -297,7 +325,12 @@ def create_app(pipeline_factory=None, settings: Settings | None = None, ingest_f
     app.state.chat = None
     app.state.db = None
     app.state.chat_store = None
+    app.state.question_store = None
+    app.state.report_store = None
     app.state.jobs = jobs
+    app.state.diagnose_jobs = diagnose_jobs
+    app.state.chat_requests = RequestCounter()  # /chat 与 /chat/stream 的累计请求数，体检用它判断运行期间有没有对话在抢资源
+    app.state.model_load_seconds = 0.0
 
     def _reject_oversized_upload(request: Request):
         """POST /documents 的 Content-Length 明显超限时，不等整个请求体传完就拒绝（精确大小在写盘时再校验）。"""
@@ -352,7 +385,16 @@ def create_app(pipeline_factory=None, settings: Settings | None = None, ingest_f
     async def validation_exception_handler(request: Request, exc: RequestValidationError):
         return _error_response(422, _validation_detail(exc))
 
+    @app.exception_handler(QuestionValidationError)
+    async def question_validation_handler(request: Request, exc: QuestionValidationError):
+        """题集校验失败 -> 422：统一错误格式 {error, detail} 之外多一个逐题错误列表 errors（与上面的 RequestValidationError 处理器互不影响）。"""
+        errors = exc.errors
+        shown = "；".join(str(QuestionValidationError([error])) for error in errors[:3])
+        detail = f"题集校验未通过（共 {len(errors)} 处）：{shown}" + ("……" if len(errors) > 3 else "")
+        return JSONResponse(status_code=422, content={"error": "validation_error", "detail": detail, "errors": errors})
+
     error_models = {code: {"model": ErrorResponse} for code in (400, 401, 404, 409, 413, 422, 502, 503, 504)}
+    question_error_models = {**error_models, 422: {"model": QuestionValidationResponse}}
 
     if settings.cors_origins:  # 最后添加 = 最外层：预检请求不经过鉴权，401 等响应也带 CORS 头
         app.add_middleware(
@@ -474,6 +516,7 @@ def create_app(pipeline_factory=None, settings: Settings | None = None, ingest_f
     @app.post("/chat", response_model=ChatResponse, responses=error_models)
     def chat(body: ChatRequest, request: Request):
         """多轮对话：Agent 按需调用知识库工具（检索 / 列书目）后回答；session_id 相同的请求共享历史，同会话的请求串行处理。"""
+        request.app.state.chat_requests.increment()
         service = _get_chat(request)
         sources = _check_sources(request.app.state.pipeline, body.sources)
         session_id = body.session_id or uuid.uuid4().hex
@@ -498,6 +541,7 @@ def create_app(pipeline_factory=None, settings: Settings | None = None, ingest_f
 
         校验类错误（400 / 422 / 503）在开始流式之前以普通 JSON 返回；流式过程中的错误以 error 事件发出（data 同统一错误 JSON）。
         """
+        request.app.state.chat_requests.increment()
         service = _get_chat(request)
         sources = _check_sources(request.app.state.pipeline, body.sources)
         session_id = body.session_id or uuid.uuid4().hex
@@ -593,11 +637,12 @@ def create_app(pipeline_factory=None, settings: Settings | None = None, ingest_f
 
         return run
 
-    def _start_job(pipeline: RAGPipeline, conflict_detail: str | None = None):
+    def _start_job(pipeline: RAGPipeline, conflict_detail=None):
+        """conflict_detail(exc) -> 409 的说明；缺省用 JobRunningError 自带的（区分“入库任务”和“体检”）。"""
         try:
             return jobs.start(_ingest_runner(pipeline))
         except JobRunningError as exc:
-            raise HTTPException(status_code=409, detail=conflict_detail or str(exc)) from exc
+            raise HTTPException(status_code=409, detail=conflict_detail(exc) if conflict_detail else str(exc)) from exc
 
     def _get_ingest_pipeline(request: Request) -> RAGPipeline:
         if request.app.state.pipeline is None:
@@ -647,7 +692,7 @@ def create_app(pipeline_factory=None, settings: Settings | None = None, ingest_f
             raise
         job = _start_job(
             pipeline,
-            conflict_detail=f"文件 {name} 已保存，但当前有入库任务在运行：请等它结束后调用 POST /ingest",
+            conflict_detail=lambda exc: f"文件 {name} 已保存，但当前有{exc.label}在运行：请等它结束后调用 POST /ingest",
         )
         return UploadResponse(filename=name, **job.to_dict())
 
@@ -676,12 +721,124 @@ def create_app(pipeline_factory=None, settings: Settings | None = None, ingest_f
             raise HTTPException(status_code=409, detail=f"{exc}，请稍后再删除") from exc
         return DeleteResponse(name=name, chunks_deleted=count)
 
+    # ------------------------------------------------------------------ 评测题集
+
+    def _question_store(request: Request) -> QuestionStore:
+        return request.app.state.question_store
+
+    @app.get("/eval-questions", response_model=QuestionListResponse, responses=error_models)
+    def list_eval_questions(request: Request):
+        """评测题集（按 id 升序）。"""
+        return QuestionListResponse(items=_question_store(request).list())
+
+    @app.post("/eval-questions", status_code=201, response_model=QuestionResponse, responses=question_error_models)
+    def create_eval_question(body: QuestionCreate, request: Request):
+        """新增一道题，id 自动分配；字段校验失败 422（带 errors）。"""
+        return _question_store(request).create(body.model_dump(exclude_unset=True))
+
+    # 固定路径放在 /eval-questions/{question_id} 之前（两者方法也不同，双重保险）
+    @app.post("/eval-questions/import", response_model=QuestionImportResponse, responses=question_error_models)
+    def import_eval_questions(body: QuestionImportRequest, request: Request):
+        """批量导入（JSON 数组，格式同导出文件）。校验与写入在同一事务里：有任何一题不合法就整体不写入，返回 422 与逐题错误。"""
+        return _question_store(request).import_items(body.items, body.mode)
+
+    @app.get("/eval-questions/export", response_model=list[dict], responses=error_models)
+    def export_eval_questions(request: Request):
+        """导出整个题集：JSON 数组，作为附件下载（eval_questions.json），旧版 ragbase eval 也能读。"""
+        return JSONResponse(
+            _question_store(request).export(),
+            headers={"Content-Disposition": 'attachment; filename="eval_questions.json"'},
+        )
+
+    @app.put("/eval-questions/{question_id}", response_model=QuestionResponse, responses=question_error_models)
+    def update_eval_question(question_id: int, body: QuestionUpdate, request: Request):
+        """只改请求里出现的字段（传 null 清空可选字段）。"""
+        updated = _question_store(request).update(question_id, body.model_dump(exclude_unset=True))
+        if updated is None:
+            raise HTTPException(status_code=404, detail=f"没有这道题：{question_id}")
+        return updated
+
+    @app.delete("/eval-questions/{question_id}", response_model=QuestionDeleteResponse, responses=error_models)
+    def delete_eval_question(question_id: int, request: Request):
+        if not _question_store(request).delete(question_id):
+            raise HTTPException(status_code=404, detail=f"没有这道题：{question_id}")
+        return QuestionDeleteResponse(deleted=True)
+
+    # ------------------------------------------------------------------ 体检
+
+    def _diagnose_runner(pipeline: RAGPipeline, questions: list[dict], duplicates: int, mode: str):
+        """后台任务体：用开始时的题目快照跑体检，报告存进数据库，返回报告 id。"""
+        db = app.state.db
+        chat_requests = app.state.chat_requests
+
+        def run(job: DiagnoseJob) -> int:
+            report = run_diagnosis(
+                pipeline,
+                settings,
+                questions,
+                mode,
+                app.state.model_load_seconds,
+                duplicates,
+                on_progress=lambda done, total: job.update(done=done, total=total),
+                chat_requests=lambda: chat_requests.value,
+            )
+            return ReportStore(db).save(report, "web")
+
+        return run
+
+    @app.post("/diagnose", status_code=202, response_model=DiagnoseJobResponse, responses=error_models)
+    def start_diagnose(request: Request, body: DiagnoseRequest | None = None):
+        """开始一次体检（后台运行，不调用大模型）；用 GET /diagnose/jobs/{job_id} 查进度，完成后报告 id 在任务的 report_id 里。
+        题目在这里取快照（先按 limit 截取、再去重），运行中改题集不影响本次体检。与入库 / 删除文档互斥，冲突 409。"""
+        body = body or DiagnoseRequest()
+        pipeline = _get_pipeline(request)  # 流水线未就绪 -> 503
+        if not collection_count(settings):
+            raise HTTPException(status_code=503, detail=INDEX_MISSING_MESSAGE)
+        mode = body.mode or settings.mode
+        _check_mode(pipeline, mode, settings)
+        questions = _question_store(request).list()
+        if body.limit is not None:
+            questions = questions[: body.limit]
+        questions, duplicates = dedupe_questions(questions)
+        if not questions:
+            raise HTTPException(status_code=400, detail="评测题集是空的：请先在体检页添加题目，或导入题集")
+        try:
+            job = diagnose_jobs.start(_diagnose_runner(pipeline, questions, duplicates, mode), total=len(questions))
+        except JobRunningError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return DiagnoseJobResponse(**job.to_dict())
+
+    @app.get("/diagnose/jobs/{job_id}", response_model=DiagnoseJobResponse, responses=error_models)
+    def get_diagnose_job(job_id: str):
+        job = diagnose_jobs.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail=f"没有这个体检任务：{job_id}")
+        return DiagnoseJobResponse(**job.to_dict())
+
+    @app.get("/diagnose/reports", response_model=ReportListResponse, responses=error_models)
+    def list_diagnose_reports(request: Request):
+        """体检报告列表（不含逐题记录，新的在前）。"""
+        return ReportListResponse(items=request.app.state.report_store.list())
+
+    @app.get("/diagnose/reports/{report_id}", response_model=ReportResponse, responses=error_models)
+    def get_diagnose_report(report_id: int, request: Request):
+        report = request.app.state.report_store.get(report_id)
+        if report is None:
+            raise HTTPException(status_code=404, detail=f"没有这份报告：{report_id}")
+        return report
+
+    @app.delete("/diagnose/reports/{report_id}", response_model=ReportDeleteResponse, responses=error_models)
+    def delete_diagnose_report(report_id: int, request: Request):
+        if not request.app.state.report_store.delete(report_id):
+            raise HTTPException(status_code=404, detail=f"没有这份报告：{report_id}")
+        return ReportDeleteResponse(deleted=True)
+
     _mount_web(app, settings.web_dist)
     return app
 
 
 def _mount_web(app: FastAPI, dist: Path) -> None:
-    """托管前端构建产物。放在所有 API 路由之后注册，且只匹配前端自己的路径（/assets/*、/、/library、/c/{id}），
+    """托管前端构建产物。放在所有 API 路由之后注册，且只匹配前端自己的路径（/assets/*、/、/library、/diagnose、/c/{id}），
     所以不会遮住 GET /documents、/health 这类 JSON 接口。dist 是否存在在请求时才检查：服务运行中重新 pnpm build 也立即生效。"""
     index = dist / "index.html"
 
@@ -690,7 +847,7 @@ def _mount_web(app: FastAPI, dist: Path) -> None:
             return FileResponse(index, headers={"Cache-Control": "no-cache"})  # 入口页不缓存，哈希资源可长缓存
         return HTMLResponse(f"<!doctype html><meta charset=utf-8><title>RAG 知识库</title><p>{WEB_MISSING_HINT}</p>")
 
-    for route in ("/", "/library", "/c/{session_id}"):
+    for route in ("/", "/library", "/diagnose", "/c/{session_id}"):  # GET /diagnose 是页面；同路径的 POST /diagnose 是 API
         app.add_api_route(route, page, methods=["GET"], include_in_schema=False)
 
     def asset(path: str):

@@ -1,6 +1,7 @@
-"""入库任务注册表：同一时刻只允许一个任务（入库或删除文档），在后台线程里运行，状态保存在内存。
+"""入库任务注册表：同一时刻只允许一个任务（入库、删除文档或体检），在后台线程里运行，状态保存在内存。
 
-“忙”由一把不阻塞获取的锁表示：start() 与 exclusive() 都先抢它，抢不到就抛 JobRunningError（API 回 409）。
+“忙”由 BusyLock 表示（一把不阻塞获取、记得持有者的锁）：start() 与 exclusive() 都先抢它，抢不到就抛 JobRunningError（API 回 409）。
+体检任务（ragbase.diagnostics_jobs）与入库共用同一把 BusyLock，所以两者互斥。
 任务线程结束时（含 BM25 刷新）才释放，所以任务显示 succeeded 时索引和 BM25 都已是最新。
 """
 import logging
@@ -20,12 +21,53 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-class JobRunningError(RuntimeError):
-    """已有任务在运行；running_job_id 可能为 None（忙于删除文档等非任务操作）。"""
+BUSY_LABELS = {"ingest": "入库任务", "diagnose": "体检"}  # 忙的原因 -> 中文提示里的名称
 
-    def __init__(self, running_job_id: str | None = None):
-        super().__init__("已有入库任务在运行" + (f"（job_id={running_job_id}）" if running_job_id else ""))
-        self.running_job_id = running_job_id
+
+class JobRunningError(RuntimeError):
+    """已有任务在运行；running_id 可能为 None（忙于删除文档等非任务操作）；kind 是正在运行的任务种类（ingest / diagnose）。"""
+
+    def __init__(self, running_id: str | None = None, kind: str = "ingest"):
+        self.running_id = running_id
+        self.kind = kind
+        self.label = BUSY_LABELS.get(kind, "任务")
+        super().__init__(f"已有{self.label}在运行" + (f"（job_id={running_id}）" if running_id else ""))
+
+
+class BusyLock:
+    """全局“忙”标记：同一时刻只有一个持有者（入库、删除文档、体检）。不阻塞获取，抢不到抛 JobRunningError。"""
+
+    def __init__(self):
+        self._guard = threading.Lock()
+        self._held = False
+        self._running_id: str | None = None
+        self._running_kind: str | None = None
+
+    @property
+    def running_id(self) -> str | None:
+        with self._guard:
+            return self._running_id
+
+    @property
+    def running_kind(self) -> str | None:
+        with self._guard:
+            return self._running_kind
+
+    def locked(self) -> bool:
+        with self._guard:
+            return self._held
+
+    def acquire(self, holder_id: str | None, kind: str) -> None:
+        with self._guard:
+            if self._held:
+                raise JobRunningError(self._running_id, self._running_kind or kind)
+            self._held = True
+            self._running_id, self._running_kind = holder_id, kind
+
+    def release(self) -> None:
+        with self._guard:
+            self._held = False
+            self._running_id = self._running_kind = None
 
 
 @dataclass
@@ -84,11 +126,10 @@ def progress_handler(job: IngestJob):
 
 
 class IngestJobManager:
-    def __init__(self):
-        self._busy = threading.Lock()
+    def __init__(self, busy: BusyLock | None = None):
+        self._busy = busy or BusyLock()  # 与体检共用时由调用方传入同一把
         self._jobs: OrderedDict[str, IngestJob] = OrderedDict()
-        self._guard = threading.Lock()  # 保护 _jobs 与 _running_id
-        self._running_id: str | None = None
+        self._guard = threading.Lock()  # 保护 _jobs
 
     @property
     def running(self) -> bool:
@@ -100,14 +141,12 @@ class IngestJobManager:
 
     def start(self, run) -> IngestJob:
         """在后台线程运行 run(job)。run 正常返回 -> succeeded；抛异常 -> failed（error 为异常描述）。"""
-        if not self._busy.acquire(blocking=False):
-            raise JobRunningError(self._running_id)
         job = IngestJob(job_id=uuid.uuid4().hex[:12])
+        self._busy.acquire(job.job_id, "ingest")  # 抢不到抛 JobRunningError
         with self._guard:
             self._jobs[job.job_id] = job
             while len(self._jobs) > MAX_JOBS_KEPT:
                 self._jobs.popitem(last=False)
-            self._running_id = job.job_id
         threading.Thread(target=self._run, args=(job, run), name=f"ingest-{job.job_id}", daemon=True).start()
         return job
 
@@ -121,8 +160,6 @@ class IngestJobManager:
             logger.exception("入库任务失败：%s", job.job_id)
             status, error = "failed", str(exc) or type(exc).__name__
         finally:
-            with self._guard:
-                self._running_id = None
             self._busy.release()
             # 先释放“忙”再写终态：客户端看到 succeeded / failed 时一定可以立刻启动下一个任务。
             # 状态、错误、结束时间一次写入，轮询方不会看到 succeeded 但 finished_at 还是空的中间态
@@ -132,8 +169,7 @@ class IngestJobManager:
     @contextmanager
     def exclusive(self):
         """同步执行需要独占索引的操作（如删除文档）：期间新任务 / 其他独占操作得到 JobRunningError。"""
-        if not self._busy.acquire(blocking=False):
-            raise JobRunningError(self._running_id)
+        self._busy.acquire(None, "ingest")
         try:
             yield
         finally:
