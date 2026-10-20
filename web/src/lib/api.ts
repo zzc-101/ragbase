@@ -98,17 +98,183 @@ export interface ChatRequest {
   sources?: string[]
 }
 
+// ---- 评测题集
+export interface EvalQuestion {
+  id: number
+  question: string
+  reference: string | null
+  difficulty: string | null
+  type: string | null
+  source_topic: string | null
+  created_at: string
+  updated_at: string
+}
+
+/** 新增 / 修改的请求体；可选字段传 null 表示清空。 */
+export interface QuestionInput {
+  question: string
+  reference?: string | null
+  difficulty?: string | null
+  type?: string | null
+  source_topic?: string | null
+}
+
+/** 题集校验错误（422）。index 从 0 开始，整体错误以及新增 / 修改时为 null。 */
+export interface QuestionErrorItem {
+  index: number | null
+  field: string | null
+  message: string
+}
+
+export type ImportMode = 'append' | 'replace'
+
+export interface ImportResult {
+  imported: number
+  /** [旧 id, 新 id]：追加时 id 与已有题冲突而改用了新 id */
+  reassigned: [number, number][]
+}
+
+// ---- 体检
+export type DiagnoseMode = 'vector' | 'bm25' | 'hybrid'
+
+export interface DiagnoseRequest {
+  mode?: DiagnoseMode
+  limit?: number
+}
+
+export interface DiagnoseJob {
+  job_id: string
+  status: JobStatus
+  total: number
+  done: number
+  report_id: number | null
+  error: string | null
+  started_at: string | null
+  finished_at: string | null
+}
+
+export type ReportOrigin = 'cli' | 'web'
+
+export interface ReportSummary {
+  id: number
+  created_at: string
+  origin: ReportOrigin
+  mode: DiagnoseMode
+  question_count: number
+  candidates_recall: number | null
+  reranked_recall: number | null
+  refusal_rate: number | null
+  total_ms_mean: number | null
+  rerank_share_pct: number | null
+  concurrent_chat_requests: number
+}
+
+export interface ChunkStats {
+  count: number
+  mean: number
+  median: number
+  max: number
+}
+
+export interface ReportParams {
+  mode: DiagnoseMode
+  per_route_k: number
+  retrieve_k: number
+  rerank_k: number
+  min_score: number | null
+  context_min_score: number | null
+  embedding_provider: string
+  embedding_model: string
+  reranker_provider: string
+  reranker_model: string | null
+  reranker_batch_size: number | null
+  device: string
+  chunks: ChunkStats | null
+  default_chunk_size: number
+  default_chunk_overlap: number
+  model_load_seconds: number
+}
+
+export interface MetricRow {
+  point_recall: number
+  context_precision: number
+  mrr: number
+}
+
+export interface ValueStat {
+  mean: number
+  median: number
+  max: number
+  min: number
+  count: number
+}
+
+export interface StageStat extends ValueStat {
+  share_pct: number
+}
+
+export type StageName = 'embed' | 'vector_search' | 'bm25' | 'fuse' | 'rerank'
+export type MetricGroup = 'candidates' | 'reranked' | 'llm_context'
+
+export interface ReportData {
+  questions: { measured: number; with_reference: number; duplicates_skipped: number }
+  quality: Record<MetricGroup, MetricRow | null> & {
+    context_filter: {
+      questions: number
+      reranked_point_recall: number | null
+      llm_point_recall: number | null
+      gap: number | null
+    } | null
+    refused: number
+    refusal_rate: number
+    top1_score: ValueStat | null
+    avg_sent_docs: number | null
+  }
+  speed: {
+    total: ValueStat | null
+    stages: Partial<Record<StageName, StageStat>>
+    avg_candidates: number | null
+    rerank_ms_per_candidate: number | null
+  }
+}
+
+export interface Recommendation {
+  id: string
+  title: string
+  phenomenon: string
+  try: string
+  cost: string
+}
+
+export interface Report {
+  id: number
+  origin: ReportOrigin
+  generated_at: string
+  params: ReportParams
+  warmup_question: string | null
+  /** 逐题记录（页面不展示） */
+  questions: Record<string, unknown>[]
+  summary: ReportData
+  recommendations: Recommendation[]
+  question_ids: unknown[]
+  question_digest: string | null
+  concurrent_chat_requests: number
+}
+
 // ---------------------------------------------------------------- 错误
 /** 统一错误：HTTP 错误带后端的 {error, detail}；网络失败 status 为 0、code 为 "network"。 */
 export class ApiError extends Error {
   readonly status: number
   readonly code: string
+  /** 题集校验失败（422 validation_error）时的逐条错误；其他错误为空数组 */
+  readonly errors: QuestionErrorItem[]
 
-  constructor(status: number, code: string, detail: string) {
+  constructor(status: number, code: string, detail: string, errors: QuestionErrorItem[] = []) {
     super(detail)
     this.name = 'ApiError'
     this.status = status
     this.code = code
+    this.errors = errors
   }
 
   get isNetwork() {
@@ -134,16 +300,18 @@ export function describeChatError(error: unknown): string {
 export async function errorFromResponse(response: Response): Promise<ApiError> {
   let code = 'http_error'
   let detail = response.statusText || `请求失败（${response.status}）`
+  let errors: QuestionErrorItem[] = []
   try {
     const body = await response.json()
     if (body && typeof body === 'object') {
       if (typeof body.error === 'string') code = body.error
       if (typeof body.detail === 'string') detail = body.detail
+      if (code === 'validation_error' && Array.isArray(body.errors)) errors = body.errors as QuestionErrorItem[]
     }
   } catch {
     // 非 JSON 响应：沿用状态文本
   }
-  return new ApiError(response.status, code, detail)
+  return new ApiError(response.status, code, detail, errors)
 }
 
 export function networkError(): ApiError {
@@ -248,3 +416,34 @@ export async function openChatStream(body: ChatRequest, signal: AbortSignal): Pr
   if (!response.body) throw new ApiError(0, 'network', '浏览器不支持流式响应')
   return response
 }
+
+// ---- 评测题集
+export const listQuestions = () => request<{ items: EvalQuestion[] }>('/eval-questions').then((r) => r.items)
+
+export const createQuestion = (body: QuestionInput) => request<EvalQuestion>('/eval-questions', jsonInit('POST', body))
+
+export const updateQuestion = (id: number, body: QuestionInput) =>
+  request<EvalQuestion>(`/eval-questions/${id}`, jsonInit('PUT', body))
+
+export const deleteQuestion = (id: number) => request<{ deleted: boolean }>(`/eval-questions/${id}`, jsonInit('DELETE'))
+
+export const importQuestions = (items: unknown, mode: ImportMode) =>
+  request<ImportResult>('/eval-questions/import', jsonInit('POST', { items, mode }))
+
+/** 导出要带鉴权头，所以先用 apiFetch 拿到 blob，再由调用方触发下载。 */
+export async function exportQuestions(): Promise<Blob> {
+  const response = await apiFetch('/eval-questions/export')
+  if (!response.ok) throw await errorFromResponse(response)
+  return response.blob()
+}
+
+// ---- 体检
+export const startDiagnose = (body: DiagnoseRequest) => request<DiagnoseJob>('/diagnose', jsonInit('POST', body))
+
+export const getDiagnoseJob = (id: string) => request<DiagnoseJob>(`/diagnose/jobs/${encodeURIComponent(id)}`)
+
+export const listReports = () => request<{ items: ReportSummary[] }>('/diagnose/reports').then((r) => r.items)
+
+export const getReport = (id: number) => request<Report>(`/diagnose/reports/${id}`)
+
+export const deleteReport = (id: number) => request<{ deleted: boolean }>(`/diagnose/reports/${id}`, jsonInit('DELETE'))

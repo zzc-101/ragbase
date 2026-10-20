@@ -17,3 +17,11 @@ export function relativeTime(value: string | number | null | undefined, now = Da
 export function formatDuration(ms: number): string {
   return ms < 1000 ? `${Math.round(ms)} ms` : `${(ms / 1000).toFixed(1)} s`
 }
+
+/** “2026/10/20 14:03”这类本地日期时间；无法解析时原样返回。 */
+export function formatDateTime(value: string | null | undefined): string {
+  if (!value) return '—'
+  const time = Date.parse(value)
+  if (Number.isNaN(time)) return value
+  return new Date(time).toLocaleString('zh-CN', { hour12: false, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
+}

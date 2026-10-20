@@ -5,6 +5,7 @@ import { Toaster } from '@/components/ui/sonner'
 import { TooltipProvider } from '@/components/ui/tooltip'
 import { ChatProvider } from '@/hooks/useChat'
 import { ChatPage } from '@/pages/ChatPage'
+import { DiagnosePage } from '@/pages/DiagnosePage'
 import { LibraryPage } from '@/pages/LibraryPage'
 
 export default function App() {
@@ -16,6 +17,7 @@ export default function App() {
             <Route index element={<ChatPage />} />
             <Route path="c/:sessionId" element={<ChatPage />} />
             <Route path="library" element={<LibraryPage />} />
+            <Route path="diagnose" element={<DiagnosePage />} />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Route>
         </Routes>

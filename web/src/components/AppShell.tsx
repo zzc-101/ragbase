@@ -1,4 +1,4 @@
-import { BookOpen, MessageSquare } from 'lucide-react'
+import { BookOpen, MessageSquare, Stethoscope } from 'lucide-react'
 import { Link, Outlet, useLocation } from 'react-router'
 import { useChat } from '@/hooks/useChat'
 import { cn } from '@/lib/utils'
@@ -22,7 +22,7 @@ function Wordmark() {
 
 const navClass = (isActive: boolean) =>
   cn(
-    'inline-flex h-8 items-center gap-1.5 rounded-md px-2.5 text-sm sm:px-3 transition-colors focus-visible:ring-[3px] focus-visible:ring-ring/50 focus-visible:outline-none',
+    'inline-flex h-8 items-center gap-1.5 whitespace-nowrap rounded-md px-2 text-sm sm:px-3 transition-colors focus-visible:ring-[3px] focus-visible:ring-ring/50 focus-visible:outline-none',
     isActive ? 'bg-accent font-medium text-foreground' : 'text-muted-foreground hover:bg-accent/60 hover:text-foreground',
   )
 
@@ -31,6 +31,8 @@ export function AppShell() {
   const { pathname } = useLocation()
   const chatHome = sessionId ? `/c/${sessionId}` : '/'
   const inLibrary = pathname.startsWith('/library')
+  const inDiagnose = pathname.startsWith('/diagnose')
+  const inChat = !inLibrary && !inDiagnose
   return (
     <div className="flex h-full flex-col">
       <header className="flex h-12 shrink-0 items-center justify-between gap-2 border-b bg-background px-3 sm:px-4">
@@ -39,13 +41,17 @@ export function AppShell() {
             <Wordmark />
           </Link>
           <nav className="flex items-center gap-1" aria-label="主导航">
-            <Link to={chatHome} className={navClass(!inLibrary)} aria-current={inLibrary ? undefined : 'page'}>
-              <MessageSquare className="size-4" />
+            <Link to={chatHome} className={navClass(inChat)} aria-current={inChat ? 'page' : undefined}>
+              <MessageSquare className="hidden size-4 sm:block" />
               对话
             </Link>
             <Link to="/library" className={navClass(inLibrary)} aria-current={inLibrary ? 'page' : undefined}>
-              <BookOpen className="size-4" />
+              <BookOpen className="hidden size-4 sm:block" />
               知识库
+            </Link>
+            <Link to="/diagnose" className={navClass(inDiagnose)} aria-current={inDiagnose ? 'page' : undefined}>
+              <Stethoscope className="hidden size-4 sm:block" />
+              体检
             </Link>
           </nav>
         </div>
